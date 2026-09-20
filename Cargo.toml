@@ -1,6 +1,5 @@
 [workspace]
 members = [
-    "crates/scarlet_vm",
     "crates/scarlet_syntax",
     "crates/scarlet_types",
     "crates/scarlet_core",
