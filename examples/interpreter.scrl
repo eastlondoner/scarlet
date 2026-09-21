@@ -1,8 +1,4 @@
-// A tiny language, end to end: a lexer that turns text into tokens, a
-// recursive-descent parser that turns tokens into a tree, and an evaluator
-// that folds the tree down to a number. Every piece is built from what the
-// earlier examples taught — sum types, array patterns, Result, closures, and
-// a Map threaded through the program as the variable environment.
+// A tiny language: a lexer, a recursive-descent parser, and an evaluator.
 
 import scarlet/array
 import scarlet/binary.{Dec}
@@ -22,12 +18,9 @@ type Token {
 	Assign
 }
 
-// Every character that is a token on its own. Words — numbers and variable
-// names — are runs of the remaining characters.
+// Single-character tokens. Numbers and names are runs of word_chars.
 const punctuation = ['+', '-', '*', '/', '(', ')', '=']
 
-// `split(s, '')` yields one string per Unicode scalar value, which is how the
-// lexer gets a character set to test membership against.
 const word_chars = string.split('abcdefghijklmnopqrstuvwxyz0123456789_', '')
 
 fn symbol(c String) Token {
@@ -42,8 +35,6 @@ fn symbol(c String) Token {
 	}
 }
 
-// The lexer matches on characters exactly the way the parser below matches on
-// tokens: peel one off the front, recurse on the rest.
 fn lex(source String) Result(Array(Token), String) {
 	scan(string.split(source, ''))
 }
@@ -55,7 +46,8 @@ fn scan(chars Array(String)) Result(Array(Token), String) {
 		[c, ..rest] if array.contains(punctuation, c) -> prepend(symbol(c), scan(rest))
 		[c, ..] if array.contains(word_chars, c) -> {
 			(word, rest) = take_word(chars)
-			result.then(word_token(word), fn(t) prepend(t, scan(rest)))
+			t <- result.then(word_token(word))
+			prepend(t, scan(rest))
 		}
 		[c, ..] -> Err('unexpected character: ${c}')
 	}
@@ -65,7 +57,6 @@ fn prepend(t Token, rest Result(Array(Token), String)) Result(Array(Token), Stri
 	result.map(rest, fn(ts) [t, ..ts])
 }
 
-// The longest run of word characters, plus whatever follows it.
 fn take_word(chars Array(String)) (String, Array(String)) {
 	match chars {
 		[c, ..rest] if array.contains(word_chars, c) -> {
@@ -76,9 +67,7 @@ fn take_word(chars Array(String)) (String, Array(String)) {
 	}
 }
 
-// A word that parses as an integer is a number; anything else is a name.
-// A word that only *starts* like a number (`12abc`) is neither, and the lexer
-// says so rather than inventing a variable called `12abc`.
+// `12abc` is an error, not a variable.
 fn word_token(word String) Result(Token, String) {
 	match binary.parse_int(binary.from_string(word), Dec) {
 		Ok(n) -> Ok(Number(n))
@@ -106,8 +95,7 @@ type Expr {
 	Div(left Expr, right Expr)
 }
 
-// One function per precedence level, each returning the tree built so far and
-// the tokens it did not consume:
+// Precedence climbing, one function per level:
 //   expression = term (('+' | '-') term)*
 //   term       = factor (('*' | '/') factor)*
 //   factor     = number | name | '(' expression ')'
@@ -142,25 +130,25 @@ fn factor(tokens Array(Token)) Parsed {
 		[] -> Err('unexpected end of input')
 		[Number(n), ..rest] -> Ok((Lit(n), rest))
 		[Name(x), ..rest] -> Ok((Var(x), rest))
-		[Open, ..rest] -> match expression(rest) {
-			Ok((inner, [Close, ..after])) -> Ok((inner, after))
-			Ok(_) -> Err('missing closing )')
-			Err(m) -> Err(m)
+		[Open, ..rest] -> {
+			pair <- result.then(expression(rest))
+			match pair {
+				(inner, [Close, ..after]) -> Ok((inner, after))
+				_ -> Err('missing closing )')
+			}
 		}
 		[t, ..] -> Err('unexpected ${string.inspect(t)}')
 	}
 }
 
 fn parse(tokens Array(Token)) Result(Expr, String) {
-	match expression(tokens) {
-		Ok((e, [])) -> Ok(e)
-		Ok((_, [t, ..])) -> Err('unexpected ${string.inspect(t)} after the expression')
-		Err(m) -> Err(m)
+	pair <- result.then(expression(tokens))
+	match pair {
+		(e, []) -> Ok(e)
+		(_, [t, ..]) -> Err('unexpected ${string.inspect(t)} after the expression')
 	}
 }
 
-// Evaluate against the environment. A `Var` is a map lookup, so an unbound
-// name fails the same way dividing by zero does: as an Err the caller reports.
 fn evaluate(e Expr, env Map(String, Int)) Result(Int, String) {
 	match e {
 		Lit(n) -> Ok(n)
@@ -175,14 +163,15 @@ fn evaluate(e Expr, env Map(String, Int)) Result(Int, String) {
 	}
 }
 
-// Evaluate both operands, then apply `op`. The leftmost Err wins.
 fn combine(
 	l Expr,
 	r Expr,
 	env Map(String, Int),
 	op fn(Int, Int) Result(Int, String),
 ) Result(Int, String) {
-	result.then(evaluate(l, env), fn(a) result.then(evaluate(r, env), fn(b) op(a, b)))
+	a <- result.then(evaluate(l, env))
+	b <- result.then(evaluate(r, env))
+	op(a, b)
 }
 
 fn divide(a Int, b Int) Result(Int, String) {
@@ -193,8 +182,7 @@ fn divide(a Int, b Int) Result(Int, String) {
 	}
 }
 
-// Print the tree back out, fully parenthesized, so the reader can see the
-// precedence the parser chose.
+// Fully parenthesized, to show the precedence the parser chose.
 fn show(e Expr) String {
 	match e {
 		Lit(n) -> '${n}'
@@ -206,9 +194,7 @@ fn show(e Expr) String {
 	}
 }
 
-// A line is either `name = expression`, which binds a variable, or a bare
-// expression, which is evaluated and printed. Binding returns a *new* map;
-// the fold below threads it into the next line, so nothing is ever mutated.
+// `name = expression` binds a variable. Anything else is evaluated and printed.
 fn run_line(env Map(String, Int), line String) Map(String, Int) {
 	match lex(line) {
 		Err(m) -> {
@@ -217,16 +203,16 @@ fn run_line(env Map(String, Int), line String) Map(String, Int) {
 		}
 		Ok([Name(x), Assign, ..rest]) -> bind(env, line, x, rest)
 		Ok(tokens) -> {
-			report(
-				line,
-				result.then(
-					parse(tokens),
-					fn(e) result.map(evaluate(e, env), fn(v) '${show(e)} = ${v}'),
-				),
-			)
+			report(line, describe(tokens, env))
 			env
 		}
 	}
+}
+
+fn describe(tokens Array(Token), env Map(String, Int)) Result(String, String) {
+	e <- result.then(parse(tokens))
+	v <- result.map(evaluate(e, env))
+	'${show(e)} = ${v}'
 }
 
 fn bind(env Map(String, Int), line String, name String, rest Array(Token)) Map(String, Int) {

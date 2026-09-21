@@ -1,33 +1,27 @@
 /**
- * Temperature units and the conversions between them.
- *
- * A doc comment on the first line of a file documents the *module*, not the
- * declaration that follows it. An imported module may only contain
- * declarations — no top-level statements — so nothing here runs on import.
+ * Temperature units and the conversions between them. A module has no
+ * top-level statements, so nothing here runs on import.
  */
 
 import scarlet/float
 
-/** A temperature in degrees Celsius. */
 pub type Celsius {
 	degrees Float
 }
 
-/** A temperature in degrees Fahrenheit. */
 pub type Fahrenheit {
 	degrees Float
 }
 
 /**
- * An absolute temperature. `opaque` exports the type but not its constructor,
- * so outside this file a Kelvin can only come from `to_kelvin` — and that
- * function refuses to build one below absolute zero.
+ * opaque exports the type but not its constructor; outside this file, only
+ * to_kelvin can build one, and it refuses to go below absolute zero.
  */
 pub opaque type Kelvin {
 	degrees Float
 }
 
-/** The bottom of the scale, in Celsius. A `pub const` is exported like a fn. */
+/** A pub const is exported like a fn. */
 pub const ABSOLUTE_ZERO_C Float = -273.15
 
 pub fn celsius(degrees Float) Celsius {
@@ -58,8 +52,7 @@ pub fn show_kelvin(t Kelvin) String {
 	'${round1(t.degrees)}K'
 }
 
-// No `pub`: a helper without it is private to this module, and importers
-// cannot name it at all.
+// No pub: round1 is private to this module.
 fn round1(x Float) Float {
 	float.from_int(float.round(x * 10.0)) / 10.0
 }

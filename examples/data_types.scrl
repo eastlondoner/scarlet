@@ -2,12 +2,13 @@
 // modelling a small filesystem tree.
 
 import scarlet/array
+import scarlet/option
 import scarlet/string
 
-/** Where an entry lives. An alias names an existing type; it is not a new one. */
+/** Where an entry lives. An alias names an existing type, not a new one. */
 type Path = String
 
-/** One entry in a directory. `Entry` mentions itself, so the type is a tree. */
+/** One entry in a directory. Entry mentions itself, so the type is a tree. */
 type Entry {
 	/** A leaf: a name and a size in bytes. */
 	File(name String, size Int)
@@ -15,7 +16,6 @@ type Entry {
 	Dir(name Path, entries Array(Entry))
 }
 
-/** `Listing` is `Array(Entry)` under a name that says what it is for. */
 type Listing = Array(Entry)
 
 /** Running totals for a subtree. A single-constructor type is a record. */
@@ -27,7 +27,6 @@ type Stat {
 
 const EMPTY = Stat(files: 0, dirs: 0, bytes: 0)
 
-// Records are built with labelled arguments and read with `.field`.
 fn merge(a Stat, b Stat) Stat {
 	Stat(files: a.files + b.files, dirs: a.dirs + b.dirs, bytes: a.bytes + b.bytes)
 }
@@ -37,8 +36,7 @@ fn walk(e Entry) Stat {
 		File(_, size) -> Stat(files: 1, dirs: 0, bytes: size)
 		Dir(_, entries) -> {
 			totals = array.fold(entries, EMPTY, fn(acc, child) merge(acc, walk(child)))
-			// `..totals` spreads the record, and the labelled argument after it
-			// overrides that one field — the original value is untouched.
+			// ..totals spreads the record; the field after it overrides that one.
 			Stat(..totals, dirs: totals.dirs + 1)
 		}
 	}
@@ -61,22 +59,16 @@ fn find(e Entry, want Path) Option(Entry) {
 		} else {
 			None
 		}
-		Dir(name, entries) -> if name == want {
-			Some(e)
-		} else {
-			find_first(entries, want)
-		}
+		Dir(name, _) if name == want -> Some(e)
+		Dir(_, entries) -> find_first(entries, want)
 	}
 }
 
-// The first hit wins, so the search stops at the first `Some`.
+// The first hit wins: or_else only runs the recursive search when find comes up empty.
 fn find_first(entries Listing, want Path) Option(Entry) {
 	match entries {
 		[] -> None
-		[head, ..rest] -> match find(head, want) {
-			Some(e) -> Some(e)
-			None -> find_first(rest, want)
-		}
+		[head, ..rest] -> option.or_else(find(head, want), fn() find_first(rest, want))
 	}
 }
 
@@ -106,7 +98,7 @@ pub fn main() {
 	Stat(files, dirs, bytes) = walk(root)
 	println('${files} files, ${dirs} dirs, ${bytes} bytes')
 
-	// Interpolation stringifies any value, enums and records included.
+	// inspect renders enums and records too.
 	println(string.inspect(walk(root)))
 
 	println(match find(root, 'lib.al') {

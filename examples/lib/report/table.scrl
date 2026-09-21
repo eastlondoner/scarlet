@@ -1,10 +1,8 @@
 /**
  * Column formatting for a table of temperature readings.
  *
- * The import below steps *up* out of this directory: a relative path is
- * resolved against the importing file's own directory, so `../units` is
- * examples/lib/units.al — the same module `examples/modules.al` reaches as
- * `./lib/units`, named from where each file sits.
+ * `../units` steps up out of this directory to examples/lib/units.scrl, the
+ * same module examples/modules.scrl reaches as `./lib/units`.
  */
 
 import scarlet/array

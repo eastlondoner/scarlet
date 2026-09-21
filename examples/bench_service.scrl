@@ -1,23 +1,5 @@
-// A login/session HTTP service, written the way a real one would be.
-//
-// This is the authoritative al benchmark workload: unlike a `fib` microbench it
-// spends its time where a real server does — header lookup, binary slicing,
-// map lookup, enum matching, Option/Result chaining, and the allocation of a
-// fresh response body per request.
-//
-// al gives each connection its own process with no shared mutable state and no
-// message passing, so there is nowhere to keep a session table. Sessions are
-// therefore stateless and *signed*: the cookie carries `<user>.<sig>` where
-// `sig` is a keyed checksum over the username. Every /me request recomputes the
-// checksum from scratch, which is exactly the per-request CPU a real service
-// spends validating a token.
-//
-// Routes:
-//   GET  /            plain hello (the cheap baseline path)
-//   POST /login       form body `user=&password=`, sets a signed session cookie
-//   GET  /me          verifies the cookie signature, returns the profile
-//   POST /logout      expires the cookie
-//   GET  /users/<id>  numeric path segment, map lookup, 404 on miss
+// The benchmark workload: a login service with signed, stateless session cookies.
+// Routes: GET / (hello), POST /login, GET /me, POST /logout, GET /users/<id>.
 
 import scarlet/http.{Request, Response, Fixed, Get, Post}
 import scarlet/http/headers.{Header}
@@ -37,16 +19,7 @@ type User {
 const USER_COUNT = 384
 const DEFAULT_PORT = 8080
 
-// ---------------------------------------------------------------------------
-// Checksum
-//
-// al has no bitwise operators, so the usual FNV/xorshift mixing is expressed in
-// arithmetic: `%` for masking, `*` and `/` for the rotate. Everything stays
-// inside 32 bits, and the widest intermediate — a 32-bit accumulator times a
-// 24-bit prime — is ~2^56, comfortably inside Int. This is not a MAC and makes
-// no cryptographic claim; it is a real fold over real bytes, which is what the
-// benchmark needs.
-// ---------------------------------------------------------------------------
+// Not a real MAC: FNV-style mixing with `%`, `*` and `/`.
 
 const M32 = 4294967296
 const FNV_PRIME = 16777619
@@ -77,15 +50,10 @@ fn fold_bytes(b Binary, i Int, n Int, h Int) Int {
 	}
 }
 
-// The session signature: a keyed checksum, the secret folded in before the
-// username so a client cannot extend a known prefix.
 fn sign(user Binary) Int {
 	checksum(binary.append(SECRET, user))
 }
 
-// ---------------------------------------------------------------------------
-// The users table, built once at startup.
-// ---------------------------------------------------------------------------
 
 fn make_user(i Int) User {
 	name = 'user${i}'
@@ -97,17 +65,11 @@ fn make_user(i Int) User {
 	)
 }
 
-// Two indexes over the same records: by name for /login and /me, by id for
-// /users/<id>.
 type Tables {
 	by_name Map(Binary, User)
 	by_id Map(Int, User)
 }
 
-// Both lookups go through a helper whose return type is written out. Reading
-// `Option(User)` straight off `map.get` and pattern-matching a field out of it
-// trips a bug in core_ir::lower (see the note at the bottom of this file); the
-// annotation is also what a reader wants at each call site anyway.
 fn find_by_name(t Tables, name Binary) Option(User) {
 	map.get(t.by_name, name)
 }
@@ -132,10 +94,6 @@ fn build_tables(i Int, n Int, t Tables) Tables {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Wire parsing: form bodies and cookies. Both are `key=value` lists over a
-// separator, so both are byte scans over zero-copy slices.
-// ---------------------------------------------------------------------------
 
 const AMP = <<'&'>>
 const EQ = <<'='>>
@@ -143,21 +101,15 @@ const SEMI = <<';'>>
 const DOT = <<'.'>>
 const SP = 32
 
-// The value of `key` in an `application/x-www-form-urlencoded` body. No percent
-// decoding: the benchmark's clients post bare tokens, and a real service would
-// hand this to a decoder rather than reimplement one here.
 fn form_get(b Binary, key Binary) Option(Binary) {
 	scan_pairs(b, 0, binary.byte_size(b), key, AMP, False)
 }
 
-// The value of cookie `name` in a `Cookie:` header value. Cookie pairs are
-// `; `-separated, so leading spaces are skipped.
 fn cookie_get(b Binary, name Binary) Option(Binary) {
 	scan_pairs(b, 0, binary.byte_size(b), name, SEMI, True)
 }
 
-// One scanner for both: walk `sep`-delimited `k=v` pairs, returning the first
-// value whose key matches. `skip_sp` trims the OWS that follows a `;`.
+// The first value whose key matches, in `sep`-delimited `k=v` pairs.
 fn scan_pairs(
 	b Binary,
 	from Int,
@@ -176,9 +128,6 @@ fn scan_pairs(
 		None -> n
 	}
 	match binary.index_of(b, EQ, start) {
-		// An `=` at or past `end` belongs to the next pair, and gives the value
-		// window a negative length — which slice_bytes reports as Err, so that
-		// case lands in the fallthrough rather than matching an empty value.
 		Some(e) -> match (
 			binary.slice_bytes(b, start, e - start),
 			binary.slice_bytes(b, e + 1, end - e - 1),
@@ -206,9 +155,7 @@ fn skip_spaces(b Binary, i Int, n Int) Int {
 	}
 }
 
-// ---------------------------------------------------------------------------
 // Responses
-// ---------------------------------------------------------------------------
 
 const NAME_CONTENT_TYPE = <<'Content-Type'>>
 const NAME_SET_COOKIE = <<'Set-Cookie'>>
@@ -237,8 +184,6 @@ fn profile_json(u User) String {
 	'{"id":${u.id},"name":"${u.name}","email":"${u.email}"}'
 }
 
-// `session=<user>.<sig>` — the whole of the server's session state, carried by
-// the client and re-verified on every request.
 fn session_cookie(name String, sig Int) Binary {
 	binary.append(
 		binary.from_string('session=${name}.'),
@@ -246,12 +191,8 @@ fn session_cookie(name String, sig Int) Binary {
 	)
 }
 
-// ---------------------------------------------------------------------------
 // Handlers
-// ---------------------------------------------------------------------------
 
-// The signed cookie's user, or None if the cookie is absent, malformed, or the
-// signature does not match a freshly computed one.
 fn verify_session(req Request, t Tables) Option(User) {
 	option.then(headers.get(req.headers, NAME_COOKIE), fn(raw) option.then(
 		cookie_get(raw, <<'session'>>),

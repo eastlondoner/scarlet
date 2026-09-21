@@ -1,20 +1,10 @@
-// Bit syntax. A `<<>>` literal builds bytes out of fields whose widths are
-// measured in *bits*, and the same syntax used as a pattern takes them apart
-// again — so a whole frame header is one expression to write and one match arm
-// to read. Below: a metrics agent's wire format, encoded, decoded, and then
-// scanned byte-by-byte without ever building a String.
+// Bit syntax: `<<>>` builds and matches binaries field by field.
 
 import scarlet/binary.{Dec, Hex, Radix}
 import scarlet/result
 import scarlet/string
 
-// One frame on the wire:
-//
-//   'ALM'    3 bytes  magic
-//   version  4 bits   protocol version
-//   flags    4 bits   bit 0 set = a gauge, clear = a counter
-//   length  16 bits   payload length, in bytes
-//   payload  `length` bytes of ASCII `name=value unit`
+// A frame: 'ALM', version:4, flags:4, length:16, then `name=value unit`.
 const VERSION = 1
 const GAUGE = 1
 
@@ -25,10 +15,6 @@ type Sample {
 	gauge Bool
 }
 
-// Building the frame is a single expression. A bare string segment ('ALM')
-// contributes its UTF-8 bytes; an integer segment encodes big-endian into the
-// width it is given, so version and flags share one byte; and a `:binary`
-// segment splices in bytes as they are.
 fn encode(s Sample) Binary {
 	payload = binary.from_string('${s.name}=${s.value} ${s.unit}')
 	flags = match s.gauge {
@@ -38,8 +24,6 @@ fn encode(s Sample) Binary {
 	<<'ALM', VERSION:4, flags:4, binary.byte_size(payload):16, payload:binary>>
 }
 
-// The header alone, ignoring the payload bytes: `_:binary` consumes whatever
-// is left, so this arm matches a frame of any length.
 fn header(frame Binary) String {
 	match frame {
 		<<'ALM', version:4, flags:4, len:16, _:binary>> -> {
@@ -49,11 +33,7 @@ fn header(frame Binary) String {
 	}
 }
 
-// Decoding mirrors the build. A literal segment ('ALM') matches only those
-// bytes, `bytes(len)` takes exactly as many bytes as the length field just
-// announced — a frame whose length field lies falls through to `else` rather
-// than reading past its end — and a guard rejects a version this build does
-// not speak.
+// bytes(len) takes exactly the length the header announced.
 fn decode(frame Binary) Result(Sample, String) {
 	match frame {
 		<<'ALM', v:4, _:4, _:16, _:binary>> if v != VERSION -> { Err('unsupported version ${v}') }
@@ -62,32 +42,21 @@ fn decode(frame Binary) Result(Sample, String) {
 	}
 }
 
-// The payload is ASCII, so it is parsed as bytes: find the '=' (61) and the
-// ' ' (32) with index_of, take the fields around them with slice_bytes, and
-// read the number straight out of its bytes with parse_int.
-//
-// slice_bytes is fallible, so a window past the end — or the negative length a
-// payload like 'a b=1' produces, where the space precedes the '=' — arrives as
-// Err rather than as a silently empty field. The trailing unit needs no bound
-// at all: drop_bytes takes whatever is left.
 fn parse_payload(payload Binary, flags Int) Result(Sample, String) {
 	match (binary.index_of(payload, <<'='>>, 0), binary.index_of(payload, <<' '>>, 0)) {
-		(Some(eq), Some(sp)) -> match (
-			binary.slice_bytes(payload, 0, eq),
-			binary.slice_bytes(payload, eq + 1, sp - eq - 1),
-		) {
-			(Ok(name), Ok(digits)) -> match (
-				binary.to_string(name),
-				binary.parse_int(digits, Dec),
-				binary.to_string(binary.drop_bytes(payload, sp + 1)),
-			) {
-				(Ok(n), Ok(v), Ok(u)) -> Ok(Sample(n, v, u, flags == GAUGE))
-				_ -> Err('malformed payload')
-			}
-			_ -> Err('malformed payload')
-		}
+		(Some(eq), Some(sp)) ->
+			result.replace_err(sample(payload, eq, sp, flags == GAUGE), 'malformed payload')
 		_ -> Err('payload is not name=value unit')
 	}
+}
+
+fn sample(payload Binary, eq Int, sp Int, gauge Bool) Result(Sample, Nil) {
+	name_bytes <- result.then(binary.slice_bytes(payload, 0, eq))
+	name <- result.then(binary.to_string(name_bytes))
+	digits <- result.then(binary.slice_bytes(payload, eq + 1, sp - eq - 1))
+	value <- result.then(binary.parse_int(digits, Dec))
+	unit <- result.then(binary.to_string(binary.drop_bytes(payload, sp + 1)))
+	Ok(Sample(name, value, unit, gauge))
 }
 
 fn show(s Sample) String {
@@ -116,11 +85,7 @@ fn reject(what String, frame Binary) Nil {
 	}
 }
 
-// Frames do not arrive one per read: a socket hands over whatever bytes have
-// turned up, which may be two frames and the front of a third. `..rest` binds
-// everything past the frame the pattern just consumed, so the buffer is peeled
-// one frame at a time and whatever will not yet parse is left for the next
-// read. `<<>>` matches only an empty binary, which is how the loop ends.
+// `..rest` is what the frame did not consume.
 fn drain(buffer Binary, seen Int) Int {
 	match buffer {
 		<<>> -> seen
@@ -136,8 +101,7 @@ fn drain(buffer Binary, seen Int) Int {
 	}
 }
 
-// A `<<>>` pattern with no `..` rest is an exact-length match, so this arm
-// fires only on a one-byte binary — the two nibbles of a byte, read apart.
+// No `..rest`, so this only matches exactly one byte.
 fn nibbles(b Binary) String {
 	match b {
 		<<hi:4, lo:4>> -> 'hi=${hi} lo=${lo}'
@@ -145,9 +109,7 @@ fn nibbles(b Binary) String {
 	}
 }
 
-// Widths need not be literal, and they need not be whole bytes. A compact
-// field writes its own bit width, then the value in exactly that many bits;
-// `size(w)` reads the width back out of the binary being matched.
+// Widths can be variables, and need not be whole bytes.
 fn compact(n Int, width Int) Binary {
 	<<width:8, n:size(width)>>
 }
@@ -159,9 +121,7 @@ fn read_compact(b Binary) Result(Int, Nil) {
 	}
 }
 
-// Text segments. In an expression `:utf8` writes a whole string's bytes; in a
-// pattern it reads ONE codepoint, which is how a scanner peeks at the first
-// character of a payload without decoding the rest.
+// In a pattern, `:utf8` reads one codepoint.
 fn tag(label String, body Binary) Binary {
 	binary.append(<<label:utf8>>, body)
 }
@@ -173,8 +133,6 @@ fn first_codepoint(b Binary) Option(Int) {
 	}
 }
 
-// Dec and Hex are the two constructors of `Radix`, so a helper that works in
-// either base takes one as an ordinary argument.
 fn ascii(n Int, base Radix) String {
 	string.inspect(binary.from_int_ascii(n, base))
 }
@@ -184,9 +142,6 @@ pub fn main() {
 	round_trip(Sample('http.requests', 4210, 'req', False))
 	round_trip(Sample('heap.used', 65535, 'MiB', True))
 
-	// The same match rejects everything that is not a frame this build speaks: a
-	// length field claiming 99 bytes that are not there, a newer protocol, and
-	// bytes from some other protocol entirely.
 	println('')
 	println('-- rejects --')
 
@@ -212,8 +167,7 @@ pub fn main() {
 	println('nibbles of <<161>>:   ${nibbles(<<161>>)}')
 	println('nibbles of <<1, 2>>:  ${nibbles(<<1, 2>>)}')
 
-	// Integer segments are unsigned, big-endian, and truncate to the width they
-	// are given: only the low N bits survive.
+	// Int segments are big-endian and truncate to their width.
 	println('<<300:8>> truncates:  ${string.inspect(<<300:8>>)}')
 	println('<<-1:8>> wraps:       ${string.inspect(<<-1:8>>)}')
 	println('<<65535:16>>:         ${string.inspect(<<65535:16>>)}')
@@ -235,12 +189,8 @@ pub fn main() {
 	println('  of <<>>             ${first_codepoint(<<>>)}')
 	println('  of <<104, 105>>     ${first_codepoint(<<104, 105>>)}')
 
-	// A binary is bytes, not text: bytes that are not valid UTF-8 have no String.
 	println('to_string of raw bytes: ${binary.to_string(<<255, 254>>)}')
 
-	// Byte-level scanning of a header block, without allocating a String for any
-	// of it. This is what an HTTP-shaped parser does: find the separator, take
-	// views either side of it, compare case-insensitively, read numbers.
 	headers = <<'Content-Length: 4210\r\nRetry-After: ff\r\n'>>
 
 	println('')
@@ -250,47 +200,30 @@ pub fn main() {
 	println('index_of "\\r\\n":      ${binary.index_of(headers, <<13, 10>>, 0)}')
 	println('index_of "zz":        ${binary.index_of(headers, <<'zz'>>, 0)}')
 
-	// Every offset and length in the binary module states its unit in its own
-	// name. slice_bytes counts bytes; slice_bits counts bits; there is no
-	// function called `slice`, because the two differ by a factor of eight and
-	// a wrong window is a valid binary rather than a failure.
 	match binary.slice_bytes(headers, 0, 14) {
 		Ok(name) -> {
+			lower = binary.to_ascii_lower(name)
+			is = fn(other) binary.eq_ignore_ascii_case(name, other)
 			println('field name:           ${string.inspect(binary.to_string(name))}')
-			println(
-				'lowercased:           ${string.inspect(binary.to_string(binary.to_ascii_lower(name)))}',
-			)
-			println('is content-length:    ${binary.eq_ignore_ascii_case(name, <<'content-length'>>)}')
-			println('is content-type:      ${binary.eq_ignore_ascii_case(name, <<'content-type'>>)}')
+			println('lowercased:           ${string.inspect(binary.to_string(lower))}')
+			println('is content-length:    ${is(<<'content-length'>>)}')
+			println('is content-type:      ${is(<<'content-type'>>)}')
 		}
-		// This fixture is longer than 14 bytes, so this arm is not taken here.
-		// A parser whose field length came off the wire reaches it instead of
-		// scanning bytes the peer never sent.
 		Err(Nil) -> println('field name:           past the end')
 	}
 
-	// A window that runs past the end is Err(Nil), never a short or empty read:
-	// asking for four bytes at 900 is a question about bytes that do not exist.
 	println('past the end:         ${binary.slice_bytes(headers, 900, 4)}')
 	println('one byte over:        ${binary.slice_bytes(headers, 36, 4)}')
 
-	// drop_bytes needs no bound, so it cannot fall short: past the end the
-	// remainder really is empty. Contrast the two lines below with the one
-	// above — the same offset, and here the three bytes that are actually
-	// there rather than a failure, because nothing was promised a fourth.
 	println('drop 36:              ${string.inspect(binary.drop_bytes(headers, 36))}')
 	println('drop 900:             ${string.inspect(binary.drop_bytes(headers, 900))}')
 
-	// byte_at is total, and returns -1 rather than boxing an Option per probe.
+	// byte_at returns -1 past the end.
 	println('byte_at 0:            ${binary.byte_at(headers, 0)}')
 	println('byte_at 900:          ${binary.byte_at(headers, 900)}')
 
-	// Numbers are read straight out of the bytes, in whichever base the protocol
-	// wrote them: decimal for a length, hex for a retry-after cookie. The window
-	// is fallible and the parse is fallible, so they chain.
-	println(
-		'parse_int(Dec):       ${result.then(binary.slice_bytes(headers, 16, 4), fn(b) binary.parse_int(b, Dec))}',
-	)
+	digits = binary.slice_bytes(headers, 16, 4)
+	println('parse_int(Dec):       ${result.then(digits, fn(b) binary.parse_int(b, Dec))}')
 	println('"ff" as Dec:          ${binary.parse_int(<<'ff'>>, Dec)}')
 	println('"ff" as Hex:          ${binary.parse_int(<<'ff'>>, Hex)}')
 
@@ -298,8 +231,6 @@ pub fn main() {
 	println('255 to Hex ascii:     ${ascii(255, Hex)}')
 	println('hex ascii round trip: ${binary.parse_int(binary.from_int_ascii(4210, Hex), Hex)}')
 
-	// slice_bits is the bit-precise version — offsets and lengths in bits — and
-	// it is what reaches a field that does not start on a byte boundary.
 	println('slice bits 0..4:      ${binary.slice_bits(headers, 0, 4)}')
 	println('slice bits 8000..8:   ${binary.slice_bits(headers, 8000, 8)}')
 }
