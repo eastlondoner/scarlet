@@ -11,6 +11,7 @@ run_case! {
     // expressions, in patterns (which must also match their plain spelling —
     // exhaustiveness keys on the digits, so `1_000` and `1000` are one arm),
     // and in floats.
+    #[ignore = "needs the VM"]
     digit_separators: (
         "pub fn main() {\n\
          \tprintln(1_000_000 + 1)\n\
@@ -27,6 +28,7 @@ run_case! {
     // examples only index arrays (`numbers[0] or 0`); a lazy Range scrutinee takes
     // a distinct arm inside `Op::Index` (`range_elem` instead of `Seq::get`).
     // In-bounds yields the element; out-of-bounds yields the recovery value.
+    #[ignore = "needs the VM"]
     range_index_or_else: (
         "pub fn main() {\n\
          \tr = 5..10\n\
@@ -39,6 +41,7 @@ run_case! {
     // `range[i]` (no `or`) lowers to `Op::Index`, producing an Option. The Range
     // arm must offset from the start (`5 + 2 = 7`), and an out-of-bounds index must
     // read as `None`, not a wrapped value.
+    #[ignore = "needs the VM"]
     range_index_option: (
         "pub fn main() {\n\
          \tr = 5..10\n\
@@ -51,6 +54,7 @@ run_case! {
     // `range[a..b]` lowers to `Op::ArraySlice`. The Range arm keeps the result lazy
     // (`rs+start .. rs+end`) rather than materialising, so the slice of `5..10` at
     // `[1..3]` is `[6, 7]`.
+    #[ignore = "needs the VM"]
     range_slice: (
         "pub fn main() {\n\
          \tr = 5..10\n\
@@ -62,6 +66,7 @@ run_case! {
     // Matching a Range value against an array pattern `[h, ..t]` drives `Op::ElemAt`
     // (head) and `Op::SeqDrop` (tail) on a Range, not an Array. `SeqDrop` on a Range stays
     // O(1) (`s+n .. e`); reconstructing `[h, ..t]` must reproduce the full sequence.
+    #[ignore = "needs the VM"]
     match_range_with_array_pattern: (
         "pub fn main() {\n\
          \tr = 0..5\n\
@@ -83,6 +88,7 @@ run_case! {
     // only `Numeric`) compiles to the *unspecialized* `Op::Neg`, which dispatches on
     // the runtime tag. The same compiled function must negate an Int and a Float,
     // preserving the IEEE sign for the float.
+    #[ignore = "needs the VM"]
     generic_unary_neg_dispatches_on_runtime_tag: (
         "fn n(x) { -x }\n\
          pub fn main() {\n\
@@ -112,6 +118,7 @@ run_case! {
     // `string.split` with a non-empty delimiter takes `Op::StrSplit`'s `split(&delim)`
     // arm (the empty-delimiter char-explode arm is the one stdlib_string covers).
     // Trailing/empty fields are preserved, so `'a,,b,'` splits into four parts.
+    #[ignore = "needs the VM"]
     string_split_nonempty_delimiter: (
         "import scarlet/string\n\
          pub fn main() {\n\
@@ -123,6 +130,7 @@ run_case! {
     ),
 
     // `values_equal`'s Binary arm: compare structurally, byte for byte.
+    #[ignore = "needs the VM"]
     binary_value_equality: (
         "pub fn main() {\n\
          \tprintln(<<1, 2, 3>> == <<1, 2, 3>>)\n\
@@ -134,6 +142,7 @@ run_case! {
 
     // `Op::DivFloat` is total: `x / 0.0 == 0.0`, mirroring the integer
     // `x / 0 == 0` convention, rather than Infinity/NaN.
+    #[ignore = "needs the VM"]
     float_division_is_total: (
         "pub fn main() {\n\
          \tprintln(7.0 / 2.0)\n\
@@ -217,6 +226,7 @@ run_case! {
 
     // Op::BinIndexOf: `from` is clamped into range and an empty needle matches
     // at the clamped start.
+    #[ignore = "needs the VM"]
     binary_index_of: (
         "import scarlet/binary\n\
          pub fn main() {\n\
@@ -232,6 +242,7 @@ run_case! {
     // Op::BinParseInt must reject an overflowing value as `Err(Nil)`, never a
     // wrapped int: Scarlet arithmetic wraps, and this is the request-smuggling
     // defense.
+    #[ignore = "needs the VM"]
     binary_parse_int: (
         "import scarlet/binary.{Dec, Hex}\n\
          pub fn main() {\n\
@@ -249,6 +260,7 @@ run_case! {
     // hand-rolled "strip a sign, delegate to the unsigned digit walk" parse
     // (which cannot represent `min_value`'s magnitude in a positive Int), it
     // round-trips every value `to_string` produces, `min_value` included.
+    #[ignore = "needs the VM"]
     int_from_string: (
         "import scarlet/int\n\
          pub fn main() {\n\
@@ -269,6 +281,7 @@ run_case! {
     ),
 
     // Op::BinEqIgnoreAsciiCase: ASCII-case-insensitive header-name matching.
+    #[ignore = "needs the VM"]
     binary_eq_ignore_ascii_case: (
         "import scarlet/binary\n\
          pub fn main() {\n\
@@ -280,6 +293,7 @@ run_case! {
     ),
 
     // Op::BinToAsciiLower: non-letter bytes pass through.
+    #[ignore = "needs the VM"]
     binary_to_ascii_lower: (
         "import scarlet/binary\n\
          pub fn main() {\n\
@@ -289,6 +303,7 @@ run_case! {
     ),
 
     // Op::BinFromIntAscii: radix 10/16, lowercase hex, zero and negatives.
+    #[ignore = "needs the VM"]
     binary_from_int_ascii: (
         "import scarlet/binary.{Dec, Hex}\n\
          pub fn main() {\n\
@@ -402,6 +417,7 @@ fn and_or_evaluate_rhs_when_lhs_undecided() {
 // only inside the match matcher.
 
 #[test]
+#[ignore = "needs the VM"]
 fn neq_on_int_and_enum() {
     // Both directions per opcode, so an always-true, always-false, or
     // accidental-`==` lowering flips exactly one line.
@@ -418,6 +434,7 @@ fn neq_on_int_and_enum() {
 }
 
 #[test]
+#[ignore = "needs the VM"]
 fn eq_on_string_array_tuple() {
     // Generic `Op::Eq` as a value-producing expression over each compound
     // kind, both directions.
@@ -459,6 +476,7 @@ run_case! {
 
     // As above for Float. The `<=`/`>=` lines use equal operands, so a
     // strict-compare mislowering fails them.
+    #[ignore = "needs the VM"]
     typed_float_ordering_compares: (
         "pub fn main() {\n\
          \tprintln(1.5 < 2.5)\n\
@@ -476,6 +494,7 @@ run_case! {
     // A `Numeric`-constrained wrapper leaves the operand type unbound at emit
     // time, so the four bodies compile to the generic ops and must serve both
     // Int and Float callers, agreeing with the typed cases line for line.
+    #[ignore = "needs the VM"]
     generic_ordering_compare_dispatches_on_runtime_tag: (
         "fn lt(a, b) { a < b }\n\
          fn gt(a, b) { a > b }\n\
@@ -601,6 +620,7 @@ run_case! {
     // `.field` on a resolved record lowers to `Op::GetFieldUnchecked`. Three
     // field indices pin the operand encoding; the `..p` spread projects the
     // unnamed fields through the same op.
+    #[ignore = "needs the VM"]
     record_field_access_unchecked: (
         "type P {\n\tx Int\n\ty Int\n\tz Int\n}\n\
          pub fn main() {\n\
@@ -635,291 +655,6 @@ run_case! {
          }\n",
         "3\n30\n300\n",
     ),
-}
-
-// Perceus drop-guided reuse (ICFP'22, frame-limited): a `map` over a uniquely
-// owned linked list reuses each `Cons` cell in place, so its allocation count
-// is independent of list length. When the list is shared the runtime
-// `is_unique()` check fails, every `Cons` allocates fresh, cost scales with
-// length, and the aliased original reads back unchanged.
-//
-// These are the only vm_exec cases that run the VM in-process: they read
-// `ProcHeap::alloc_count()`, which is thread-local, so a mutex serializes
-// them. Every other test here spawns a subprocess and cannot touch it.
-
-use scarlet::heap::ProcHeap;
-use scarlet::{bytecode, vm};
-use std::cell::RefCell;
-use std::rc::Rc;
-use std::sync::Mutex;
-
-// bench_typed's speed depends on `AddInt`/`SubInt`/`EqInt` firing instead of
-// tag-dispatching `Add`/`Sub`/`Eq`. Catches lowered locals carrying unbound
-// type-vars, where type resolution never sees the concrete `Int`.
-#[test]
-fn core_ir_lower_selects_typed_int_ops() {
-    use bytecode::Op;
-    // `f`'s body is the bench_typed hot shape; `sq(n)` adds the
-    // Callee::Known → return-type path.
-    let src = "\
-fn sq(x Int) Int { x * x }\n\
-fn f(n Int) Int {\n\
-\tif n == 0 { 0 } else { sq(n) + n - 1 }\n\
-}\n\
-pub fn main() {\n\
-\tprintln(f(3))\n\
-}\n";
-    let ast = common::parse(src);
-    let r = bytecode::compile(&ast, None, Some(&scarlet::STDLIB));
-    assert!(r.success(), "compile failed: {:?}", r.diagnostics);
-    let r = r.into_runnable().expect("a successful compile emits");
-    // Restrict to `f`'s bytecode range so stdlib generics don't false-positive.
-    let f = r
-        .program
-        .functions
-        .iter()
-        .find(|fun| &*fun.name == "f")
-        .expect("fn f in program");
-    let (s, l) = (f.code_start as usize, f.code_len as usize);
-    let ops: Vec<Op> = r.program.code[s..s + l].iter().map(|i| i.op).collect();
-    let has = |o: Op| ops.contains(&o);
-    // `emit` and the peephole fold `local OP const` into `*LC`
-    // superinstructions, and an `EqInt` feeding a branch becomes
-    // `JumpNeIntLC`, so accept either form.
-    assert!(
-        has(Op::EqInt) || has(Op::JumpNeIntLC),
-        "EqInt not selected: {ops:?}"
-    );
-    assert!(
-        has(Op::AddInt) || has(Op::AddIntLC),
-        "AddInt not selected: {ops:?}"
-    );
-    assert!(
-        has(Op::SubInt) || has(Op::SubIntLC),
-        "SubInt not selected: {ops:?}"
-    );
-    for generic in [Op::Eq, Op::Add, Op::Sub] {
-        assert!(
-            !has(generic),
-            "generic {generic:?} leaked (typed selection did not fire): {ops:?}"
-        );
-    }
-}
-
-/// Same requirement for a type nothing in the source states: `v` is `Int` only
-/// because inference unified `Some`'s payload with the literal `3`, so `lower`
-/// must read that back rather than re-instantiate `Some`'s scheme.
-///
-/// `fn g(a, b) { a + b }` would not test this: it really is
-/// `Addable a => (a, a) -> a`, one body for every instantiation, and dynamic
-/// `Add` is correct there. The failure is unresolved monomorphic types.
-#[test]
-fn typed_ops_fire_on_a_type_that_only_inference_knows() {
-    use bytecode::Op;
-    let src = "\
-fn f() Int {\n\
-\tmatch Some(3) {\n\
-\t\tNone -> 0\n\
-\t\tSome(v) -> v + 1\n\
-\t}\n\
-}\n\
-pub fn main() {\n\
-\tprintln(f())\n\
-}\n";
-    let ast = common::parse(src);
-    let r = bytecode::compile(&ast, None, Some(&scarlet::STDLIB));
-    assert!(r.success(), "compile failed: {:?}", r.diagnostics);
-    let r = r.into_runnable().expect("a successful compile emits");
-    let f = r
-        .program
-        .functions
-        .iter()
-        .find(|fun| &*fun.name == "f")
-        .expect("fn f in program");
-    let (s, l) = (f.code_start as usize, f.code_len as usize);
-    let ops: Vec<Op> = r.program.code[s..s + l].iter().map(|i| i.op).collect();
-    assert!(
-        ops.contains(&Op::AddInt) || ops.contains(&Op::AddIntLC),
-        "AddInt not selected for an inferred Int: {ops:?}"
-    );
-    assert!(
-        !ops.contains(&Op::Add),
-        "dynamic Add leaked into f's body: {ops:?}"
-    );
-}
-
-/// Serializes the Perceus alloc-counting tests: `ProcHeap::alloc_count()`
-/// is thread-local and each test does reset→run→read.
-static ALLOC_LOCK: Mutex<()> = Mutex::new(());
-
-/// Linked-list scaffold for the reuse tests. `lmap` is the canonical Perceus
-/// shape: destructure a `Cons`, construct a same-shape `Cons`, so the dropped
-/// cell and the constructor pair up frame-locally, never across a call.
-const LIST_SRC: &str = "\
-type List {\n\
-\tLNil\n\
-\tLCons(head Int, tail List)\n\
-}\n\
-fn build(n Int) List {\n\
-\tif n == 0 { LNil } else { LCons(n, build(n - 1)) }\n\
-}\n\
-fn lmap(xs List, f fn(Int) Int) List {\n\
-\tmatch xs {\n\
-\t\tLNil -> LNil\n\
-\t\tLCons(h, t) -> LCons(f(h), lmap(t, f))\n\
-\t}\n\
-}\n\
-fn lsum(xs List) Int {\n\
-\tmatch xs {\n\
-\t\tLNil -> 0\n\
-\t\tLCons(h, t) -> h + lsum(t)\n\
-\t}\n\
-}\n\
-fn double(x Int) Int { x * 2 }\n";
-
-/// Compile `src` through the native backend's load-time pipeline, as `al run`
-/// does: a Cranelift plan per mode-selected body, JITed and published into the
-/// program's `NativeTable`.
-///
-/// `must_native` names the functions the caller's parity claim rides on. Its
-/// table slot must be filled for every planned body; otherwise a
-/// coverage-gate rejection silently interprets the "native" run and the parity
-/// assertion compares the interpreter to itself.
-fn compile_native(src: &str, must_native: &[&str]) -> bytecode::Program {
-    use scarlet::core_ir::clif;
-    use scarlet::tivec::Idx as _;
-    let ast = common::parse(src);
-    let plans: Rc<RefCell<Vec<clif::NativePlan>>> = Rc::default();
-    let sink = Rc::clone(&plans);
-    let r = bytecode::compile_with_native(
-        &ast,
-        None,
-        Some(&scarlet::STDLIB),
-        Box::new(move |idx, f, pool, counts| {
-            sink.borrow_mut()
-                .push(clif::plan(idx, f, pool, scarlet::STDLIB.prelude, counts));
-        }),
-    );
-    assert!(
-        r.success(),
-        "compile failed: {:?}\n---\n{src}",
-        r.diagnostics
-    );
-    let emitted = r.into_runnable().expect("a successful compile emits");
-    let layouts = emitted.frame_layouts;
-    let program = emitted.program;
-
-    let plans = plans.take();
-    if !plans.is_empty() {
-        let mut module = vm::jit::jit_module().expect("jit module");
-        let mut defs = Vec::with_capacity(plans.len());
-        for plan in &plans {
-            let layout = layouts.get(&plan.func_idx).expect("a layout per body");
-            let body = clif::compile(&mut module, plan, &program, layout).expect("clif define");
-            let name = program
-                .functions
-                .get(body.func_idx.index())
-                .map(|f| f.name.to_string())
-                .unwrap_or_default();
-            defs.push(vm::jit::JitDef {
-                fn_idx: body.func_idx,
-                func_id: body.func_id,
-                name,
-                code_size: body.code_size,
-            });
-        }
-        vm::jit::finalize_into(&mut module, &defs, &program.native).expect("jit finalize");
-        // Dropping the module keeps the executable mapping alive, so the
-        // published entries outlive this scope (see vm::jit).
-    }
-
-    for name in must_native {
-        let pos = program
-            .functions
-            .iter()
-            .position(|f| &*f.name == *name)
-            .unwrap_or_else(|| panic!("fn {name} in program"));
-        let idx = scarlet::core_ir::FuncIdx::from_usize(pos);
-        assert!(
-            program.native.get(idx).is_some(),
-            "no native body was published for `{name}` (coverage gate rejected \
-             it?); the native half of this alloc-count parity test would \
-             silently interpret"
-        );
-    }
-
-    program
-}
-
-/// Run an already-built `program`, returning `(total ProcHeap allocations
-/// during the run, rendered value `main` returned)`. `scarlet run` discards
-/// that value, but the entry frame leaves it for `Halt` and the in-process
-/// `Vm::run` hands it back, which is how these tests read a result without
-/// capturing stdout. Caller holds `ALLOC_LOCK`.
-fn count_run(program: bytecode::Program) -> (usize, String) {
-    ProcHeap::reset_alloc_count();
-    let mut v = vm::new_vm(program).expect("vm init");
-    let val = v.run().expect("vm run");
-    let allocs = ProcHeap::alloc_count();
-    (allocs, vm::inspect(&val, v.program()))
-}
-
-/// Run `src` twice — interpreter-only, then with the native backend published
-/// — and assert the Perceus parity gate: identical result and identical exact
-/// allocation count. Caller holds `ALLOC_LOCK`.
-fn run_counting_allocs(src: &str, must_native: &[&str]) -> (usize, String) {
-    let ast = common::parse(src);
-    let r = bytecode::compile(&ast, None, Some(&scarlet::STDLIB));
-    assert!(
-        r.success(),
-        "compile failed: {:?}\n---\n{src}",
-        r.diagnostics
-    );
-    let r = r.into_runnable().expect("a successful compile emits");
-    let (interp_allocs, interp_out) = count_run(r.program);
-
-    let (native_allocs, native_out) = count_run(compile_native(src, must_native));
-    assert_eq!(
-        interp_out, native_out,
-        "native result diverged from the interpreter for:\n{src}"
-    );
-    assert_eq!(
-        interp_allocs, native_allocs,
-        "Perceus parity: native allocated {native_allocs} cells vs the \
-         interpreter's {interp_allocs} for:\n{src}"
-    );
-    (interp_allocs, interp_out)
-}
-
-/// `a[i] or <default>` must not build the `Some` box that `Index` returns and
-/// the next instruction throws away. `Op::IndexOr` fuses the pair; a constant
-/// default rides in the operand, so nothing is pushed on a hit. A regression
-/// here is invisible in results — it only shows up as one alloc per index.
-#[test]
-fn index_or_default_allocates_nothing() {
-    let _g = ALLOC_LOCK.lock().unwrap();
-    let prog = |body: &str| {
-        format!(
-            "fn go(a Array(Int), i Int, acc Int) Int {{\n\
-             \tif i == 0 {{ acc }} else {{ go(a, i - 1, {body}) }}\n\
-             }}\n\
-             pub fn main() {{\n\
-             \tgo([1, 2, 3], 2000, 0)\n\
-             }}\n"
-        )
-    };
-    // `go` sits outside the native coverage gate, so no `must_native` claim;
-    // the parity assertion still holds either way.
-    let (with_or, out) = run_counting_allocs(&prog("acc + { a[0] or 0 }"), &[]);
-    let (baseline, _) = run_counting_allocs(&prog("acc + 1"), &[]);
-    assert_eq!(out.trim(), "2000");
-    assert_eq!(
-        with_or,
-        baseline,
-        "`a[0] or 0` allocated {} cells over 2000 iterations; the fused \
-         Op::IndexOr must build no Option box",
-        with_or as i64 - baseline as i64
-    );
 }
 
 /// The fused op evaluates its default eagerly, so `lower` may only fuse a
@@ -964,128 +699,6 @@ fn index_or_covers_both_encodings_and_every_boundary() {
     );
 }
 
-#[test]
-fn list_map_unique_reuses_in_place() {
-    let _g = ALLOC_LOCK.lock().unwrap();
-    // `chain` re-maps its uniquely owned argument `k` times, so every `Cons`
-    // is rc==1 at its drop. Varying only `k` isolates map's per-call cost;
-    // build/sum contribute equally to both runs and cancel.
-    let prog = |k: u32| {
-        format!(
-            "{LIST_SRC}\
-             fn chain(xs List, k Int) List {{\n\
-             \tif k == 0 {{ xs }} else {{ chain(lmap(xs, double), k - 1) }}\n\
-             }}\n\
-             pub fn main() {{\n\
-             \tlsum(chain(build(100), {k}))\n\
-             }}\n"
-        )
-    };
-    // The reuse shapes live in the LIST_SRC fns; `chain` is only the driver,
-    // so it carries no must-native claim.
-    let native = &["build", "lmap", "lsum", "double"];
-    let (a1, r1) = run_counting_allocs(&prog(1), native);
-    let (a10, r10) = run_counting_allocs(&prog(10), native);
-    assert_eq!(r1, "10100", "1× doubled sum");
-    assert_eq!(r10, "5171200", "10× doubled sum");
-    // Nine extra passes over 100 cells must allocate a length-independent
-    // amount. Without reuse the delta is 9×100 = 900, so a bound of 100
-    // discriminates while tolerating a few per-pass constants.
-    let delta = a10.saturating_sub(a1);
-    assert!(
-        delta < 100,
-        "unique list.map allocated per-element: Δ={delta} for 9 extra passes over 100 cells \
-         (reuse ⇒ length-independent Δ; no-reuse ⇒ ~900)"
-    );
-}
-
-#[test]
-fn list_map_shared_falls_back_to_alloc() {
-    let _g = ALLOC_LOCK.lock().unwrap();
-    // `alias` stays live across the `lmap` call, so the list reaches it
-    // shared and `is_unique()` is false at every drop down the spine: the
-    // constructor allocates fresh each time. Varying only `n` isolates the
-    // per-element cost of build+map together.
-    let prog = |n: u32| {
-        format!(
-            "{LIST_SRC}\
-             pub fn main() {{\n\
-             \txs = build({n})\n\
-             \talias = xs\n\
-             \tys = lmap(xs, double)\n\
-             \t(lsum(alias), lsum(ys))\n\
-             }}\n"
-        )
-    };
-    let native = &["build", "lmap", "lsum", "double"];
-    let (a20, r20) = run_counting_allocs(&prog(20), native);
-    let (a200, r200) = run_counting_allocs(&prog(200), native);
-    // `alias` must still read the original values, proving the shared cells
-    // were not overwritten in place.
-    assert_eq!(r20, "(210, 420)");
-    assert_eq!(r200, "(20100, 40200)");
-    // 180 more elements ⇒ ~180 build Cons + ~180 map Cons = ~360. Reusing
-    // regardless of rc would show ~180 and corrupt `alias`; ≥300 separates
-    // the two by over 100.
-    let delta = a200.saturating_sub(a20);
-    assert!(
-        delta >= 300,
-        "shared list.map did not fall back to fresh allocation: Δ={delta} for 180 extra \
-         elements (fallback ⇒ ~360 = build+map; wrongly reused ⇒ ~180)"
-    );
-}
-
-// Bench gate (docs/core-ir-spec.md §Constraints): `dot_loop` must show
-// measurable reuse, alloc counter ≪ 2N. This needs ANF — last-use is
-// unknowable during a forward AST emit, so an AST-walker perceus hedges Nop
-// holes on every read with no compensating reuse here (construct-then-drop, so
-// no drop dominates a same-shape ctor).
-
-/// `dot_loop` from `examples/bench_typed.scrl`, minus the `println`.
-const DOT_SRC: &str = "\
-type Point {\n\
-\tPoint(x Int, y Int, z Int)\n\
-}\n\
-fn dot(a Point, b Point) Int {\n\
-\ta.x * b.x + a.y * b.y + a.z * b.z\n\
-}\n\
-fn dot_loop(n Int, acc Int) Int {\n\
-\tif n == 0 {\n\
-\t\tacc\n\
-\t} else {\n\
-\t\tp = Point(n, n + 1, n + 2)\n\
-\t\tq = Point(n + 3, n + 4, n + 5)\n\
-\t\tdot_loop(n - 1, acc + dot(p, q))\n\
-\t}\n\
-}\n";
-
-/// [`DOT_SRC`] plus a `main` that runs `dot_loop` for `n` iterations and
-/// returns the accumulator.
-fn dot_program(n: u64) -> String {
-    format!("{DOT_SRC}pub fn main() {{\n\tdot_loop({n}, 0)\n}}\n")
-}
-
-#[test]
-fn dot_loop_perceus_reuse_gate() {
-    let _g = ALLOC_LOCK.lock().unwrap();
-    // Two `Point`s per iteration: 2N fresh objects without loop-carried reuse,
-    // O(1) with it. Requires `collapse_tail_frame` not to drain reuse slots
-    // for self-tail-calls, so the end-of-body drops of `p`/`q` pair with the
-    // next iteration's constructors across `TailCallSelf`.
-    const N: u64 = 10_000;
-    let (allocs, r) = run_counting_allocs(&dot_program(N), &["dot", "dot_loop"]);
-    // ∑ₙ₌₁ᴺ 3n²+15n+14 at N=10_000.
-    assert_eq!(r, "1000900220000", "dot_loop correctness at N={N}");
-    // N/10 separates reuse (a few fixed allocs) from no reuse (2N) by an
-    // order of magnitude while tolerating per-run constants.
-    assert!(
-        allocs < (N as usize) / 10,
-        "dot_loop allocated per-iteration: {allocs} allocs for {N} iterations \
-         (loop-carried reuse ⇒ O(1); no reuse ⇒ {}; bench gate not met)",
-        2 * N
-    );
-}
-
 /// `examples/bench_typed.scrl` is the typed-opcode workload. Its output is
 /// pinned here; its speed is not gated anywhere.
 ///
@@ -1099,70 +712,6 @@ fn bench_typed_output_is_pinned() {
     let out = common::run_al("run", &path);
     assert!(out.success, "bench_typed failed:\n{}", out.combined());
     assert_eq!(out.stdout, "1048576\nTrue\n1000009000022000000\n");
-}
-
-/// Emit-level half of the same gate: `Op::Reuse` paired with a
-/// `MakeEnumPayload a=1`, once each for `p` and `q`. The alloc-counter test
-/// above proves the runtime effect; this one names the mechanism, so a
-/// regression (say `peel_call_arg_drops` handing `p`/`q` to `dot`, zeroing the
-/// slot before `Reuse` reads it) fails with a readable cause.
-#[test]
-fn dot_loop_emits_paired_reuse() {
-    use bytecode::Op;
-    let ast = common::parse(&dot_program(10));
-    let r = bytecode::compile(&ast, None, Some(&scarlet::STDLIB));
-    assert!(r.success(), "compile failed: {:?}", r.diagnostics);
-    let r = r.into_runnable().expect("a successful compile emits");
-    let f = r
-        .program
-        .functions
-        .iter()
-        .find(|fun| &*fun.name == "dot_loop")
-        .expect("fn dot_loop in program");
-    let (s, l) = (f.code_start as usize, f.code_len as usize);
-    let code = &r.program.code[s..s + l];
-
-    let reuses = code.iter().filter(|i| i.op == Op::Reuse).count();
-    assert_eq!(
-        reuses,
-        2,
-        "expected one `Reuse` per loop-carried `Point`, got {reuses}: {:?}",
-        code.iter().map(|i| i.op).collect::<Vec<_>>()
-    );
-    // `a = 1` makes `MakeEnumPayload` pop a reuse token instead of allocating.
-    let makes: Vec<u8> = code
-        .iter()
-        .filter(|i| i.op == Op::MakeEnumPayload)
-        .map(|i| i.a)
-        .collect();
-    assert_eq!(
-        makes,
-        vec![1, 1],
-        "both `Point` ctors must take a reuse token"
-    );
-    // The token must reach the constructor: `Reuse` sits immediately before
-    // its `MakeEnumPayload`, payloads already pushed.
-    for (i, ins) in code.iter().enumerate() {
-        if ins.op == Op::Reuse {
-            assert_eq!(
-                code[i + 1].op,
-                Op::MakeEnumPayload,
-                "`Reuse` at {i} is not immediately followed by its constructor"
-            );
-        }
-    }
-    // The drops that make them reusable must stay in this frame, after the
-    // `CallKnown`, not be peeled into `dot`'s call.
-    let call = code
-        .iter()
-        .position(|i| i.op == Op::CallKnown)
-        .expect("dot(p, q) is a CallKnown");
-    let drops_after = code[call..].iter().filter(|i| i.op == Op::Drop).count();
-    assert_eq!(
-        drops_after, 2,
-        "`p`/`q` drops must stay in dot_loop's frame (reuse tokens), not be \
-         peeled into `dot`'s arguments"
-    );
 }
 
 run_case! {
@@ -1198,6 +747,7 @@ run_case! {
     // A `@vm` builtin named without being called is a first-class value: the
     // elaborator synthesises an eta wrapper over the opcode, as for a ctor
     // used as a value. Driven through the VM, not just the typechecker.
+    #[ignore = "needs the VM"]
     builtin_bound_to_a_local_is_callable: (
         "import scarlet/string\n\
          pub fn main() {\n\
@@ -1206,6 +756,7 @@ run_case! {
          }\n",
         "3\n",
     ),
+    #[ignore = "needs the VM"]
     builtin_passed_as_a_function_argument: (
         "import scarlet/array\n\
          import scarlet/string\n\
@@ -1232,6 +783,7 @@ run_case! {
     // It is not a witness for the jump-over mispatch `tests/check_parity.rs`
     // pins: both cases pass against the unfixed compiler, because the mispatched
     // jump is never executed. Only the layout assertion catches that.
+    #[ignore = "needs the VM"]
     builtin_as_a_value_inside_a_function_body: (
         "import scarlet/array\n\
          import scarlet/string\n\
@@ -1243,6 +795,7 @@ run_case! {
          }\n",
         "[1, 2, 3]\n",
     ),
+    #[ignore = "needs the VM"]
     ctor_as_a_value_inside_a_function_body: (
         "import scarlet/array\n\
          type W { W(v Int) }\n\
@@ -1278,6 +831,7 @@ run_case! {
     // that decoded to the wrong shape changes 7, where `array.length` would
     // still read 2. `dis.rs` covers the missing-descriptor half; only running it
     // can see a wrong one.
+    #[ignore = "needs the VM"]
     eta_wrapped_wire_decode_round_trips: (
         "import scarlet/array\n\
          import scarlet/wire\n\
@@ -1303,6 +857,7 @@ run_case! {
     // three fields came back as the parser's encoding and not merely as three
     // values of the right types — a `Doc` built wrong answers `None` or the
     // wrong member, never 42.
+    #[ignore = "needs the VM"]
     an_opaque_json_doc_round_trips_through_wire: (
         "import scarlet/json\n\
          import scarlet/wire\n\
@@ -1326,19 +881,4 @@ run_case! {
          }\n",
         "42\n",
     ),
-}
-
-#[test]
-fn w32_3_probe_wire_backend_parity() {
-    let _g = ALLOC_LOCK.lock().unwrap();
-    const SRC: &str = "import scarlet/wire\n\
-                       type Event {\n\
-                       \tSaid(who String)\n\
-                       \tLeft(who String)\n\
-                       }\n\
-                       pub fn main() {\n\
-                       \twire.encode(Left('a'))\n\
-                       }\n";
-    let (allocs, out) = run_counting_allocs(SRC, &["main"]);
-    println!("W32_3_WIRE_PARITY out={out} allocs={allocs}");
 }

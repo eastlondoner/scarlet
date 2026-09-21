@@ -22,7 +22,6 @@ use crate::typed_ir::{RTy, ResolvedPool};
 /// make `is_heap` answer `false` by accident.
 pub(crate) fn perceus(pool: &ResolvedPool, f: CoreFn) -> CoreFn {
     let CoreFn {
-        name,
         params,
         body,
         ret_ty,
@@ -41,7 +40,6 @@ pub(crate) fn perceus(pool: &ResolvedPool, f: CoreFn) -> CoreFn {
         .collect();
     let body = cx.wrap_drops(&dead_params, None, body);
     CoreFn {
-        name,
         params,
         body: reuse_pass(body),
         ret_ty,
@@ -171,9 +169,12 @@ impl<'p> Perceus<'p> {
                     // Strip and re-derive, so the pass is safe to rerun.
                     e = *body;
                 }
+                // A tail call gives up every reference its frame still holds
+                // once it has read its arguments, so its arguments need no
+                // `Drop` here. One here would come before the read.
                 CoreExpr::Tail(a) => {
                     let live = atom_live(&a);
-                    break (self.release_self_tail_args(a), live);
+                    break (CoreExpr::Tail(a), live);
                 }
                 CoreExpr::Goto(id) => {
                     // The edge hands the cont ownership of exactly its live-in
@@ -260,43 +261,6 @@ impl<'p> Perceus<'p> {
         (body, live)
     }
 
-    /// Release the argument slots of a self-tail-call.
-    ///
-    /// `TailCallSelf` keeps its frame and does not drain `[base, args_start)`
-    /// the way every other tail call does, because those slots *are* the
-    /// per-frame reuse table. Without this, a heap argument still sitting in a
-    /// local slot enters the next iteration at rc==2 and its `Drop` refuses to
-    /// hollow it, so a self-recursive `map` never reuses.
-    ///
-    /// `emit::split_self_tail_drops` sinks these drops past the operand pushes,
-    /// so the `PushLocal` dup keeps the value alive while the slot's own
-    /// reference goes. `shape: None` keeps the reuse walk from parking a live
-    /// cell as a token.
-    fn release_self_tail_args(&mut self, a: Atom) -> CoreExpr {
-        let Atom::Call {
-            callee: Callee::Self_,
-            args,
-        } = &a
-        else {
-            return CoreExpr::Tail(a);
-        };
-        let mut moved: Vec<LocalId> = Vec::new();
-        for &x in args {
-            if !moved.contains(&x) && self.is_heap_local(x) {
-                moved.push(x);
-            }
-        }
-        let mut body = CoreExpr::Tail(a);
-        for &x in moved.iter().rev() {
-            body = CoreExpr::Drop {
-                local: x,
-                shape: None,
-                body: Box::new(body),
-            };
-        }
-        body
-    }
-
     fn drop_match(
         &mut self,
         scrut: LocalId,
@@ -372,7 +336,7 @@ impl<'p> Perceus<'p> {
                 }
                 (
                     fields.iter().map(|b| b.id).collect(),
-                    Some(ReuseShape::enum_(fields.len())),
+                    Some(ReuseShape::ctor(fields.len())),
                 )
             }
         }
@@ -454,7 +418,7 @@ impl ReuseWalk {
                     // A 0-payload cell has nothing to reuse: the header is the
                     // whole allocation.
                     if let Some(s) = *shape
-                        && s.words > 0
+                        && s.fields > 0
                     {
                         avail.push(Token {
                             slot: *local,
@@ -470,7 +434,7 @@ impl ReuseWalk {
                     // callee. Frame-limited (ICFP'22 §4) constrains reuse to
                     // this frame; it does not fence intra-frame call sites.
                     if let Atom::Ctor { fields, reuse, .. } = rhs {
-                        let want = ReuseShape::enum_(fields.len());
+                        let want = ReuseShape::ctor(fields.len());
                         // Prefer this bind's own slot: `StoreLocal` is about to
                         // overwrite it, so a same-slot token must be consumed
                         // here or discarded by the retain below.
@@ -516,7 +480,7 @@ impl ReuseWalk {
                 CoreExpr::Tail(a) => {
                     match a {
                         Atom::Ctor { fields, reuse, .. } => {
-                            let want = ReuseShape::enum_(fields.len());
+                            let want = ReuseShape::ctor(fields.len());
                             if let Some(i) =
                                 avail.iter().rposition(|t| !t.carried && t.shape == want)
                             {
@@ -653,11 +617,83 @@ fn unscoped_goto(id: JoinId) -> ! {
     )
 }
 
+/// Take a module toplevel's pinned globals back out of Perceus's hands: no
+/// `Drop` releases one, and no `Ctor` reuses one's cell.
+///
+/// Perceus sees only the toplevel, where a global's last read is not its last
+/// use: function bodies read it through `Load::Global` for as long as the
+/// program runs. Releasing or overwriting it at the toplevel's last read would
+/// free a value the program still holds.
+pub(crate) fn keep_globals(mut f: CoreFn) -> CoreFn {
+    let pinned: BTreeSet<LocalId> = f
+        .body
+        .toplevel_globals()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    if !pinned.is_empty() {
+        spare(&mut f.body, &pinned);
+    }
+    f
+}
+
+/// [`keep_globals`]'s walk. Iterative along each spine and recursive only into
+/// branches, so a long toplevel costs no stack depth.
+fn spare(mut e: &mut CoreExpr, pinned: &BTreeSet<LocalId>) {
+    loop {
+        if let CoreExpr::Drop { local, body, .. } = &mut *e
+            && pinned.contains(local)
+        {
+            let rest = std::mem::replace(&mut **body, CoreExpr::Tail(Atom::Nil));
+            *e = rest;
+            continue;
+        }
+        match e {
+            CoreExpr::Let { rhs, body, .. } => {
+                spare_atom(rhs, pinned);
+                e = body;
+            }
+            CoreExpr::LetJoin { join, body, .. } => {
+                spare(join, pinned);
+                e = body;
+            }
+            CoreExpr::LetCont { cont, body, .. } => {
+                spare(cont, pinned);
+                e = body;
+            }
+            CoreExpr::Drop { body, .. } => e = body,
+            CoreExpr::If { then, els, .. } => {
+                spare(then, pinned);
+                e = els;
+            }
+            CoreExpr::Match { arms, .. } => {
+                for (_, body) in arms {
+                    spare(body, pinned);
+                }
+                return;
+            }
+            CoreExpr::Tail(a) => {
+                spare_atom(a, pinned);
+                return;
+            }
+            CoreExpr::Goto(_) => return,
+        }
+    }
+}
+
+fn spare_atom(a: &mut Atom, pinned: &BTreeSet<LocalId>) {
+    if let Atom::Ctor { reuse, .. } = a
+        && reuse.is_some_and(|r| pinned.contains(&r))
+    {
+        *reuse = None;
+    }
+}
+
 /// Known allocation shape of a `Let`'s rhs. Only a `Ctor` rhs proves a shape;
 /// `Call`/`PrimOp` results have no statically-known arity.
 fn ctor_shape(a: &Atom) -> Option<ReuseShape> {
     match a {
-        Atom::Ctor { fields, .. } => Some(ReuseShape::enum_(fields.len())),
+        Atom::Ctor { fields, .. } => Some(ReuseShape::ctor(fields.len())),
         _ => None,
     }
 }
@@ -665,11 +701,11 @@ fn ctor_shape(a: &Atom) -> Option<ReuseShape> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bytecode::Op;
+    use crate::core_ir::PrimOp;
     use crate::core_ir::testkit::{bind, ctor, func, local, variant};
     use crate::core_ir::{ConstId, FuncIdx};
     use crate::type_def::TypeId;
-    use crate::types::{PrimIds, StrId};
+    use crate::types::PrimIds;
 
     /// The same arena the elaborator hands `perceus` in the real pipeline.
     fn pool() -> ResolvedPool {
@@ -678,13 +714,13 @@ mod tests {
 
     /// A nominal, non-primitive type: heap-shaped, unknown allocation width.
     fn con(p: &mut ResolvedPool, id: i32) -> RTy {
-        p.mk_con(TypeId(id), StrId::NONE, &[])
+        p.mk_con(TypeId(id), &[])
     }
 
     /// The unboxed `Int` — heap-shaped `false`, so no `Drop`.
     fn int_ty(p: &mut ResolvedPool) -> RTy {
         let int = p.prims().int;
-        p.mk_con(int, StrId::NONE, &[])
+        p.mk_con(int, &[])
     }
 
     fn count_drops(e: &CoreExpr) -> usize {
@@ -759,6 +795,59 @@ mod tests {
     /// `map` shape: match xs { Cons(h,t) -> Cons(h+h, self t) | Nil -> Nil }.
     /// The Cons arm's tail Cons reuses `%0` across the recursive call; the Nil
     /// arm's arity-0 ctor does not pair.
+    /// A toplevel keeps every value it pins to a global: Perceus's drop of
+    /// one and a constructor's reuse of its cell both go, while a plain
+    /// temporary's drop stays.
+    #[test]
+    fn keep_globals_spares_pinned_globals_only() {
+        let mut pool = pool();
+        let obj = con(&mut pool, 7);
+        let mut global = bind(0, obj);
+        global.global = Some(crate::typed_ir::GlobalSlot(0));
+        let reuse_global = Atom::Ctor {
+            variant: variant(),
+            fields: Vec::new(),
+            reuse: Some(local(0)),
+        };
+        let top = func(
+            Vec::new(),
+            CoreExpr::Let {
+                bind: global,
+                rhs: ctor(&[]),
+                body: Box::new(CoreExpr::Let {
+                    bind: bind(1, obj),
+                    rhs: ctor(&[]),
+                    body: Box::new(CoreExpr::Drop {
+                        local: local(0),
+                        shape: Some(ReuseShape::ctor(0)),
+                        body: Box::new(CoreExpr::Drop {
+                            local: local(1),
+                            shape: Some(ReuseShape::ctor(0)),
+                            body: Box::new(CoreExpr::Tail(reuse_global)),
+                        }),
+                    }),
+                }),
+            },
+            obj,
+        );
+        let kept = keep_globals(top);
+        assert_eq!(count_drops(&kept.body), 1, "only the temporary is dropped");
+        assert!(
+            matches!(
+                kept.body,
+                CoreExpr::Let { ref body, .. }
+                    if matches!(**body, CoreExpr::Let { ref body, .. }
+                        if matches!(**body, CoreExpr::Drop { local, .. } if local == LocalId(1)))
+            ),
+            "the global's drop is the one removed"
+        );
+        assert_eq!(
+            ctor_reuses(&kept.body),
+            vec![None, None, None],
+            "no constructor reuses the global's cell"
+        );
+    }
+
     #[test]
     fn map_reuse_across_call_and_arm_shape() {
         let mut pool = pool();
@@ -766,7 +855,7 @@ mod tests {
         let int = int_ty(&mut pool);
         let cons_body = CoreExpr::Let {
             bind: bind(3, int),
-            rhs: Atom::prim(Op::AddInt, vec![local(1), local(1)]),
+            rhs: Atom::prim(PrimOp::IntAdd, vec![local(1), local(1)]),
             body: Box::new(CoreExpr::Let {
                 bind: bind(4, list),
                 rhs: Atom::Call {
@@ -891,6 +980,28 @@ mod tests {
         assert!(find_drop(&f.body, local(3)));
     }
 
+    /// A tail call reads its arguments before its frame's references go, so
+    /// no argument is dropped ahead of it: that drop would come before the
+    /// read. Other locals the frame holds still drop as usual.
+    #[test]
+    fn a_tail_call_argument_is_not_dropped_before_the_call() {
+        let mut pool = pool();
+        let list = con(&mut pool, 99);
+        for callee in [Callee::Self_, Callee::Known(FuncIdx(3))] {
+            let body = CoreExpr::Let {
+                bind: bind(1, list),
+                rhs: ctor(&[0]),
+                body: Box::new(CoreExpr::Tail(Atom::Call {
+                    callee,
+                    args: vec![local(1)],
+                })),
+            };
+            let f = perceus(&pool, func(vec![bind(0, list)], body, list));
+            assert!(!find_drop(&f.body, local(1)), "{}", f.body);
+            assert!(find_drop(&f.body, local(0)), "{}", f.body);
+        }
+    }
+
     /// Without a self-tail edge nothing loop-carries.
     #[test]
     fn no_loop_carry_without_tail_self() {
@@ -902,7 +1013,7 @@ mod tests {
             rhs: ctor(&[0, 0]),
             body: Box::new(CoreExpr::Let {
                 bind: bind(2, int),
-                rhs: Atom::prim(Op::AddInt, vec![local(1)]),
+                rhs: Atom::prim(PrimOp::IntAdd, vec![local(1)]),
                 body: Box::new(CoreExpr::Tail(Atom::Local(local(2)))),
             }),
         };
@@ -1035,7 +1146,7 @@ mod tests {
                     rhs: ctor(&[0, 0]),
                     body: Box::new(CoreExpr::Let {
                         bind: bind(2, t),
-                        rhs: Atom::prim(Op::AddInt, vec![local(1)]),
+                        rhs: Atom::prim(PrimOp::IntAdd, vec![local(1)]),
                         body: Box::new(CoreExpr::Tail(ctor(&[2, 2, 2]))),
                     }),
                 },
@@ -1109,7 +1220,7 @@ mod tests {
         let int = int_ty(&mut pool);
         let cont = CoreExpr::Let {
             bind: bind(2, int),
-            rhs: Atom::prim(Op::AddInt, vec![local(0)]),
+            rhs: Atom::prim(PrimOp::IntAdd, vec![local(0)]),
             body: Box::new(CoreExpr::Tail(Atom::Local(local(2)))),
         };
         let f = perceus(
@@ -1161,7 +1272,7 @@ mod tests {
                     rhs: ctor(&[0, 0]),
                     body: Box::new(CoreExpr::Let {
                         bind: bind(2, int),
-                        rhs: Atom::prim(Op::AddInt, vec![local(1)]),
+                        rhs: Atom::prim(PrimOp::IntAdd, vec![local(1)]),
                         // Drop %1 [Enum:2] lands here, ahead of the LetCont.
                         body: Box::new(CoreExpr::LetCont {
                             id: JoinId(0),

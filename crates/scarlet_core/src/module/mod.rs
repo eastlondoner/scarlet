@@ -9,9 +9,9 @@ use crate::bytecode::Watermark;
 use crate::reference::ModuleReferences;
 use crate::type_def::TypeId;
 use crate::typed_ir::GlobalSlot;
-use crate::types::{DefinitionLocation, Scheme, TypeInfo};
+use crate::types::{Scheme, TypeInfo};
 
-pub(crate) mod stdlib;
+mod stdlib;
 
 // Module identity lives in `scarlet_syntax::module_path` because a `Diagnostic`
 // carries the key of the module it points into. Re-exported here, where
@@ -20,6 +20,12 @@ pub use scarlet_syntax::module_path::{
     ModuleKey, ModulePath, ResolveError, file_module_path, is_resolved_file, is_stdlib,
     main_module, scarlet_prelude,
 };
+
+/// Every module the embedded stdlib holds, sorted by the path an import names
+/// it with.
+pub fn stdlib_modules() -> Vec<ModulePath> {
+    stdlib::module_paths()
+}
 
 const STDLIB_MARKER: &str = include_str!("../std/.scarlet-stdlib-root");
 
@@ -99,29 +105,12 @@ pub fn collect_scrl_files(dir: &Path, out: &mut Vec<PathBuf>) {
 pub struct ExportedValue {
     pub(crate) scheme: Scheme,
     pub(crate) local_slot: Option<GlobalSlot>,
-    /// A function's parameter names, in order. Empty for anything else.
-    ///
-    /// Documentation, not semantics: Scarlet rejects labelled arguments outside a
-    /// constructor call, so a parameter name never reaches a call site and must
-    /// stay out of `TypeNode::Fun` — otherwise unification would have to decide
-    /// whether `fn(path String)` equals `fn(p String)`. Constructor field
-    /// labels *are* semantic and live in the type instead.
-    pub(crate) param_names: Vec<String>,
-    /// The declaration's own doc comment, carried across module boundaries.
-    pub(crate) doc: Option<String>,
 }
 
-/// A module's exported type: its `TypeInfo` plus the declaration site and doc,
-/// so the reference graph and hover work identically whether the module was
-/// compiled from source or hydrated from the precompiled stdlib blob.
+/// A module's exported type.
 #[derive(Debug, Clone)]
 pub struct ExportedType {
     pub(crate) info: TypeInfo,
-    /// The `type` declaration's own location. `None` only for types with no
-    /// source declaration to point at.
-    pub(crate) def: Option<DefinitionLocation>,
-    /// The declaration's own doc comment, carried across module boundaries.
-    pub(crate) doc: Option<String>,
 }
 
 /// What an importer sees of a compiled module: its `pub` types and values, plus
@@ -132,12 +121,11 @@ pub struct ModuleInterface {
     pub(crate) path: ModulePath,
     pub(crate) types: IndexMap<String, ExportedType>,
     pub(crate) values: IndexMap<String, ExportedValue>,
-    /// `BTreeSet` so iteration is sorted: `static_ir::flatten` interns these
-    /// in iteration order into the reproducible stdlib blob.
+    /// `BTreeSet` so iteration is sorted.
     pub(crate) private_names: BTreeSet<String>,
     /// The module's own doc comment: the `/** */` block at line 0 of its
-    /// source. Unlike every other doc, this one is carried through the
-    /// precompiled stdlib blob so hovering `scarlet/process` shows its prose.
+    /// source. Kept on the interface so hovering `scarlet/process` shows its
+    /// prose.
     pub(crate) doc: Option<String>,
 }
 
@@ -197,21 +185,18 @@ impl IdRangeReservation {
 }
 
 /// Where a cached module came from, and so which incremental bookkeeping it
-/// has: only `File` modules have a source path to re-hash and a watermark to
-/// truncate to. `Embedded` stdlib comes from `&'static str` and never changes;
-/// `Hydrated` stdlib came from the precompiled blob and has no source.
+/// has: only `File` modules have a source path to re-hash. `Embedded` stdlib
+/// comes from `&'static str` and never changes.
 ///
 /// `refs` holds the module's definitions and occurrences. Storing them here is
 /// what lets a cross-module reference survive an unrelated recompile, and
 /// dropping the `CachedModule` drops them, so a rebuilt workspace graph cannot
-/// have a dangling reverse edge. `Hydrated` modules carry none: their
-/// definitions are synthesised from the interface at graph-build time.
+/// have a dangling reverse edge.
 #[derive(Debug)]
 // One instance per cached module, moved only at insert; boxing would add
 // derefs and save nothing.
 #[allow(clippy::large_enum_variant)]
 pub enum ModuleOrigin {
-    Hydrated,
     Embedded {
         refs: Rc<ModuleReferences>,
     },
@@ -223,9 +208,6 @@ pub enum ModuleOrigin {
         /// evicting the `CachedModule` drops the gate with it. See
         /// [`ModuleTable::source_changed`].
         stat: Option<FileStat>,
-        /// Every arena/pool length immediately *before* this module's body was
-        /// analysed.
-        watermark: Watermark,
         /// Resolved on-disk path.
         path: PathBuf,
         refs: Rc<ModuleReferences>,
@@ -241,19 +223,17 @@ pub enum ModuleOrigin {
 pub struct CachedModule {
     pub(crate) iface: ModuleInterface,
     pub(crate) origin: ModuleOrigin,
+    /// Every arena/pool length immediately *before* this module's body was
+    /// analysed. Every module has one, embedded or not: an embedded module's
+    /// source never changes, but its interface indexes the arenas it was
+    /// compiled into, so a rewind below this line must take the module with
+    /// it.
+    pub(crate) watermark: Watermark,
     /// Direct importers of this module (reverse edges of the import graph).
     pub(crate) dependents: HashSet<ModuleKey>,
 }
 
 impl CachedModule {
-    fn hydrated(iface: ModuleInterface) -> Self {
-        CachedModule {
-            iface,
-            origin: ModuleOrigin::Hydrated,
-            dependents: HashSet::new(),
-        }
-    }
-
     /// Resolved on-disk path this module was compiled from, if any.
     pub(crate) fn source_path(&self) -> Option<&Path> {
         match &self.origin {
@@ -262,34 +242,19 @@ impl CachedModule {
         }
     }
 
-    /// Arena watermark captured before this module's body was analysed. `None`
-    /// for embedded/hydrated modules, which are never invalidated.
-    pub(crate) fn watermark(&self) -> Option<Watermark> {
-        match &self.origin {
-            ModuleOrigin::File { watermark, .. } => Some(*watermark),
-            _ => None,
-        }
-    }
-
     /// Reference-graph data collected while this module's body was analysed.
-    /// `None` for hydrated stdlib modules.
-    pub(crate) fn module_refs(&self) -> Option<&Rc<ModuleReferences>> {
+    pub(crate) fn module_refs(&self) -> &Rc<ModuleReferences> {
         match &self.origin {
-            ModuleOrigin::Embedded { refs } | ModuleOrigin::File { refs, .. } => Some(refs),
-            ModuleOrigin::Hydrated => None,
+            ModuleOrigin::Embedded { refs } | ModuleOrigin::File { refs, .. } => refs,
         }
     }
 }
 
 #[derive(Debug)]
 pub struct ModuleTable {
-    /// Insertion order is compilation order; `into_loaded` preserves it so the
-    /// precompiled-stdlib emit is deterministic.
+    /// Insertion order is compilation order.
     loaded: IndexMap<ModuleKey, CachedModule>,
     loading: HashSet<ModuleKey>,
-    /// When the binary carries a static stdlib, `get_or_hydrate` falls through
-    /// to it on a `loaded` miss and caches the result.
-    static_fallback: Option<&'static crate::static_ir::StaticStdlib>,
     /// In-memory document overrides (LSP unsaved buffers), preferred over
     /// `fs::read_to_string`.
     overlays: HashMap<PathBuf, String>,
@@ -314,7 +279,6 @@ impl Default for ModuleTable {
         ModuleTable {
             loaded: IndexMap::new(),
             loading: HashSet::new(),
-            static_fallback: None,
             overlays: HashMap::new(),
             compile_count: 0,
             id_bases: HashMap::new(),
@@ -329,13 +293,6 @@ impl ModuleTable {
         Self::default()
     }
 
-    pub(crate) fn into_loaded(self) -> IndexMap<String, ModuleInterface> {
-        self.loaded
-            .into_iter()
-            .map(|(k, v)| (k.as_str().to_string(), v.iface))
-            .collect()
-    }
-
     pub(crate) fn is_loading(&self, key: &ModuleKey) -> bool {
         self.loading.contains(key)
     }
@@ -348,30 +305,12 @@ impl ModuleTable {
         self.loading.clear();
     }
 
-    #[cfg(test)]
-    fn insert_hydrated(&mut self, key: ModuleKey, iface: ModuleInterface) {
-        self.loading.remove(&key);
-        self.loaded.insert(key, CachedModule::hydrated(iface));
-    }
-
     pub(crate) fn insert_cached(&mut self, key: ModuleKey, cm: CachedModule) {
         self.loading.remove(&key);
         self.loaded.insert(key, cm);
     }
 
     pub(crate) fn get(&self, key: &ModuleKey) -> Option<&ModuleInterface> {
-        self.loaded.get(key).map(|c| &c.iface)
-    }
-
-    /// `get`, falling through to `static_fallback` and caching the hydrate.
-    pub(crate) fn get_or_hydrate(&mut self, key: &ModuleKey) -> Option<&ModuleInterface> {
-        if !self.loaded.contains_key(key)
-            && let Some(s) = self.static_fallback
-            && let Some(iface) = s.lookup_module(key.as_str())
-        {
-            self.loaded
-                .insert(key.clone(), CachedModule::hydrated(iface));
-        }
         self.loaded.get(key).map(|c| &c.iface)
     }
 
@@ -397,10 +336,6 @@ impl ModuleTable {
 
     pub(crate) fn clear_overlay(&mut self, path: &Path) {
         self.overlays.remove(path);
-    }
-
-    pub(crate) fn set_static_fallback(&mut self, s: &'static crate::static_ir::StaticStdlib) {
-        self.static_fallback = Some(s);
     }
 
     /// Iterate cached user modules (those compiled from a file on disk).
@@ -462,19 +397,17 @@ impl ModuleTable {
         }
     }
 
-    /// Iterate every cached module, user and hydrated stdlib alike.
+    /// Iterate every cached module, user and stdlib alike.
     pub(crate) fn loaded_modules(&self) -> impl Iterator<Item = (&ModuleKey, &CachedModule)> {
         self.loaded.iter()
     }
 
     /// Persisted reference data for the module whose *canonical* path is
-    /// `path`. Lookup, not mint: a non-canonical path simply misses. `None`
-    /// for hydrated stdlib modules, which carry none.
+    /// `path`. Lookup, not mint: a non-canonical path simply misses.
     pub(crate) fn module_refs_by_path(&self, path: &ModulePath) -> Option<&ModuleReferences> {
         self.loaded
             .get(&ModuleKey::of(path))
-            .and_then(|c| c.module_refs())
-            .map(Rc::as_ref)
+            .map(|c| c.module_refs().as_ref())
     }
 
     /// Reserve or re-find the type-id range for `key`, allocating a fresh
@@ -560,28 +493,26 @@ impl ModuleTable {
         // than keeping whichever came first.
         let min_wm = closure
             .iter()
-            .filter_map(|k| self.loaded.get(k).and_then(|cm| cm.watermark()))
+            .filter_map(|k| self.loaded.get(k).map(|cm| cm.watermark))
             .reduce(Watermark::earlier)?;
-        self.loaded.retain(|k, cm| {
-            if closure.contains(k) {
-                return false;
-            }
-            cm.watermark().is_none_or(|w| w < min_wm)
-        });
+        // The rewind to `min_wm` drops every arena entry above it, so every
+        // module compiled after it goes too, whether or not it depends on
+        // `key`: a stdlib module first imported after `key` is one.
+        self.loaded
+            .retain(|k, cm| !closure.contains(k) && cm.watermark < min_wm);
         Some(min_wm)
     }
 
-    /// Evict every user module (those with a watermark) and return the
-    /// earliest watermark among them. Used as the overflow fallback when a
-    /// recompiled module no longer fits its reserved id range.
+    /// Evict every user module, and every module compiled after the first of
+    /// them, and return the earliest user module's watermark. Used as the
+    /// overflow fallback when a recompiled module no longer fits its reserved
+    /// id range.
     pub(crate) fn invalidate_all(&mut self) -> Option<Watermark> {
         let min_wm = self
-            .loaded
-            .values()
-            .filter_map(|cm| cm.watermark())
+            .user_modules()
+            .map(|(_, cm)| cm.watermark)
             .reduce(Watermark::earlier)?;
-        self.loaded
-            .retain(|_, cm| !matches!(cm.origin, ModuleOrigin::File { .. }));
+        self.loaded.retain(|_, cm| cm.watermark < min_wm);
         Some(min_wm)
     }
 }
@@ -915,6 +846,69 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// A cached `Embedded` module named `name`, the way a stdlib module is
+    /// cached once compiled.
+    fn embedded(name: &str) -> CachedModule {
+        embedded_at(name, Watermark::default())
+    }
+
+    fn embedded_at(name: &str, watermark: Watermark) -> CachedModule {
+        CachedModule {
+            iface: ModuleInterface::new(vec![name.to_string()]),
+            origin: ModuleOrigin::Embedded {
+                refs: Rc::new(ModuleReferences::new(crate::reference::ModuleId(0))),
+            },
+            watermark,
+            dependents: HashSet::new(),
+        }
+    }
+
+    /// A cached `File` module named `name`, compiled at `watermark`.
+    fn file_at(name: &str, watermark: Watermark) -> CachedModule {
+        CachedModule {
+            iface: ModuleInterface::new(vec![name.to_string()]),
+            origin: ModuleOrigin::File {
+                source_hash: 0,
+                stat: None,
+                path: PathBuf::from(format!("/{name}.scrl")),
+                refs: Rc::new(ModuleReferences::new(crate::reference::ModuleId(0))),
+            },
+            watermark,
+            dependents: HashSet::new(),
+        }
+    }
+
+    /// Editing `lib` rewinds the arenas to where `lib` began. A stdlib
+    /// module first imported after `lib` does not depend on it, but its
+    /// interface lives above that line, so it is evicted too; one imported
+    /// before `lib` stays.
+    #[test]
+    fn invalidating_a_module_evicts_every_module_compiled_after_it() {
+        let key = |n: &str| ModuleKey::of(&vec![n.to_string()]);
+        let mut t = ModuleTable::new();
+        t.insert_cached(key("string"), embedded_at("string", Watermark::at(1)));
+        t.insert_cached(key("lib"), file_at("lib", Watermark::at(2)));
+        t.insert_cached(key("array"), embedded_at("array", Watermark::at(3)));
+
+        assert!(t.invalidate(&key("lib")).is_some());
+        assert!(t.get(&key("string")).is_some(), "compiled before lib");
+        assert!(t.get(&key("lib")).is_none(), "the edited module");
+        assert!(t.get(&key("array")).is_none(), "compiled after lib");
+    }
+
+    #[test]
+    fn invalidating_everything_keeps_only_what_came_before_the_first_file() {
+        let key = |n: &str| ModuleKey::of(&vec![n.to_string()]);
+        let mut t = ModuleTable::new();
+        t.insert_cached(key("string"), embedded_at("string", Watermark::at(1)));
+        t.insert_cached(key("lib"), file_at("lib", Watermark::at(2)));
+        t.insert_cached(key("array"), embedded_at("array", Watermark::at(3)));
+
+        assert!(t.invalidate_all().is_some());
+        let left: Vec<_> = t.loaded_modules().map(|(k, _)| k.to_string()).collect();
+        assert_eq!(left, ["string"]);
+    }
+
     #[test]
     fn module_table_loading_and_insert_lifecycle() {
         let mut t = ModuleTable::new();
@@ -923,13 +917,10 @@ mod tests {
         t.mark_loading(&foo);
         assert!(t.is_loading(&foo));
 
-        t.insert_hydrated(foo.clone(), ModuleInterface::new(vec!["foo".to_string()]));
+        t.insert_cached(foo.clone(), embedded("foo"));
         assert!(!t.is_loading(&foo));
         assert!(t.get(&foo).is_some());
-
-        let loaded = t.into_loaded();
-        assert!(loaded.contains_key("foo"));
-        assert_eq!(loaded.len(), 1);
+        assert_eq!(t.loaded_modules().count(), 1);
     }
 
     #[test]
@@ -939,12 +930,9 @@ mod tests {
         // Unknown key.
         assert!(!t.source_changed(&ModuleKey::of(&vec!["unknown".to_string()])));
 
-        // Hydrated module never changes.
+        // An embedded module never changes.
         let stat = ModuleKey::of(&vec!["static".to_string()]);
-        t.insert_hydrated(
-            stat.clone(),
-            ModuleInterface::new(vec!["static".to_string()]),
-        );
+        t.insert_cached(stat.clone(), embedded("static"));
         assert!(!t.source_changed(&stat));
 
         let dir = unique_dir("srcchanged");
@@ -956,10 +944,10 @@ mod tests {
             origin: ModuleOrigin::File {
                 source_hash: source_hash(body),
                 stat: None,
-                watermark: Watermark::default(),
                 path: path.clone(),
                 refs: Rc::new(ModuleReferences::new(crate::reference::ModuleId(0))),
             },
+            watermark: Watermark::default(),
             dependents: HashSet::new(),
         };
         let m = ModuleKey::of(&vec!["m".to_string()]);

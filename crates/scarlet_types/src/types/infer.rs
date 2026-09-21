@@ -6,6 +6,7 @@ use indexmap::{IndexMap, IndexSet};
 use smallvec::SmallVec;
 
 use super::environment::{DefinitionLocation, TypeBody, TypeEnv, TypeParam, Variant, VariantField};
+use crate::intrinsic::Intrinsic;
 use crate::type_def::{
     FieldDef, PrimitiveKind, Type, TypeId, prim_names as pn, t_array, t_float, t_int, t_string,
     t_tuple, t_var,
@@ -137,7 +138,7 @@ pub mod pool {
 /// [`pool`]). `len` is `u16` to keep `TypeNode` at 12 bytes; no Scarlet type has
 /// more than 65535 type arguments, parameters, or tuple elements.
 pub struct ArenaSlice<P> {
-    pub start: u32,
+    start: u32,
     pub len: u16,
     _pool: PhantomData<P>,
 }
@@ -181,7 +182,7 @@ impl<P> ArenaSlice<P> {
         }
     }
     #[inline]
-    pub fn range(self) -> std::ops::Range<usize> {
+    fn range(self) -> std::ops::Range<usize> {
         self.start as usize..(self.start as usize + self.len as usize)
     }
 }
@@ -269,10 +270,16 @@ pub enum ValueKind {
         /// → `InferEngine.str_slices`
         param_labels: ArenaSlice<pool::StrSlices>,
     },
-    /// VM intrinsic registered from Rust. The `@vm(name)` string is resolved
-    /// to an opcode at analysis time, so an unknown name is a compile error at
-    /// the annotation rather than a codegen fallthrough.
-    Builtin { op: scarlet_vm::bytecode::Op },
+    /// A built-in function, from a `@vm(key)` declaration. Analysis resolves
+    /// the key to its [`Intrinsic`] at the annotation, so an unknown key is a
+    /// compile error there rather than a codegen fallthrough.
+    Builtin {
+        intrinsic: Intrinsic,
+        /// The declaration's parameter names, as for `ModuleFn`.
+        ///
+        /// → `InferEngine.str_slices`
+        param_labels: ArenaSlice<pool::StrSlices>,
+    },
     /// A data constructor. Carries enough to compile pattern-match and
     /// constructor-call without re-consulting the type env.
     Constructor {
@@ -297,15 +304,15 @@ pub enum ValueKind {
 /// It is engine-local, so `None` once a scheme crosses engines.
 #[derive(Debug, Clone, Copy)]
 pub struct QuantVar {
-    pub constraint: Option<Constraint>,
+    constraint: Option<Constraint>,
     /// Display name; `StrId::NONE` when unset.
-    pub name: StrId,
-    pub origin_id: Option<i32>,
+    name: StrId,
+    origin_id: Option<i32>,
     /// The engine's `var_epoch` when `origin_id` was minted. `instantiate`
     /// honours `origin_id` (the rigid self-reference case) only within the
     /// same epoch: `truncate_to` restarts var numbering, so a later compile's
     /// rigid var can share the number without being the same variable.
-    pub epoch: u32,
+    epoch: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -420,26 +427,26 @@ pub enum MatchFunTypeError {
 #[derive(Debug, Default)]
 pub struct InferEngine {
     /// The type arena. `Ty` indexes into this.
-    pub nodes: Vec<TypeNode>,
+    nodes: Vec<TypeNode>,
     /// Shared pool for `Con.args`/`Fun.params`/`Tuple.elems`. `ArenaSlice`
     /// indexes into this.
-    pub children: Vec<Ty>,
+    children: Vec<Ty>,
     /// Interned strings. `StrId` indexes into this.
-    pub strings: IndexSet<String>,
+    strings: IndexSet<String>,
 
     // Pools backing the variable-length data `Scheme`/`TypeInfo` carry while
     // staying `Copy` and const-constructible. Append-only; indices are stable.
     /// `Scheme.quantified` slices into this.
-    pub quants: Vec<QuantVar>,
+    quants: Vec<QuantVar>,
     /// `ValueKind::Constructor.field_labels` and `TypeInfo.module` slice into
     /// this. Each entry is itself a `StrId` into `strings`.
-    pub str_slices: Vec<StrId>,
+    str_slices: Vec<StrId>,
     /// `TypeInfo.type_params` slices into this.
-    pub type_params: Vec<TypeParam>,
+    type_params: Vec<TypeParam>,
     /// `Variant.fields` slices into this.
-    pub variant_fields: Vec<VariantField>,
+    variant_fields: Vec<VariantField>,
     /// `TypeBody::Custom.variants` slices into this.
-    pub variants: Vec<Variant>,
+    variants: Vec<Variant>,
 
     vars: Vec<TyVarState>,
     next_var_id: i32,
@@ -466,47 +473,7 @@ pub struct InferEngine {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-/// Nominal ids for the primitives the inference engine recognises directly:
-/// int/float/string literals, plus `Array` for structural resolution.
-#[derive(Debug, Clone, Copy)]
-pub struct PrimIds {
-    pub int: TypeId,
-    pub float: TypeId,
-    pub string: TypeId,
-    pub array: TypeId,
-}
-
-impl PrimIds {
-    /// Map a nominal type id to the corresponding primitive, if it is one.
-    /// Identity is by id, never name: a user's `type Int { }` is not `Int`.
-    /// `InferEngine::as_prim` and `ResolvedPool::as_prim` both delegate here so
-    /// the two sides of the `Ty`/`RTy` divide cannot disagree.
-    pub fn prim_of(self, id: TypeId) -> Option<Prim> {
-        if id == self.int {
-            Some(Prim::Int)
-        } else if id == self.float {
-            Some(Prim::Float)
-        } else if id == self.string {
-            Some(Prim::String)
-        } else {
-            None
-        }
-    }
-}
-
-impl Default for PrimIds {
-    fn default() -> Self {
-        // Placeholders for engine-only tests, distinct from each other and from
-        // the 1-based ids `register_type_head` allocates. `set_prim_ids`
-        // overwrites them as soon as a compiler owns the engine.
-        PrimIds {
-            int: TypeId(-1),
-            float: TypeId(-2),
-            string: TypeId(-3),
-            array: TypeId(-4),
-        }
-    }
-}
+pub use scarlet_ir::rty::PrimIds;
 
 pub fn new_engine() -> InferEngine {
     InferEngine::default()
@@ -517,29 +484,14 @@ pub struct EnginePoolWatermark {
     // Field order is significant: derived `Ord` compares lexicographically, so
     // `nodes` decides. `ModuleTable::invalidate` relies on `min` over
     // watermarks picking the earliest-compiled module.
-    pub nodes: usize,
-    pub children: usize,
+    nodes: usize,
+    children: usize,
     pub strings: usize,
-    pub quants: usize,
-    pub str_slices: usize,
-    pub type_params: usize,
-    pub variant_fields: usize,
-    pub variants: usize,
-}
-
-/// Every static pool slice handed to [`InferEngine::seed_arena`]. Named fields
-/// rather than eight positional slices, so transposing two same-typed pools is
-/// a compile error and not a corrupted arena prefix.
-#[derive(Clone, Copy)]
-pub struct ArenaSeed<'a> {
-    pub nodes: &'a [TypeNode],
-    pub children: &'a [Ty],
-    pub strings: &'a [&'a str],
-    pub quants: &'a [QuantVar],
-    pub str_slices: &'a [StrId],
-    pub type_params: &'a [TypeParam],
-    pub variant_fields: &'a [VariantField],
-    pub variants: &'a [Variant],
+    quants: usize,
+    str_slices: usize,
+    type_params: usize,
+    variant_fields: usize,
+    variants: usize,
 }
 
 fn next_letter(uid: &mut u64) -> String {
@@ -702,25 +654,8 @@ impl InferEngine {
         self.diagnostics.clear();
     }
 
-    /// Seed every arena/pool from static slices (the precompiled stdlib). Must
-    /// be called before anything is minted so static indices stay valid.
-    pub fn seed_arena(&mut self, seed: ArenaSeed<'_>) {
-        debug_assert_eq!(self.pool_watermark(), EnginePoolWatermark::default());
-        debug_assert!(self.vars.is_empty());
-        self.nodes.extend_from_slice(seed.nodes);
-        self.children.extend_from_slice(seed.children);
-        for s in seed.strings {
-            self.intern(s);
-        }
-        self.quants.extend_from_slice(seed.quants);
-        self.str_slices.extend_from_slice(seed.str_slices);
-        self.type_params.extend_from_slice(seed.type_params);
-        self.variant_fields.extend_from_slice(seed.variant_fields);
-        self.variants.extend_from_slice(seed.variants);
-    }
-
     /// Wire the nominal ids of Int/Float/String. Called once by the compiler
-    /// right after the prelude is registered or seeded.
+    /// right after the prelude is registered.
     pub fn set_prim_ids(&mut self, ids: PrimIds) {
         self.prim_ids = ids;
         self.nullary_cache = NullaryCache::default();

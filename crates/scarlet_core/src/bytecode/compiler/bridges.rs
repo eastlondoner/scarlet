@@ -1,86 +1,9 @@
-//! `Compiler`'s impls of the traits `core_ir` speaks to the enclosing
-//! compilation through ([`crate::core_ir::emit::EmitCtx`], [`ElabCtx`]), kept
-//! here so `core_ir` never sees the compiler's fields.
+//! `Compiler`'s impls of the traits the elaborator speaks to the enclosing
+//! compilation through ([`PreludeTys`], [`ElabCtx`]), kept here so the
+//! elaborator never sees the compiler's fields.
 
 use super::*;
-use crate::typed_ir::{PreludeTys, wire};
-
-impl crate::core_ir::emit::EmitCtx for Compiler {
-    fn resolve_str(&self, id: StrId) -> &str {
-        self.engine.str(id)
-    }
-    fn intern_int(&mut self, i: i64) -> i32 {
-        self.const_int(i)
-    }
-    fn intern_str(&mut self, s: &str) -> i32 {
-        self.const_str(s)
-    }
-    fn intern_labels(&mut self, tid: TypeId, variant_idx: u16) -> i32 {
-        let variant = self.declared_variant(tid, variant_idx);
-        let labels: Vec<String> = self
-            .engine
-            .variant_fields_of(variant.fields)
-            .iter()
-            .map(|f| self.engine.str(f.label).to_string())
-            .collect();
-        let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
-        let v = self.frozen.str_array(&refs).into_value();
-        self.add_constant(v)
-    }
-    fn variant_name(&self, tid: TypeId, variant_idx: u16) -> &str {
-        self.engine
-            .str(self.declared_variant(tid, variant_idx).name)
-    }
-    fn switch_variant_count(&self, tid: TypeId) -> Option<u8> {
-        Compiler::switch_variant_count(self, tid)
-    }
-    fn bool_variant(&self, tid: TypeId, variant_idx: u16) -> Option<bool> {
-        if !self.prelude.bool().is(tid) {
-            return None;
-        }
-        Some(self.prelude.true_().is(tid, variant_idx))
-    }
-}
-
-/// `emit` asked for a constructor of a type with no variants. Aborts in
-/// release too: any name or labels invented here ship the wrong cell.
-#[allow(clippy::unreachable)]
-#[cold]
-#[inline(never)]
-fn no_variants(tid: TypeId) -> ! {
-    unreachable!(
-        "internal compiler error: emit asked for a variant of a type with no variants: {tid:?}. \
-         Report this as a compiler bug."
-    )
-}
-
-impl Compiler {
-    fn declared_variant(&self, tid: TypeId, variant_idx: u16) -> crate::types::Variant {
-        let Some(vs) = self
-            .env
-            .lookup_type_info_by_id(tid)
-            .and_then(|ti| ti.variants())
-        else {
-            no_variants(tid);
-        };
-        self.engine.variants_of(vs)[variant_idx as usize]
-    }
-
-    /// The variant count a `SwitchTag` over `tid` dispatches on, or `None`
-    /// when the type never switches: the bytecode emitter's rule, and — via
-    /// [`crate::core_ir::SwitchCounts`] — the native planner's, so the two
-    /// backends ladder and switch the same matches. `Bool` is unboxed, so
-    /// its scrutinee has no tag word; past 255 variants the `SwitchTag.a`
-    /// byte overflows.
-    pub(super) fn switch_variant_count(&self, tid: TypeId) -> Option<u8> {
-        let n = self.env.lookup_type_info_by_id(tid)?.variants()?.len;
-        if self.prelude.bool().is(tid) || n > 255 {
-            None
-        } else {
-            Some(n as u8)
-        }
-    }
-}
+use crate::typed_ir::PreludeTys;
 
 impl PreludeTys for Compiler {
     /// The one bridge from a live inference `Ty` into the program's `RTy`
@@ -122,20 +45,20 @@ impl ElabCtx for Compiler {
     fn str(&self, id: StrId) -> &str {
         self.engine.str(id)
     }
-    // Safe mid-elaboration: `program.constants` is `ConstId`-addressed, so
-    // pooling moves no address.
+    // Safe mid-elaboration: the pool is `ConstId`-addressed, so pooling moves
+    // no address.
     fn number_const(&mut self, lit: &ast::NumberLiteral) -> crate::core_ir::ConstId {
-        let v = self.const_number(lit);
-        crate::core_ir::ConstId(self.add_constant(v) as u32)
+        let c = self.const_number(lit);
+        self.add_constant(c)
     }
     fn string_const(&mut self, s: &str) -> crate::core_ir::ConstId {
-        crate::core_ir::ConstId(self.const_str(s) as u32)
+        self.const_str(s)
     }
     fn int_const(&mut self, i: i64) -> crate::core_ir::ConstId {
-        crate::core_ir::ConstId(self.const_int(i) as u32)
+        self.const_int(i)
     }
     fn binary_const(&mut self, bytes: Vec<u8>, bit_len: u64) -> crate::core_ir::ConstId {
-        crate::core_ir::ConstId(self.const_binary(bytes, bit_len) as u32)
+        self.const_binary(bytes, bit_len)
     }
     fn resolve_name(&mut self, name: &str) -> Option<(Ty, Denotation)> {
         let scheme = self.env.lookup(name)?;
@@ -275,215 +198,26 @@ impl ElabCtx for Compiler {
         let TypeNode::Con { id, .. } = self.engine.node(resolved) else {
             return None;
         };
-        let (tref, ok, fail, err_has_payload) = if self.prelude.option().is(id) {
-            (
-                self.prelude.option(),
-                self.prelude.some(),
-                self.prelude.none(),
-                false,
-            )
+        let (ok, fail, err_has_payload) = if self.prelude.option().is(id) {
+            (self.prelude.some(), self.prelude.none(), false)
         } else if self.prelude.result().is(id) {
-            (
-                self.prelude.result(),
-                self.prelude.ok(),
-                self.prelude.err(),
-                true,
-            )
+            (self.prelude.ok(), self.prelude.err(), true)
         } else {
             return None;
         };
-        let tn = self.engine.intern(tref.name);
         Some(OrShape {
             fail: VariantRef {
                 type_id: fail.type_id,
                 variant_idx: fail.variant_idx,
-                type_name: tn,
             },
             ok: VariantRef {
                 type_id: ok.type_id,
                 variant_idx: ok.variant_idx,
-                type_name: tn,
             },
             err_has_payload,
         })
     }
     fn ty_nil(&mut self) -> Ty {
         Compiler::ty_nil(self)
-    }
-    fn wire_descriptor(
-        &mut self,
-        pool: &mut ResolvedPool,
-        ty: RTy,
-        op: wire::WireOp,
-        at: Span,
-    ) -> Option<u32> {
-        let desc = match wire::build_desc(pool, &mut *self, ty) {
-            Ok(desc) => desc,
-            Err(refusal) => {
-                let msg = refusal.message(&*self, pool, op);
-                self.error(msg, at);
-                return None;
-            }
-        };
-        // The immediate is this descriptor's position in `wire_descs`, which
-        // emit copies to `Program.wire_descs` in the same order — so the
-        // number the instruction carries is the number the VM indexes with.
-        //
-        // Two call sites at one type describe it twice, and both must reach
-        // the same entry. `Desc` equality is the right key and the fingerprint
-        // is NOT: the fingerprint deliberately excludes the type's identity,
-        // so two different types of one shape share it while needing different
-        // templates, and deduping on it would hand one type's call site the
-        // other's constructors.
-        let at = self.wire_descs.iter().position(|d| *d == desc);
-        let idx = match at {
-            Some(i) => i,
-            None => {
-                self.wire_descs.push(desc);
-                self.wire_descs.len() - 1
-            }
-        };
-        // The table is indexed by an i32 operand, so an index past i32::MAX
-        // could not be named. A program with two billion distinct wire shapes
-        // is not reachable, and saying so is cheaper than a silent truncation.
-        u32::try_from(idx).ok().filter(|i| *i <= i32::MAX as u32)
-    }
-}
-
-/// The declaration half of the descriptor builder's seam. Everything it
-/// answers comes off `env`/`engine`; nothing here decides encodability, which
-/// is `wire`'s alone.
-impl wire::WireCtx for Compiler {
-    fn nominal(&mut self, pool: &mut ResolvedPool, id: TypeId) -> wire::Nominal {
-        // The structural primitives answer first. `Int`, `Array`, `Map` and
-        // the rest are declared with no body, so reading the body would report
-        // every one of them as uninhabited and write nothing for an `Int`.
-        if let Some(b) = self.wire_builtin(id) {
-            return wire::Nominal::Builtin(b);
-        }
-        let info = self.env.declaration(id);
-        match info.body {
-            TypeBody::External => match self.wire_handle(id) {
-                Some(kind) => wire::Nominal::Handle(kind),
-                None => wire::Nominal::Uninhabited,
-            },
-            // A body is attached by the pass that declares it — `External`
-            // in Pass 1, `Alias` in Pass 2, `Custom` in Pass 4 — and an
-            // imported declaration is exported only after its own body is.
-            // Elaboration, the only caller, starts once every pass has run,
-            // so a body still in this state is the checker's bug; describing
-            // it as anything would write nothing for a value that exists.
-            TypeBody::Unresolved => wire::wire_bug("a type whose body is not yet hydrated"),
-            TypeBody::Alias { target } => wire::Nominal::Alias(self.resolve_rty(pool, target)),
-            TypeBody::Custom { variants, .. } => {
-                // Copied out of the arena first: interning a field type
-                // reborrows the engine.
-                let vs = self.engine.variants_of(variants).to_vec();
-                let ctors = vs
-                    .iter()
-                    .enumerate()
-                    .map(|(i, v)| {
-                        let declared: Vec<(StrId, Ty)> = self
-                            .engine
-                            .variant_fields_of(v.fields)
-                            .iter()
-                            .map(|f| (f.label, f.ty))
-                            .collect();
-                        let fields = declared
-                            .into_iter()
-                            .map(|(label, t)| (label, self.resolve_rty(pool, t)))
-                            .collect();
-                        wire::CtorDecl::new(
-                            crate::core_ir::VariantRef {
-                                type_id: id,
-                                // The variant slice's own length is a `u16`,
-                                // so an index into it cannot overflow one.
-                                variant_idx: i as u16,
-                                type_name: info.name,
-                            },
-                            v.name,
-                            fields,
-                        )
-                    })
-                    .collect();
-                wire::Nominal::Data { ctors }
-            }
-        }
-    }
-
-    fn name(&self, s: StrId) -> String {
-        self.engine.str(s).to_string()
-    }
-}
-
-impl Compiler {
-    /// The six types the wire format writes structurally rather than as a
-    /// tagged constructor.
-    ///
-    /// Identity is the prelude's own binding, never a name: a user's
-    /// `type Map(k, v)` is a different type from `scarlet/map`'s and must be
-    /// described by its constructors. `Map` is late-bound, so this answers
-    /// `None` for it until `scarlet/map` has loaded — which is also the first
-    /// moment a value of it can exist.
-    fn wire_builtin(&self, id: TypeId) -> Option<wire::Builtin> {
-        let p = &self.prelude;
-        if p.int().is(id) {
-            Some(wire::Builtin::Int)
-        } else if p.float().is(id) {
-            Some(wire::Builtin::Float)
-        } else if p.string().is(id) {
-            Some(wire::Builtin::String)
-        } else if p.binary().is(id) {
-            Some(wire::Builtin::Binary)
-        } else if p.array().is(id) {
-            Some(wire::Builtin::Array)
-        } else if p.map().is(id) {
-            Some(wire::Builtin::Map)
-        } else {
-            None
-        }
-    }
-
-    /// The five host-backed stdlib types the wire format writes as an
-    /// identity, or `None` for a bodiless type that is not one of them.
-    ///
-    /// Identity is the declaring module's own binding, resolved through the
-    /// module table exactly as `restricted_generalization_cons` resolves
-    /// `Subject`, and never a name: a user's `pub type Pid` is a different
-    /// type and stays bodiless. `Port` is absent on purpose — it is a record
-    /// over a `Connection`, and the runtime kind its stream carries is the
-    /// value's to write (see `scarlet_vm::wire::HandleKind`).
-    fn wire_handle(&mut self, id: TypeId) -> Option<wire::HandleKind> {
-        const HANDLES: &[(&[&str], &str, wire::HandleKind)] = &[
-            (&["scarlet", "process"], "Pid", wire::HandleKind::Pid),
-            (
-                &["scarlet", "process"],
-                "Subject",
-                wire::HandleKind::Subject,
-            ),
-            (
-                &["scarlet", "net", "socket"],
-                "Connection",
-                wire::HandleKind::Connection,
-            ),
-            (&["scarlet", "net"], "Server", wire::HandleKind::Listener),
-            (
-                &["scarlet", "net", "tls"],
-                "TlsConnection",
-                wire::HandleKind::Tls,
-            ),
-        ];
-        for &(module, name, kind) in HANDLES {
-            let key = ModuleKey::of(&module.iter().map(|s| s.to_string()).collect());
-            // A module this compile cannot resolve declares no type a value
-            // of `id` could have, so a miss here is not a miss on `id`.
-            let Some(iface) = self.module_table.get_or_hydrate(&key) else {
-                continue;
-            };
-            if iface.types.get(name).is_some_and(|et| et.info.id == id) {
-                return Some(kind);
-            }
-        }
-        None
     }
 }

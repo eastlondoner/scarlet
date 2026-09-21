@@ -26,6 +26,86 @@ fn compile_script(src: &str) -> super::CompileResult {
     )
 }
 
+/// The lowered body of the function `name` in `p`.
+fn body_named<'p>(p: &'p crate::core_ir::Program, name: &str) -> &'p crate::core_ir::CoreFn {
+    for f in &p.fns {
+        if f.name == name {
+            return &f.core;
+        }
+    }
+    panic!("no function named `{name}` in the program")
+}
+
+/// Every atom in `e`, in no particular order.
+fn atoms(e: &crate::core_ir::CoreExpr) -> Vec<&crate::core_ir::Atom> {
+    use crate::core_ir::CoreExpr as E;
+    fn go<'e>(e: &'e E, out: &mut Vec<&'e crate::core_ir::Atom>) {
+        match e {
+            E::Let { rhs, body, .. } => {
+                out.push(rhs);
+                go(body, out);
+            }
+            E::LetJoin { join, body, .. } => {
+                go(join, out);
+                go(body, out);
+            }
+            E::LetCont { cont, body, .. } => {
+                go(cont, out);
+                go(body, out);
+            }
+            E::Drop { body, .. } => go(body, out),
+            E::If { then, els, .. } => {
+                go(then, out);
+                go(els, out);
+            }
+            E::Match { arms, .. } => {
+                for (_, b) in arms {
+                    go(b, out);
+                }
+            }
+            E::Tail(a) => out.push(a),
+            E::Goto(_) => {}
+        }
+    }
+    let mut out = Vec::new();
+    go(e, &mut out);
+    out
+}
+
+/// The locals `e` drops, in spine order.
+fn drops(e: &crate::core_ir::CoreExpr) -> Vec<crate::core_ir::LocalId> {
+    use crate::core_ir::CoreExpr as E;
+    fn go(e: &E, out: &mut Vec<crate::core_ir::LocalId>) {
+        match e {
+            E::Drop { local, body, .. } => {
+                out.push(*local);
+                go(body, out);
+            }
+            E::Let { body, .. } => go(body, out),
+            E::LetJoin { join, body, .. }
+            | E::LetCont {
+                cont: join, body, ..
+            } => {
+                go(join, out);
+                go(body, out);
+            }
+            E::If { then, els, .. } => {
+                go(then, out);
+                go(els, out);
+            }
+            E::Match { arms, .. } => {
+                for (_, b) in arms {
+                    go(b, out);
+                }
+            }
+            E::Tail(_) | E::Goto(_) => {}
+        }
+    }
+    let mut out = Vec::new();
+    go(e, &mut out);
+    out
+}
+
 /// Compile `src` as the entry module on the LSP path, with
 /// `collect_hover_facts` on so occurrence collection fires. A script, for
 /// the reason `compile_script` is.
@@ -151,29 +231,35 @@ mod local_binders_as_definitions {
     }
 }
 
-/// Perceus drop/reuse assertions on the `lower → perceus → emit` output.
+/// Perceus drop/reuse assertions on the lowered program.
 mod perceus_drop {
-    use super::super::*;
+    use super::{atoms, body_named, drops};
+    use crate::core_ir::{Atom, CoreExpr, Program};
 
-    /// Compile `src` with codegen on and return the emitted instructions.
-    fn emitted(src: &str) -> Vec<crate::bytecode::Instruction> {
+    /// Compile `src` and return the lowered program.
+    fn lowered(src: &str) -> Program {
         let r = super::compile_script(src);
         assert!(
             !crate::diagnostic::has_errors(&r.diagnostics),
             "snippet failed to compile: {:?}",
             r.diagnostics,
         );
-        r.into_runnable()
-            .expect("a non-check compile emits")
-            .program
-            .code
+        r.into_runnable().expect("a clean compile is runnable")
+    }
+
+    /// The constructors in `e` that reuse a dropped cell.
+    fn reusing_ctors(e: &CoreExpr) -> Vec<&Atom> {
+        atoms(e)
+            .into_iter()
+            .filter(|a| matches!(a, Atom::Ctor { reuse: Some(_), .. }))
+            .collect()
     }
 
     #[test]
-    fn drop_slot_emitted_at_heap_local_last_use() {
-        // `p` is heap-shaped and read twice, so `Drop 0` belongs right after
-        // the second read's `Let`. Int local `n` gets no Drop.
-        let code = emitted(
+    fn a_heap_local_is_dropped_once_and_an_int_never() {
+        // `p` is heap-shaped and read twice, so it is dropped once, after the
+        // second read. `n` is an Int and gets no drop at all.
+        let p = lowered(
             "fn f(p (Int, Int), n Int) Int {\n\
             \x20 a = p.0\n\
             \x20 b = p.1\n\
@@ -181,44 +267,29 @@ mod perceus_drop {
             }\n\
             f((1, 2), 3)\n",
         );
-        let drops: Vec<_> = code.iter().filter(|i| i.op == Op::Drop).collect();
-        assert_eq!(drops.len(), 1, "expected one DropSlot, got {drops:?}");
-        assert_eq!(drops[0].operand, 0, "DropSlot targets param slot 0 (`p`)");
-        let pos = code.iter().position(|i| i.op == Op::Drop).unwrap();
-        let last_read = code[..pos]
-            .iter()
-            .rposition(|i| i.op == Op::PushLocal && i.operand == 0)
-            .unwrap();
-        assert!(
-            code[last_read + 1..pos]
-                .iter()
-                .all(|i| matches!(i.op, Op::TupleIndex | Op::StoreLocal)),
-            "Drop is placed on the spine right after `p.1`'s let",
-        );
-        assert!(
-            !code[pos..]
-                .iter()
-                .take_while(|i| i.op != Op::Ret)
-                .any(|i| i.op == Op::PushLocal && i.operand == 0),
-            "no read of `p` after its Drop",
-        );
-        assert!(!code.iter().any(|i| i.op == Op::Drop && i.operand == 1));
-    }
-
-    #[test]
-    fn drop_slot_not_emitted_for_unboxed_prim() {
-        let code = emitted("fn g(x Int) Int { x + x }\ng(1)\n");
-        assert!(
-            !code.iter().any(|i| i.op == Op::Drop),
-            "Int local must not receive a DropSlot",
+        let f = body_named(&p, "f");
+        assert_eq!(
+            drops(&f.body),
+            vec![f.params[0].id],
+            "exactly `p` is dropped:\n{f}"
         );
     }
 
     #[test]
-    fn reuse_paired_for_match_destructure_then_construct() {
+    fn an_unboxed_prim_is_never_dropped() {
+        let p = lowered("fn g(x Int) Int { x + x }\ng(1)\n");
+        let g = body_named(&p, "g");
+        assert!(
+            drops(&g.body).is_empty(),
+            "an Int local is never dropped:\n{g}"
+        );
+    }
+
+    #[test]
+    fn a_destructured_cell_is_reused_by_a_same_shaped_constructor() {
         // Canonical Perceus shape: destructure a Cons, construct a same-arity
         // Cons in the arm body, pairing the dropped cell with the constructor.
-        let code = emitted(
+        let p = lowered(
             "type List {\n\tLNil\n\tLCons(head Int, tail List)\n}\n\
              fn lmap(xs List, f fn(Int) Int) List {\n\
              \x20 match xs {\n\
@@ -228,30 +299,20 @@ mod perceus_drop {
              }\n\
              lmap(LNil, fn(x) { x })\n",
         );
-        let reuse_at = code
-            .iter()
-            .position(|i| i.op == Op::Reuse)
-            .expect("Op::Reuse emitted for LCons arm");
-        let ctor = code[reuse_at + 1];
-        assert_eq!(ctor.op, Op::MakeEnumPayload);
-        assert_eq!(ctor.a, 1, "constructor's a-byte set for in-place reuse");
-        assert_eq!(ctor.b, 2, "reuse paired with the 2-arity Cons, not LNil");
-        let nil_ctors: Vec<_> = code
-            .iter()
-            .filter(|i| i.op == Op::MakeEnumPayload && i.b == 0)
-            .collect();
+        let lmap = body_named(&p, "lmap");
+        let reusing = reusing_ctors(&lmap.body);
+        assert_eq!(reusing.len(), 1, "one constructor reuses a cell:\n{lmap}");
         assert!(
-            nil_ctors.iter().all(|i| i.a == 0),
-            "0-arity constructor must allocate fresh (a=0)",
+            matches!(reusing[0], Atom::Ctor { fields, .. } if fields.len() == 2),
+            "the reuse pairs with the two-field LCons, not LNil:\n{lmap}"
         );
     }
 
     #[test]
-    fn reuse_candidate_scoped_per_match_arm() {
-        // Reuse pairing is arm-scoped: arm 1's dropped 2-field cell must not
-        // be consumed by arm 2's constructor. At runtime the slot holds a
-        // 0-field cell in arm 2 and `reuse_or_alloc`'s shape assert fires.
-        let code = emitted(
+    fn a_reuse_candidate_stays_in_its_own_arm() {
+        // Reuse pairing is arm-scoped: arm 1's dropped two-field cell must not
+        // be consumed by arm 2's constructor, which runs when the cell is a B.
+        let p = lowered(
             "type T {\n\tA(x Int, y Int)\n\tB\n}\n\
              fn f(v T) T {\n\
              \x20 match v {\n\
@@ -261,16 +322,17 @@ mod perceus_drop {
              }\n\
              f(B)\n",
         );
+        let f = body_named(&p, "f");
         assert!(
-            !code.iter().any(|i| i.op == Op::Reuse),
-            "arm 1's Enum/2 candidate must not leak to arm 2's Enum/2 constructor",
+            reusing_ctors(&f.body).is_empty(),
+            "arm 1's candidate must not leak to arm 2's constructor:\n{f}"
         );
     }
 }
 
 /// A module the typechecker rejected must never reach the elaborator.
 ///
-/// `CleanModule` is why `lower`, `perceus` and `emit` need no poison arm: they
+/// `CleanModule` is why `lower` and `perceus` need no poison arm: they
 /// take a `TypedProgram`, which only `elaborate_body`/`elaborate_toplevel` can
 /// build. `Elab` aborts when `resolve_name` returns `None`, so without the
 /// gate an ordinary type error would abort the compiler.
@@ -338,7 +400,7 @@ mod clean_module_gate {
             crate::diagnostic::has_errors(&pr.diagnostics),
             "snippet must fail to parse"
         );
-        let r = compile(&ast::Expression::BlockExpression(pr.ast), None, None);
+        let r = compile(&ast::Expression::BlockExpression(pr.ast), None);
         assert!(!r.success(), "an unparseable program must not compile");
         assert!(
             codes(&r.diagnostics).contains(&DiagnosticCode::ParseError),
@@ -351,13 +413,10 @@ mod clean_module_gate {
     #[test]
     fn a_clean_module_reaches_the_core_pipeline() {
         let block = parse_ok("fn f(x Int) Int { x + 1 }\npub fn main() { f(1) }\n");
-        let r = compile(&ast::Expression::BlockExpression(block), None, None);
+        let r = compile(&ast::Expression::BlockExpression(block), None);
         assert!(r.success(), "{:#?}", r.diagnostics);
-        let emitted = r.into_runnable().expect("a non-check compile emits");
-        assert!(
-            !emitted.core.fns.is_empty(),
-            "a diagnostics-clean module must produce Core"
-        );
+        let program = r.into_runnable().expect("a clean compile is runnable");
+        let _ = super::body_named(&program, "f");
     }
 }
 
@@ -396,7 +455,7 @@ mod toplevel_slot_queue {
         let [ast::Node::Expression(expr)] = &block.body[..] else {
             panic!("expected a single bare expression");
         };
-        let r = compile(expr, None, None);
+        let r = compile(expr, None);
         assert!(
             !crate::diagnostic::has_errors(&r.diagnostics),
             "{:?}",
@@ -485,164 +544,24 @@ mod qualified_ctor_pattern_occurrences {
     }
 }
 
-mod stdlib_native_gate_probe {
-    //! Diagnostic: if the native hook could see stdlib bodies, how many would
-    //! the A0 coverage gate accept? Replicates `precompile_stdlib`'s pipeline
-    //! with a gate-probing hook installed from the start, so prelude bodies
-    //! are probed too. Prints a report under `--nocapture`; the only assertion
-    //! is that the diag walker mirrors `plan` exactly.
-
-    use std::cell::RefCell;
-    use std::rc::Rc;
-
-    use super::super::*;
-    use crate::core_ir::FuncIdx;
-    use crate::core_ir::clif;
-    use crate::module::{ModuleKey, stdlib};
-
-    /// Prelude bindings from a first, hook-free run. Stdlib compilation is
-    /// deterministic, so these identities hold for the probed second run.
-    fn prelude_bindings() -> PreludeBindings {
-        let mut c = new_compiler(None, false);
-        c.register_prelude();
-        assert!(!crate::diagnostic::has_errors(c.diagnostics()));
-        c.prelude.clone()
-    }
-
-    struct Probe {
-        idx: FuncIdx,
-        plan: clif::NativePlan,
-    }
-
-    /// Every stdlib body must survive the Core IR byte codec exactly — the
-    /// static blob will ship these bytes, so a lossy encode here is a
-    /// miscompiled stdlib at every startup. Equality is the golden renderer's,
-    /// the same notion the `.core` snapshots pin.
-    #[test]
-    fn every_stdlib_body_round_trips_through_the_codec() {
-        type Captured = Vec<(FuncIdx, String, Vec<u8>)>;
-        let bodies: Rc<RefCell<Captured>> = Rc::default();
-        let sink = Rc::clone(&bodies);
-        let mut c = new_compiler(None, false);
-        c.native_hook = Some(Box::new(move |idx, f, _pool, _counts| {
-            sink.borrow_mut()
-                .push((idx, format!("{f}"), crate::core_ir::codec::encode_fn(f)));
-        }));
-        let at = crate::span::Span::DUMMY;
-        c.register_prelude();
-        for path in stdlib::all_modules() {
-            c.load_module(&crate::ast::ImportPath::canonical(path.clone()), at);
-        }
-        assert!(!crate::diagnostic::has_errors(c.diagnostics()));
-        let bodies = bodies.take();
-        assert!(bodies.len() > 200, "hook saw {} bodies", bodies.len());
-        let mut total = 0usize;
-        for (idx, rendered, bytes) in &bodies {
-            total += bytes.len();
-            let back = crate::core_ir::codec::decode_fn(bytes)
-                .unwrap_or_else(|e| panic!("fn#{} failed to decode: {e}", idx.index()));
-            assert_eq!(
-                *rendered,
-                format!("{back}"),
-                "fn#{} changed across the codec",
-                idx.index()
-            );
-        }
-        println!(
-            "codec round-tripped {} bodies, {} KiB total",
-            bodies.len(),
-            total / 1024
-        );
-    }
-
-    /// Every stdlib body must reach native code. There is no admission gate
-    /// any more — `plan` is infallible — so this asserts the *compile* step
-    /// covers all of them, and prints the per-module breakdown.
-    #[test]
-    fn every_stdlib_body_compiles_to_native() {
-        let prelude = prelude_bindings();
-        let probes: Rc<RefCell<Vec<Probe>>> = Rc::default();
-        let sink = Rc::clone(&probes);
-        let mut c = new_compiler(None, false);
-        c.native_hook = Some(Box::new(move |idx, f, pool, counts| {
-            let plan = clif::plan(idx, f, pool, &prelude, counts);
-            sink.borrow_mut().push(Probe { idx, plan });
-        }));
-
-        let at = crate::span::Span::DUMMY;
-        c.register_prelude();
-        assert!(!crate::diagnostic::has_errors(c.diagnostics()));
-        let mut bounds = vec![("al (prelude)".to_string(), probes.borrow().len())];
-        for path in stdlib::all_modules() {
-            c.load_module(&crate::ast::ImportPath::canonical(path.clone()), at);
-            assert!(
-                !crate::diagnostic::has_errors(c.diagnostics()),
-                "errors compiling {}",
-                ModuleKey::for_stdlib(&path).as_str()
-            );
-            bounds.push((
-                ModuleKey::for_stdlib(&path).as_str().to_string(),
-                probes.borrow().len(),
-            ));
-        }
-
-        let probes = probes.take();
-        let fn_name = |idx: FuncIdx| c.program.functions[idx.index()].name.to_string();
-        let idxs: Vec<FuncIdx> = probes.iter().map(|p| p.idx).collect();
-        let plans: Vec<clif::NativePlan> = probes.into_iter().map(|p| p.plan).collect();
-        let compilable = clif::native_set(&plans, &c.program, &c.frame_layouts);
-
-        println!("== stdlib native coverage ==");
-        println!("function table size: {}", c.program.functions.len());
-        println!("bodies seen by hook: {}", idxs.len());
-        println!("compile to native:   {}", compilable.len());
-
-        println!("\n-- per module --");
-        let mut prev = 0usize;
-        for (name, upto) in &bounds {
-            if *upto > prev {
-                let pass = idxs[prev..*upto]
-                    .iter()
-                    .filter(|i| compilable.contains(i))
-                    .count();
-                println!("{:24} {:3} / {:3}", name, pass, *upto - prev);
-            }
-            prev = *upto;
-        }
-
-        let missing: Vec<FuncIdx> = idxs
-            .iter()
-            .copied()
-            .filter(|i| !compilable.contains(i))
-            .collect();
-        assert!(
-            missing.is_empty(),
-            "these stdlib bodies did not compile to native: {:?}",
-            missing
-                .iter()
-                .map(|i| format!("fn#{} {}", i.index(), fn_name(*i)))
-                .collect::<Vec<_>>()
-        );
-    }
-}
-
 mod runnable_programs {
-    //! Two facts a `CompileResult` must never confuse: what analysis built,
-    //! and whether there is a program worth running. A rejected module emits
-    //! no toplevel, so its `Program` runs the stdlib init and halts — and the
-    //! entry frame's pre-filled locals make that look like a computed `0`
+    //! Two facts a `CompileResult` must never confuse: what analysis saw, and
+    //! whether there is a program worth running. A rejected module records no
+    //! toplevel, so running what it built would run the stdlib init and stop
+    //! — and the pre-filled globals would make that look like a computed `0`
     //! rather than a failure.
     //!
     //! Also: a REPL entry is a fragment of a session, not a whole program, so
     //! the line that uses a binding is typed next. That is why the prompt
     //! turns the unused-binding check off — and why turning it off must mean
-    //! "do not report", never "report and skip the emit".
+    //! "do not report", never "report and skip the lowering".
 
     use super::parse_ok;
     use crate::ast;
     use crate::bytecode::{
-        CompileOptions, ModuleScope, Op, UnusedBindings, check, compile, compile_with,
+        CompileOptions, ModuleScope, UnusedBindings, check, compile, compile_with,
     };
+    use crate::core_ir::{Atom, Const, CoreExpr};
 
     fn entry(src: &str) -> ast::Expression {
         ast::Expression::BlockExpression(parse_ok(src))
@@ -650,7 +569,7 @@ mod runnable_programs {
 
     #[test]
     fn an_unused_binding_is_reported_in_a_file() {
-        let result = compile(&entry("pub fn main() {\n  x = 5\n  42\n}\n"), None, None);
+        let result = compile(&entry("pub fn main() {\n  x = 5\n  42\n}\n"), None);
         assert!(
             !result.success(),
             "a file's unused binding must be an error"
@@ -660,61 +579,60 @@ mod runnable_programs {
     /// The shape of a real bug: the REPL filtered a diagnostic it did not want
     /// to show, `success()` then said yes, and the `Program` it ran had no
     /// toplevel — so the entry "evaluated" to one of the entry frame's
-    /// pre-filled locals. Whether a program is runnable is now the splice's
-    /// answer, not the diagnostics'.
+    /// pre-filled globals. Whether a program is runnable is now the recorded
+    /// toplevel's answer, not the diagnostics'.
     #[test]
     fn a_rejected_compile_stays_unrunnable_even_with_its_diagnostics_removed() {
-        let mut result = compile(&entry("pub fn main() {\n  x = 5\n  42\n}\n"), None, None);
+        let mut result = compile(&entry("pub fn main() {\n  x = 5\n  42\n}\n"), None);
         assert!(!result.success(), "an unused binding rejects a file");
         result.diagnostics.clear();
         assert!(result.success(), "the filtered result looks clean");
         assert!(
             result.into_runnable().is_none(),
-            "a program whose toplevel was never emitted must not be runnable"
+            "a program whose toplevel was never recorded must not be runnable"
         );
     }
 
-    /// A check builds the function table but splices no toplevel: analysis,
-    /// never a run. It also does not need a `main`: a library file checks.
+    /// A check records no toplevel: analysis, never a run. It also does not
+    /// need a `main`: a library file checks.
     #[test]
-    fn a_check_has_artifacts_but_nothing_to_run() {
+    fn a_check_has_nothing_to_run() {
         let src = entry("pub const x = 1\n");
-        let checked = check(&src, None, None);
+        let checked = check(&src, None);
         assert!(checked.success(), "{:?}", checked.diagnostics);
-        assert!(check(&src, None, None).into_runnable().is_none());
-        assert!(check(&src, None, None).into_artifacts().is_some());
+        assert!(check(&src, None).into_runnable().is_none());
     }
 
-    /// The last three instructions of a program's entry frame after the
-    /// declarations have been initialised.
-    fn entry_tail(src: &str) -> Vec<Op> {
-        let result = compile(&entry(src), None, None);
-        assert!(result.success(), "{:?}", result.diagnostics);
-        let emitted = result.into_runnable().expect("a successful compile emits");
-        let mut ops: Vec<Op> = emitted
-            .program
-            .code
-            .iter()
-            .rev()
-            .take(3)
-            .map(|i| i.op)
-            .collect();
-        ops.reverse();
-        ops
+    /// The atom a toplevel ends in, past its `Let`/`Drop` spine.
+    fn tail(mut e: &CoreExpr) -> &Atom {
+        loop {
+            match e {
+                CoreExpr::Let { body, .. }
+                | CoreExpr::LetJoin { body, .. }
+                | CoreExpr::LetCont { body, .. }
+                | CoreExpr::Drop { body, .. } => e = body,
+                CoreExpr::Tail(a) => return a,
+                CoreExpr::If { .. } | CoreExpr::Match { .. } | CoreExpr::Goto(_) => {
+                    panic!("toplevel ends in a branch")
+                }
+            }
+        }
     }
 
-    /// A program is entered at `main`: the toplevel's own Nil is popped and
-    /// `main` is called by index, so its result is what `Halt` sees.
+    /// A program is entered at `main`, which the program names by index.
     #[test]
     fn a_program_starts_at_main() {
-        assert_eq!(
-            entry_tail("pub fn main() {\n  42\n}\n"),
-            vec![Op::Pop, Op::CallKnown, Op::Halt]
-        );
+        let result = compile(&entry("pub fn main() {\n  42\n}\n"), None);
+        assert!(result.success(), "{:?}", result.diagnostics);
+        let program = result.into_runnable().expect("a clean compile is runnable");
+        let main = program
+            .main
+            .expect("a program with `pub fn main` starts there");
+        assert_eq!(program.fns[main].name, "main");
     }
 
     fn messages(src: &str) -> Vec<String> {
-        compile(&entry(src), None, None)
+        compile(&entry(src), None)
             .diagnostics
             .into_iter()
             .map(|d| d.message)
@@ -731,7 +649,7 @@ mod runnable_programs {
             "{:?}",
             messages(src)
         );
-        assert!(check(&entry(src), None, None).success());
+        assert!(check(&entry(src), None).success());
     }
 
     #[test]
@@ -748,7 +666,7 @@ mod runnable_programs {
         );
         // Both are reported by `check` too: a malformed entry point is a
         // fact about the file, not about running it.
-        let checked = check(&entry("fn main() {\n  1\n}\n"), None, None);
+        let checked = check(&entry("fn main() {\n  1\n}\n"), None);
         assert!(!checked.success());
     }
 
@@ -763,8 +681,8 @@ mod runnable_programs {
     }
 
     /// The REPL's mode: statements are the input, bindings persist as
-    /// module-scope binds, and the entry's value is its tail expression,
-    /// left on the stack for the `Halt` the REPL reads — no `main` involved.
+    /// module-scope binds, and the entry's value is its tail expression — no
+    /// `main` involved.
     #[test]
     fn a_script_entry_runs_its_statements_and_leaves_the_tail() {
         let result = compile_with(
@@ -776,20 +694,15 @@ mod runnable_programs {
             },
         );
         assert!(result.success(), "{:?}", result.diagnostics);
-        let emitted = result.into_runnable().expect("a successful compile emits");
-        let ops: Vec<Op> = emitted
-            .program
-            .code
-            .iter()
-            .rev()
-            .take(3)
-            .map(|i| i.op)
-            .collect();
-        assert_eq!(
-            ops,
-            vec![Op::Halt, Op::PushConst, Op::StoreLocal],
-            "the toplevel was not emitted: {ops:?}"
-        );
+        let program = result.into_runnable().expect("a clean compile is runnable");
+        assert!(program.main.is_none(), "a script has no `main`");
+        let Atom::Const(c) = tail(&program.toplevel.core.body) else {
+            panic!(
+                "the script's tail is not a constant:\n{}",
+                program.toplevel.core
+            );
+        };
+        assert_eq!(program.consts[c.0 as usize], Const::Int(42));
     }
 }
 
@@ -845,21 +758,14 @@ mod ctor_visibility_survives_on_the_type {
     }
 }
 
-/// `scarlet/wire`'s declaration surface: the two `@vm` keys reach the two new
-/// opcodes, and a program that calls them binds `DecodeError`'s ABI slots.
+/// `scarlet/wire`'s declaration surface: the two `@vm` keys reach the core IR
+/// as their intrinsics.
 mod wire_surface {
-    use super::super::*;
+    use crate::core_ir::Atom;
+    use scarlet_types::intrinsic::Intrinsic;
 
-    /// A clean compile is half the assertion here. `bind_abi` refuses a
-    /// program whose emitted ops construct unbound slots, and `slots_for`
-    /// declares all five `DecodeError` slots against `WireDecode` — so a
-    /// constructor renamed out from under `BINDINGS`, or one whose arity no
-    /// longer matches its slot, is an error in `r.diagnostics`, not a
-    /// mis-built value at runtime.
-    ///
-    /// The ops themselves have no bodies yet; nothing here runs them.
     #[test]
-    fn a_wire_call_emits_its_op_and_binds_the_decode_error_slots() {
+    fn a_wire_call_reaches_the_core_ir_as_its_intrinsic() {
         let r = super::compile_script(
             "import scarlet/wire\n\
              b = wire.encode(1)\n\
@@ -873,460 +779,129 @@ mod wire_surface {
             "snippet failed to compile: {:?}",
             r.diagnostics,
         );
-        let code = r
-            .into_runnable()
-            .expect("a non-check compile emits")
-            .program
-            .code;
-        assert!(
-            code.iter().any(|i| i.op == Op::WireEncode),
-            "wire.encode must reach Op::WireEncode",
-        );
-        assert!(
-            code.iter().any(|i| i.op == Op::WireDecode),
-            "wire.decode must reach Op::WireDecode",
-        );
+        let program = r.into_runnable().expect("a clean compile is runnable");
+        let calls: Vec<Intrinsic> = super::atoms(&program.toplevel.core.body)
+            .into_iter()
+            .filter_map(|a| {
+                if let Atom::Intrinsic { intrinsic, .. } = a {
+                    Some(*intrinsic)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(calls.contains(&Intrinsic::WireEncode), "{calls:?}");
+        assert!(calls.contains(&Intrinsic::WireDecode), "{calls:?}");
     }
 }
 
-/// `bind_abi` rebuilds the ABI prefix and records its length so a later
-/// emit can append descriptor templates past it.
-mod abi_prefix {
-    use super::super::*;
-    use scarlet_vm::template::EnumTemplate;
+mod typed_prim_ops {
+    //! An operator on a type inference has fixed lowers to its typed
+    //! [`PrimOp`] (`IntAdd`), never the unresolved one (`Add`) a backend
+    //! would have to dispatch on at run time.
 
-    #[test]
-    fn bind_abi_records_the_prefix_and_drops_a_suffix_on_rebuild() {
-        let mut c = new_compiler(None, false);
-        c.register_prelude();
-        assert!(
-            !crate::diagnostic::has_errors(c.diagnostics()),
-            "prelude failed to load: {:?}",
-            c.diagnostics(),
-        );
-        c.bind_abi();
-        let n = c.abi_template_count;
-        assert_eq!(n, c.program.templates.len());
-        assert!(
-            n > 0,
-            "prelude must bind at least Nil/Option/Result, got an empty prefix"
-        );
+    use super::{atoms, body_named, parse_ok};
+    use crate::ast;
+    use crate::bytecode::compile;
+    use crate::core_ir::{Atom, PrimOp};
 
-        let extra = EnumTemplate::build(
-            &mut c.program.frozen.builder(),
-            crate::type_def::TypeId(0),
-            0,
-            "Desc",
-            "V",
-            &[],
-        );
-        let suffix = c.program.templates.push(extra);
-        assert_eq!(suffix.index(), n);
-        assert_eq!(c.program.templates.len(), n + 1);
-        assert_eq!(c.abi_template_count, n);
-
-        // The reset stays: a later emit rebuilds the prefix and the suffix
-        // is gone, so a TemplateIdx minted against the previous table cannot
-        // silently name a different constructor.
-        c.bind_abi();
-        assert_eq!(c.program.templates.len(), c.abi_template_count);
-        assert!(
-            c.program.templates.get(suffix).is_none(),
-            "bind_abi must drop a template appended past the previous prefix"
-        );
-    }
-}
-
-/// `mint_wire_templates` extends `program.templates` past `bind_abi`'s ABI
-/// prefix and records where each `WireVariant` landed in
-/// `program.wire_templates`, keyed by the constructor identity it carries —
-/// never by name (T-461).
-mod wire_templates {
-    use super::super::*;
-    use crate::core_ir::VariantRef;
-    use crate::type_def::TypeId;
-    use crate::typed_ir::wire::{Desc, Node, WireVariant};
-
-    /// A one-node `Data` descriptor over one nullary constructor, so a test
-    /// names only what it varies: the type id, the variant index and the
-    /// constructor name.
-    fn one_variant_desc(c: &mut Compiler, ty: TypeId, variant_idx: u16, ctor: &str) -> Desc {
-        let type_name = c.engine.intern("Colour");
-        let ctor_name = c.engine.intern(ctor);
-        Desc::from_parts(vec![Node::Data(vec![WireVariant {
-            variant: VariantRef {
-                type_id: ty,
-                variant_idx,
-                type_name,
-            },
-            name: ctor_name,
-            fields: Vec::new(),
-        }])])
-    }
-
-    #[test]
-    fn a_variant_mints_one_template_past_the_abi_prefix() {
-        let mut c = new_compiler(None, false);
-        c.register_prelude();
-        c.bind_abi();
-        let n = c.abi_template_count;
-
-        let desc = one_variant_desc(&mut c, TypeId(500), 0, "Red");
-        c.mint_wire_templates(&[desc]);
-
-        assert_eq!(c.program.templates.len(), n + 1, "one template minted");
-        let idx = *c
-            .program
-            .wire_templates
-            .get(&(TypeId(500), 0))
-            .expect("recorded under its (type_id, variant_idx) identity");
-        assert_eq!(idx.index(), n, "lands right past the ABI prefix");
-    }
-
-    /// The same constructor reachable through two descriptors — one type two
-    /// `wire.encode`/`wire.decode` call sites both mention, in the eventual
-    /// caller — must mint one template, not two.
-    #[test]
-    fn the_same_identity_across_two_descriptors_mints_once() {
-        let mut c = new_compiler(None, false);
-        c.register_prelude();
-        c.bind_abi();
-        let n = c.abi_template_count;
-
-        let d1 = one_variant_desc(&mut c, TypeId(500), 0, "Red");
-        let d2 = one_variant_desc(&mut c, TypeId(500), 0, "Red");
-        c.mint_wire_templates(&[d1, d2]);
-
-        assert_eq!(
-            c.program.templates.len(),
-            n + 1,
-            "one identity across two descriptors is one template"
-        );
-    }
-
-    /// A later `bind_abi` — a second emit in one session — must drop
-    /// `wire_templates` along with the table it names, exactly as it already
-    /// drops a bare suffix template (`abi_prefix`'s test above): a stale
-    /// index surviving into a rebuilt table would name whatever constructor
-    /// now happens to sit there, not the one that was minted for it. The
-    /// mechanism, not any one `TemplateIdx`, is what a re-emit must preserve
-    /// — this compiler's own design forbids storing the index itself
-    /// anywhere longer-lived than one compile.
-    #[test]
-    fn a_second_bind_abi_drops_wire_templates_and_minting_again_still_works() {
-        let mut c = new_compiler(None, false);
-        c.register_prelude();
-        c.bind_abi();
-
-        let desc = one_variant_desc(&mut c, TypeId(500), 0, "Red");
-        c.mint_wire_templates(&[desc]);
-        assert!(c.program.wire_templates.contains_key(&(TypeId(500), 0)));
-
-        c.bind_abi();
-        assert!(
-            c.program.wire_templates.is_empty(),
-            "bind_abi must clear the wire index along with the templates it named"
-        );
-
-        let desc_again = one_variant_desc(&mut c, TypeId(500), 0, "Red");
-        c.mint_wire_templates(&[desc_again]);
-        let idx = *c
-            .program
-            .wire_templates
-            .get(&(TypeId(500), 0))
-            .expect("re-minting after a rebuild works the same way it did the first time");
-        assert_eq!(
-            idx.index(),
-            c.abi_template_count,
-            "lands past the (possibly relocated) new ABI prefix"
-        );
-    }
-}
-
-/// Elaboration runs the descriptor builder at every `wire.encode`/
-/// `wire.decode` call: on success the op carries the descriptor's constant and
-/// the type's constructors reach `wire_templates`, and on a refusal the call
-/// site gets a diagnostic.
-///
-/// The reason these live here and not only as `al check` cases is the
-/// operand: a subprocess sees the diagnostics but not which constant an
-/// instruction names, and "a descriptor was attached" is exactly the half a
-/// clean compile is silent about.
-mod wire_descriptors {
-    use super::super::*;
-
-    const EVENT: &str = "import scarlet/wire\n\
-                         type Event {\n\
-                         \x20 Said(who String, tags Array(String))\n\
-                         \x20 Left(who String)\n\
-                         }\n";
-
-    /// The operand of every instruction with `op`, in code order.
-    fn operands(p: &crate::bytecode::Program, op: Op) -> Vec<i32> {
-        p.code
-            .iter()
-            .filter(|i| i.op == op)
-            .map(|i| i.operand)
+    /// The prim ops in the body of `name`.
+    fn prim_ops(src: &str, name: &str) -> Vec<PrimOp> {
+        let result = compile(&ast::Expression::BlockExpression(parse_ok(src)), None);
+        assert!(result.success(), "compile failed: {:?}", result.diagnostics);
+        let program = result.into_runnable().expect("a clean compile is runnable");
+        atoms(&body_named(&program, name).body)
+            .into_iter()
+            .filter_map(|a| match a {
+                Atom::PrimOp { op, .. } => Some(*op),
+                _ => None,
+            })
             .collect()
     }
 
-    fn emitted(src: &str) -> crate::bytecode::Program {
-        let r = super::compile_script(src);
-        assert!(
-            !crate::diagnostic::has_errors(&r.diagnostics),
-            "snippet failed to compile: {:?}",
-            r.diagnostics,
+    /// `sq(n)` adds a known call's return type to the operands' sources.
+    #[test]
+    fn int_operators_select_the_int_ops() {
+        let ops = prim_ops(
+            "fn sq(x Int) Int { x * x }\n\
+             fn f(n Int) Int {\n\
+             \tif n == 0 { 0 } else { sq(n) + n - 1 }\n\
+             }\n\
+             pub fn main() {\n\
+             \tprintln(f(3))\n\
+             }\n",
+            "f",
         );
-        r.into_runnable()
-            .expect("a non-check compile emits")
-            .program
+        for typed in [PrimOp::IntEq, PrimOp::IntAdd, PrimOp::IntSub] {
+            assert!(ops.contains(&typed), "{typed:?} not selected: {ops:?}");
+        }
+        for unresolved in [PrimOp::Eq, PrimOp::Add, PrimOp::Sub] {
+            assert!(!ops.contains(&unresolved), "{unresolved:?} leaked: {ops:?}");
+        }
     }
 
-    /// Every error message a compile produced, joined — so an assertion can
-    /// say which text it wanted without depending on diagnostic order.
-    fn errors(src: &str, check_only: bool) -> String {
-        let block = super::parse_ok(src);
-        let r = compile_with(
-            &crate::ast::Expression::BlockExpression(block),
-            CompileOptions {
-                module_scope: ModuleScope::Script,
-                check_only,
-                ..CompileOptions::default()
-            },
-        );
-        r.diagnostics
-            .iter()
-            .map(|d| d.message.clone())
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    /// A descriptor is attached, and it is a descriptor *of that type*: both
-    /// its constructors are minted, under the `(type_id, variant_idx)`
-    /// identity a decoder rebuilds them by. The template count is the part
-    /// that witnesses the node table's contents rather than just that some
-    /// number was attached.
+    /// `v` is `Int` only because inference unified `Some`'s payload with the
+    /// literal `3`, so lowering must read the solved type back rather than
+    /// re-instantiate `Some`'s scheme.
     ///
-    /// **The operand indexes `Program.wire_descs`, not the constant pool**,
-    /// and the fingerprint rides inside the descriptor. Asserting against
-    /// `constants` here would still find *a* value and would say nothing
-    /// about wire.
+    /// `fn g(a, b) { a + b }` would not test this: it really is
+    /// `Addable a => (a, a) -> a`, one body for every instantiation, and the
+    /// unresolved `Add` is correct there.
     #[test]
-    fn an_encode_carries_a_descriptor_and_mints_that_type_s_constructors() {
-        let p = emitted(&format!("{EVENT}b = wire.encode(Left('a'))\nb\n"));
-
-        let ops = operands(&p, Op::WireEncode);
-        assert_eq!(ops.len(), 1, "one call, one op");
-        assert!(
-            usize::try_from(ops[0])
-                .ok()
-                .is_some_and(|i| i < p.wire_descs.len()),
-            "the operand must index wire_descs; got {} against a table of {}",
-            ops[0],
-            p.wire_descs.len()
-        );
-        assert_eq!(p.wire_descs.len(), 1, "one type crossed, one descriptor");
-
-        assert_eq!(
-            p.wire_templates.len(),
-            2,
-            "Event has two constructors and both must be rebuildable: {:?}",
-            p.wire_templates
-        );
-    }
-
-    /// Two types are two descriptors; one type at two call sites is one. The
-    /// second half is what fails if the operand were not type-directed at
-    /// all — a hard-coded 0 passes every test that only looks at one call.
-    #[test]
-    fn the_operand_follows_the_type_and_nothing_else() {
-        let p = emitted(&format!(
-            "{EVENT}type Other {{\n\
-             \x20 Other(n Int)\n\
-             }}\n\
-             a = wire.encode(Left('a'))\n\
-             b = wire.encode(Said('b', []))\n\
-             c = wire.encode(Other(1))\n\
-             [a, b, c]\n"
-        ));
-
-        let ops = operands(&p, Op::WireEncode);
-        assert_eq!(ops.len(), 3);
-        assert_eq!(
-            ops[0], ops[1],
-            "two calls at one type describe one shape, so they share a constant"
-        );
-        assert_ne!(ops[0], ops[2], "a different type is a different descriptor");
-    }
-
-    /// The whole of constraint 2. `decode`'s payload is fixed only by the
-    /// `match` *after* the call, so a descriptor built from the type as the
-    /// call was entered would be built from an unresolved variable and refuse.
-    /// It compiles, and it describes the same shape the `encode` above it
-    /// does — which is the property a shared constant witnesses and a bare
-    /// "it compiled" does not.
-    #[test]
-    fn a_decode_typed_only_by_a_later_match_describes_that_type() {
-        let p = emitted(&format!(
-            "{EVENT}b = wire.encode(Left('a'))\n\
-             match wire.decode(b) {{\n\
-             \x20 Ok(Said(w, _)) -> w\n\
-             \x20 Ok(Left(w)) -> w\n\
-             \x20 Err(_) -> 'no'\n\
-             }}\n"
-        ));
-
-        let enc = operands(&p, Op::WireEncode);
-        let dec = operands(&p, Op::WireDecode);
-        assert_eq!((enc.len(), dec.len()), (1, 1));
-        assert_eq!(
-            enc[0], dec[0],
-            "decode's descriptor must be Event's, the same shape encode described"
-        );
-    }
-
-    #[test]
-    fn an_unconstrained_decode_is_refused_with_the_annotate_wording() {
-        let msgs = errors(
-            "import scarlet/wire\n\
-             fn read(b Binary) {\n\
-             \x20 match wire.decode(b) {\n\
-             \x20   Ok(v) -> Some(v)\n\
-             \x20   Err(_) -> None\n\
-             \x20 }\n\
+    fn an_operand_typed_only_by_inference_selects_the_int_op() {
+        let ops = prim_ops(
+            "fn f() Int {\n\
+             \tmatch Some(3) {\n\
+             \t\tNone -> 0\n\
+             \t\tSome(v) -> v + 1\n\
+             \t}\n\
              }\n\
-             read\n",
-            false,
+             pub fn main() {\n\
+             \tprintln(f())\n\
+             }\n",
+            "f",
         );
         assert!(
-            msgs.contains("the type `wire.decode` produces here is not known"),
-            "got: {msgs}"
+            ops.contains(&PrimOp::IntAdd),
+            "IntAdd not selected: {ops:?}"
         );
+        assert!(!ops.contains(&PrimOp::Add), "Add leaked: {ops:?}");
     }
+}
 
-    /// The same refusal, reached the other way: the payload is pinned to the
-    /// enclosing function's own quantified parameter rather than left unsolved.
-    #[test]
-    fn a_decode_in_a_generic_fn_is_refused() {
-        let msgs = errors(
-            "import scarlet/wire\n\
-             fn read(b Binary, fallback a) a {\n\
-             \x20 match wire.decode(b) {\n\
-             \x20   Ok(v) -> v\n\
-             \x20   Err(_) -> fallback\n\
-             \x20 }\n\
-             }\n\
-             read\n",
-            false,
-        );
-        assert!(
-            msgs.contains("the type `wire.decode` produces here is not known"),
-            "got: {msgs}"
-        );
-    }
+mod function_modules {
+    //! Every lowered function names the module it came from. A name alone is
+    //! ambiguous once the stdlib compiles into the same program as the user's
+    //! code.
 
-    /// A closure's captures are not fixed by its type and are described
-    /// inline at encode time, so a record with a `fn` field compiles and
-    /// carries a descriptor and the record's constructor like any other.
-    #[test]
-    fn a_fn_field_compiles_and_carries_a_descriptor() {
-        let p = emitted(
-            "import scarlet/wire\n\
-             type Handler {\n\
-             \x20 Handler(name String, run fn(Int) Int)\n\
-             }\n\
-             wire.encode(Handler('h', fn(x) { x + 1 }))\n",
-        );
-        assert_eq!(operands(&p, Op::WireEncode).len(), 1, "one call, one op");
-        assert_eq!(p.wire_descs.len(), 1, "one type crossed, one descriptor");
-        assert_eq!(
-            p.wire_templates.len(),
-            1,
-            "Handler's one constructor is minted: {:?}",
-            p.wire_templates
-        );
-    }
+    use super::parse_ok;
+    use crate::ast;
+    use crate::bytecode::compile;
+    use crate::module::ModuleKey;
 
-    /// The arm that silently does not happen if the builder is run at
-    /// emission instead: `check` never emits, so a diagnostic raised there is
-    /// invisible in an editor. Reached through the unknown type, the one
-    /// refusal.
     #[test]
-    fn the_refusal_reaches_the_check_only_path() {
-        let src = "import scarlet/wire\n\
-                   fn send(xs Array(a)) Binary { wire.encode(xs) }\n\
-                   send\n";
-        let checked = errors(src, true);
-        assert!(
-            checked.contains("the type is still polymorphic here"),
-            "check-only must report the refusal too, got: {checked}"
-        );
-        assert!(
-            checked.contains("[element]"),
-            "the refusal must name the position it was reached through: {checked}"
-        );
-    }
-
-    /// A record over a user-declared bodiless type compiles and carries a
-    /// descriptor: the field is a node no value reaches, not a refusal.
-    #[test]
-    fn a_bodiless_field_compiles_and_carries_a_descriptor() {
-        let src = "import scarlet/wire\n\
-                   pub type Native\n\
-                   type Handler {\n\
-                   \x20 Handler(raw Native)\n\
-                   }\n\
-                   fn send(h Handler) Binary { wire.encode(h) }\n\
-                   send\n";
-        assert_eq!(errors(src, true), "", "check-only admits it");
-        let p = emitted(src);
-        assert_eq!(p.wire_descs.len(), 1, "one type crossed, one descriptor");
-    }
-
-    /// A descriptor is built for a type this program never names or imports:
-    /// `Port`'s stream is a `scarlet/net/socket.Connection`, and nothing here
-    /// imports `scarlet/net/socket`. This harness compiles the stdlib from
-    /// source, so `Connection` was registered by `scarlet/net/socket`'s own
-    /// compile in this env and its by-id entry outlived that module's frame;
-    /// the import of `scarlet/os/port` brought in `Port` alone. That is one
-    /// of the two ways a declaration the builder meets is registered, and
-    /// `wire_descriptor.rs` witnesses the other, the seeded stdlib.
-    #[test]
-    fn a_stdlib_type_reached_only_through_a_field_is_described() {
-        let src = "import scarlet/os/port
-                   import scarlet/wire
-                   fn send(p port.Port) Binary { wire.encode(p) }
-                   send
-";
-        assert_eq!(errors(src, true), "", "check-only admits it");
-        let p = emitted(src);
-        assert_eq!(p.wire_descs.len(), 1, "one type crossed, one descriptor");
-        assert_eq!(
-            p.wire_templates.len(),
-            1,
-            "Port's one constructor is minted and Connection, an identity, mints none: {:?}",
-            p.wire_templates
-        );
-    }
-
-    /// The prelude's `True` and `False` are minted unboxed: the pre-built
-    /// value a decoder hands back is the immediate `Op::PushTrue` and
-    /// `Op::PushFalse` push, in the declared order — `True` 0, `False` 1 —
-    /// which is the tag the encoder writes. Every other constructor minted
-    /// here is a cell, so the two are the only entries whose value is not.
-    #[test]
-    fn bools_constructors_mint_unboxed_templates() {
-        let p = emitted("import scarlet/wire\nwire.encode(True)\n");
-        let mut unboxed: Vec<(u16, bool)> = p
-            .wire_templates
-            .keys()
-            .filter_map(|&(tid, vi)| Some((vi, p.wire_nullary(tid, vi)?.as_bool()?)))
+    fn two_maps_are_told_apart_by_their_module() {
+        let src = "import scarlet/array\n\
+                   fn map(x Int) Int { x + 1 }\n\
+                   pub fn main() {\n\
+                   \tprintln(array.map([map(1)], map))\n\
+                   }\n";
+        let result = compile(&ast::Expression::BlockExpression(parse_ok(src)), None);
+        let program = result.into_runnable().expect("the snippet compiles");
+        let mut maps: Vec<String> = (&program.fns)
+            .into_iter()
+            .filter(|f| f.name == "map")
+            .map(|f| f.module.clone())
             .collect();
-        unboxed.sort();
-        assert_eq!(
-            unboxed,
-            vec![(0, true), (1, false)],
-            "True is 0 and False is 1, as scarlet.scrl declares them"
+        maps.sort();
+        assert_eq!(maps, ["main", "scarlet/array"]);
+        assert_eq!(program.toplevel.module, ModuleKey::main().as_str());
+        let array = ModuleKey::of(&vec!["scarlet".to_string(), "array".to_string()]);
+        assert!(
+            program
+                .inits
+                .iter()
+                .any(|init| init.module == array.as_str())
         );
     }
 }

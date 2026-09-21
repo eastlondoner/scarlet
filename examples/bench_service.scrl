@@ -66,8 +66,8 @@ fn make_user(i Int) User {
 }
 
 type Tables {
-	by_name Map(Binary, User)
-	by_id Map(Int, User)
+	by_name map.Map(Binary, User)
+	by_id map.Map(Int, User)
 }
 
 fn find_by_name(t Tables, name Binary) Option(User) {

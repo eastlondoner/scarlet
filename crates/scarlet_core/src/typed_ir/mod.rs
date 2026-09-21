@@ -12,12 +12,12 @@
 //! patterns keep their nesting for `lower` to flatten into `CorePat` heads
 //! (docs/core-ir-spec.md §IR).
 
+pub(crate) mod binop;
 pub mod elaborate;
 pub mod elaborate_pat;
 pub mod eta;
 pub mod resolve;
 pub mod rty;
-pub mod wire;
 pub(crate) use scarlet_types::slots;
 pub(crate) mod zonk;
 
@@ -30,9 +30,9 @@ pub(crate) use resolve::Denotation;
 pub use rty::{Arity, RSlice, RTy, ResolvedNode, ResolvedPool};
 pub(crate) use zonk::{Zonker, pool_for};
 
-use crate::bytecode::{Op, Value};
-use crate::core_ir::{ConstId, FuncIdx, Imm, VariantRef};
+use crate::core_ir::{ConstId, FuncIdx, PrimOp, VariantRef};
 use crate::types::StrId;
+use scarlet_types::intrinsic::Intrinsic;
 
 /// A binding introduced by a `TypedFn`'s parameter list, a `let`, or a
 /// pattern. Dense within its function: `BindingId(i)` for `i < TypedFn::binds`.
@@ -47,22 +47,7 @@ impl std::fmt::Display for BindingId {
     }
 }
 
-/// A slot in the entry (module) frame: what `PushGlobal` addresses. A
-/// module-scope name may be bound more than once (an import shadowed by a later
-/// `let`), so each [`TypedBind`] carries the slot its own binding lands in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct GlobalSlot(pub i32);
-
-/// A slot in the *current* frame: what `PushLocal` addresses. A different index
-/// space from [`GlobalSlot`] and [`CaptureIdx`], kept distinct so the three
-/// cannot be swapped.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct FrameSlot(pub(crate) i32);
-
-/// An index into the current closure's capture array: what `PushCapture`
-/// addresses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct CaptureIdx(pub(crate) i32);
+pub use scarlet_ir::core_ir::{CaptureIdx, FrameSlot, GlobalSlot};
 
 /// A name bound to a value, with the type the checker gave it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,7 +56,7 @@ pub struct TypedBind {
     pub(crate) name: StrId,
     pub(crate) ty: RTy,
     /// `Some(slot)` when this binding is module-level and must land in that
-    /// entry-frame slot, because fn bodies address it by `PushGlobal slot`.
+    /// entry-frame slot, because fn bodies read it from there.
     pub(crate) global: Option<GlobalSlot>,
 }
 
@@ -81,17 +66,17 @@ pub struct TypedBind {
 pub enum ValueRef {
     /// A [`TypedBind`] in the current function.
     Local(BindingId),
-    /// ESCAPE HATCH: `PushLocal slot` for a raw frame slot the module walk
-    /// assigned (a selective `import mod.{x}` binding). Anchored to no
-    /// [`BindingId`], because import bindings are materialised by the module
-    /// walk rather than by the elaborator.
+    /// ESCAPE HATCH: a raw frame slot the module walk assigned (a selective
+    /// `import mod.{x}` binding). Anchored to no [`BindingId`], because import
+    /// bindings are materialised by the module walk rather than by the
+    /// elaborator.
     Slot(FrameSlot),
-    /// `PushGlobal slot`. A top-level `fn` referenced as a *value* loads this
+    /// An entry-frame slot. A top-level `fn` referenced as a *value* loads this
     /// way even inside itself; self-*calls* are [`TypedCallee::SelfRec`].
     Global(GlobalSlot),
-    /// `PushCapture idx` — a value captured from the enclosing frame.
+    /// A value captured from the enclosing frame.
     Capture(CaptureIdx),
-    /// `PushSelf` — the current closure itself.
+    /// The current closure itself.
     SelfClosure,
 }
 
@@ -102,11 +87,8 @@ pub enum TypedCallee {
     Known(FuncIdx),
     /// The function currently being lowered.
     SelfRec,
-    /// A `@vm` builtin: the call *is* the opcode. `imm` is the operand the
-    /// instruction carries; every builtin resolved from a name takes
-    /// [`Imm::None`], and only a site that has a constant to attach — a wire
-    /// op's descriptor — sets anything else.
-    Builtin { op: Op, imm: Imm },
+    /// A `@vm` builtin: the call *is* the intrinsic.
+    Builtin { intrinsic: Intrinsic },
     /// A closure value computed at runtime.
     Dynamic(Box<TypedExpr>),
 }
@@ -259,7 +241,7 @@ pub enum TypedExpr {
         ty: RTy,
         value: ConstId,
     },
-    /// `PushNil` — a block that ended in a statement, or an empty one.
+    /// `Nil` — a block that ended in a statement, or an empty one.
     Nil {
         ty: RTy,
     },
@@ -283,17 +265,17 @@ pub enum TypedExpr {
         body: Box<TypedExpr>,
     },
     /// A binary operator, already specialised against the operand's resolved
-    /// primitive (`AddInt` rather than `Add`). Never `&&`/`||`.
+    /// primitive (`IntAdd` rather than `Add`). Never `&&`/`||`.
     Binary {
         ty: RTy,
-        op: Op,
+        op: PrimOp,
         lhs: Box<TypedExpr>,
         rhs: Box<TypedExpr>,
     },
-    /// `!x`, `-x` — specialised the same way (`NegInt`/`NegFloat`/`Neg`).
+    /// `!x`, `-x` — specialised the same way (`IntNeg`/`FloatNeg`/`Neg`).
     Unary {
         ty: RTy,
-        op: Op,
+        op: PrimOp,
         operand: Box<TypedExpr>,
     },
     /// `a && b`. Control flow, not an operator: `b` is not evaluated when `a`
@@ -466,17 +448,6 @@ pub struct TypedProgram {
     /// The module's initialiser — top-level declarations in dependency order
     /// followed by its statements. `params` is empty.
     pub(crate) toplevel: TypedFn,
-    /// The compiler's own constant pool, moved in — not a copy, and not a
-    /// second pool merged at emit.
-    ///
-    /// `lower` copies it verbatim and the compiler adopts it back wholesale, so
-    /// a [`ConstId`] means the same thing from elaboration to the VM. That is
-    /// what keeps `lower` `&mut`-free: every constant a lowered body pushes
-    /// must already be pooled and carried on the node, including the ones with
-    /// no source literal behind them (`TypedPat::Array`'s `len`,
-    /// `TypedPat::Bin`'s `zero`, `TypedBinPatSeg::Utf8Literal`'s `bits`).
-    /// Pinned by `typed_program_consts_are_stable_ids`.
-    pub(crate) consts: Vec<Value>,
     /// The arena every [`RTy`] in the program indexes. Append-only during
     /// elaboration, immutable afterwards. `lower` never reads it; `perceus`
     /// reads it for `is_heap`, and `emit` erases types entirely.
@@ -612,10 +583,10 @@ mod tests {
     fn pool_and_temps() -> (ResolvedPool, TempTys) {
         let mut p = ResolvedPool::new(PrimIds::default());
         let prims = p.prims();
-        let int = p.mk_con(prims.int, StrId::NONE, &[]);
-        let boolean = p.mk_con(TypeId(100), StrId::NONE, &[]);
-        let string = p.mk_con(prims.string, StrId::NONE, &[]);
-        let binary = p.mk_con(TypeId(101), StrId::NONE, &[]);
+        let int = p.mk_con(prims.int, &[]);
+        let boolean = p.mk_con(TypeId(100), &[]);
+        let string = p.mk_con(prims.string, &[]);
+        let binary = p.mk_con(TypeId(101), &[]);
         let int_pair = p.mk_tuple(&[int, int]);
         (
             p,
@@ -639,17 +610,12 @@ mod tests {
         }
     }
 
-    fn bits(vs: &[Value]) -> Vec<u64> {
-        vs.iter().map(|v| v.to_bits()).collect()
-    }
-
     /// `TypedProgram::consts` is not a second pool that emit merges: lowering
     /// preserves every `ConstId` in it.
     #[test]
     fn typed_program_consts_are_stable_ids() {
         let (pool, temps) = pool_and_temps();
         let int = temps.int;
-        let consts = vec![Value::small_int(7), Value::small_int(9)];
         let p = TypedProgram {
             fns: vec![nullary(
                 StrId::NONE,
@@ -667,35 +633,24 @@ mod tests {
                     value: ConstId(0),
                 },
             ),
-            consts: consts.clone(),
             pool,
             temps,
         };
 
-        let out = lower::lower(&p);
-        assert_eq!(
-            out.consts.len(),
-            consts.len(),
-            "lower has no pool to intern into: it hands back what it was given"
-        );
-        assert_eq!(
-            bits(&out.consts),
-            bits(&consts),
-            "every ConstId the elaborator minted must name the same Value after \
-             lowering, or PushConst operands baked into TypedExpr::Const would \
-             have to be renumbered"
-        );
-        assert_eq!(
-            p.consts.get(ConstId(1).0 as usize).map(Value::to_bits),
-            Some(out.consts[1].to_bits())
+        // Every constant lives in the compiler's one pool, and `lower` has
+        // none of its own: an id the elaborator minted names the same constant
+        // after lowering.
+        let out = format!("{}", lower::lower(&p));
+        assert!(out.contains("ret c1\n"), "the fn's constant:\n{out}");
+        assert!(
+            out.ends_with("toplevel:\n  ret c0\n"),
+            "the toplevel's constant:\n{out}"
         );
     }
 
-    /// `lower` copies the callee's immediate onto the atom. Dropping it would
-    /// be silent — the op still emits, with operand 0, and decodes against
-    /// whatever schema that names.
+    /// A builtin call reaches the core IR as a call to that same intrinsic.
     #[test]
-    fn a_builtin_immediate_reaches_the_core_atom() {
+    fn a_builtin_call_reaches_the_core_ir_as_its_intrinsic() {
         let (pool, temps) = pool_and_temps();
         let binary = temps.binary;
         let p = TypedProgram {
@@ -706,8 +661,7 @@ mod tests {
                 TypedExpr::Call {
                     ty: binary,
                     callee: TypedCallee::Builtin {
-                        op: Op::WireEncode,
-                        imm: Imm::Const(ConstId(1)),
+                        intrinsic: Intrinsic::StringLength,
                     },
                     args: vec![TypedExpr::Const {
                         ty: binary,
@@ -715,7 +669,6 @@ mod tests {
                     }],
                 },
             ),
-            consts: vec![Value::small_int(7), Value::small_int(42)],
             pool,
             temps,
         };
@@ -723,8 +676,8 @@ mod tests {
         let out = lower::lower(&p);
         let rendered = out.toplevel.to_string();
         assert!(
-            rendered.contains("WireEncode#c1"),
-            "the descriptor must survive lowering, got: {rendered}"
+            rendered.contains("StringLength"),
+            "the intrinsic must survive lowering, got: {rendered}"
         );
     }
 
@@ -738,7 +691,7 @@ mod tests {
         let array = {
             let mut pool = pool;
             let prims = pool.prims();
-            let a = pool.mk_con(prims.array, StrId::NONE, &[int]);
+            let a = pool.mk_con(prims.array, &[int]);
             (pool, a)
         };
         let (pool, arr_ty) = array;
@@ -772,11 +725,6 @@ mod tests {
                 },
             },
         ];
-        let consts = vec![
-            Value::small_int(2),
-            Value::small_int(1),
-            Value::small_int(0),
-        ];
         let p = TypedProgram {
             fns: Vec::new(),
             toplevel: nullary(
@@ -788,17 +736,15 @@ mod tests {
                     arms,
                 },
             ),
-            consts: consts.clone(),
             pool,
             temps,
         };
 
-        let out = lower::lower(&p);
-        assert_eq!(
-            bits(&out.consts),
-            bits(&consts),
-            "the array arm's length check reads TypedPat::Array's pooled `len`; \
-             lower neither appends to nor reorders the pool it was handed"
-        );
+        // The array arm's length check compares against `TypedPat::Array`'s
+        // pooled `len`, `c0`: `lower` has no pool to mint a constant into, so
+        // every constant it emits is one the elaborator already pooled.
+        let out = format!("{}", lower::lower(&p));
+        assert!(out.contains("c0"), "the length check:\n{out}");
+        assert!(!out.contains("c3"), "a constant nobody pooled:\n{out}");
     }
 }

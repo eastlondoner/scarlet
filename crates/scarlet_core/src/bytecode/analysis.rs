@@ -41,7 +41,6 @@ use petgraph::Directed;
 use petgraph::algo::tarjan_scc;
 use petgraph::stable_graph::{NodeIndex, StableGraph};
 
-use super::Op;
 use super::compiler::{Compiler, ToplevelDecl};
 use crate::ast;
 use crate::module::{self, ExportedType, ExportedValue, ModuleInterface};
@@ -53,6 +52,7 @@ use crate::types::{
     AddedTypeVar, AnnotationContext, ArenaSlice, DefinitionLocation, EntityKind, Hydrator, Scheme,
     StrId, Ty, TypeBody, TypeInfo, TypeParam, ValueKind, Variant, VariantField, pool,
 };
+use scarlet_types::intrinsic::Intrinsic;
 
 #[derive(Clone, Copy)]
 enum Decl<'a> {
@@ -124,13 +124,6 @@ impl<'a> Prepared<'a> {
                 .map(|p| p.identifier.name.clone())
                 .collect(),
             _ => Vec::new(),
-        }
-    }
-
-    fn doc(&self) -> Option<String> {
-        match self {
-            Prepared::Fn { fd, .. } => fd.doc.clone(),
-            Prepared::Const { cb, .. } => cb.doc.clone(),
         }
     }
 
@@ -236,7 +229,7 @@ impl Compiler {
         // which Pass 3.5 drops as duplicate fns/consts are dropped here.
         let mut dup_ctors: Vec<Vec<bool>> = Vec::new();
         let mut decls: Vec<Decl<'_>> = Vec::new();
-        let mut vm_fns: Vec<(&ast::FunctionDeclaration, bool, Op)> = Vec::new();
+        let mut vm_fns: Vec<(&ast::FunctionDeclaration, bool, Intrinsic)> = Vec::new();
         let mut other_nodes: Vec<&ast::Node> = Vec::new();
 
         let in_prelude = self.current_module == module::scarlet_prelude();
@@ -284,8 +277,10 @@ impl Compiler {
                                     // a real expression body.
                                     match &fd.body {
                                         ast::FnBody::Vm(key) => {
-                                            match super::builtin_op(&key.name) {
-                                                Some(op) => vm_fns.push((fd, is_public, op)),
+                                            match Intrinsic::from_key(&key.name) {
+                                                Some(intrinsic) => {
+                                                    vm_fns.push((fd, is_public, intrinsic))
+                                                }
                                                 None => self.error(
                                                     format!("unknown @vm builtin '{}'", key.name),
                                                     key.span,
@@ -357,24 +352,27 @@ impl Compiler {
         // Pass 3 — pre-allocate one slot per decl, then register fn
         // signatures, positionally in `prepared`.
         //
-        // `@vm` fns get a `Builtin{op}` scheme, no slot, no body codegen, and
+        // `@vm` fns get a `Builtin` scheme, no slot, no body codegen, and
         // export here rather than after generalisation: their type is the
         // annotated signature verbatim, there is no body to infer from.
-        for &(fd, is_pub, op) in &vm_fns {
+        for &(fd, is_pub, intrinsic) in &vm_fns {
             let name = &fd.identifier.name;
             let fn_ty = self.hydrate_fn_signature(fd).fn_ty;
-            let mut scheme = self.engine.generalize_top(fn_ty);
-            scheme.kind = ValueKind::Builtin { op };
-            let m = self.current_module_slice();
-            let dl = DefinitionLocation::new(fd.identifier.span, m, EntityKind::Function);
-            scheme.def = Some(dl);
-            self.env.define_at(name, scheme, dl);
-            self.env.store_doc_opt(name, &fd.doc);
             let params: Vec<String> = fd
                 .params
                 .iter()
                 .map(|p| p.identifier.name.clone())
                 .collect();
+            let mut scheme = self.engine.generalize_top(fn_ty);
+            scheme.kind = ValueKind::Builtin {
+                intrinsic,
+                param_labels: self.engine.intern_slice(&params),
+            };
+            let m = self.current_module_slice();
+            let dl = DefinitionLocation::new(fd.identifier.span, m, EntityKind::Function);
+            scheme.def = Some(dl);
+            self.env.define_at(name, scheme, dl);
+            self.env.store_doc_opt(name, &fd.doc);
             self.emit_def(
                 dl,
                 name,
@@ -385,15 +383,7 @@ impl Compiler {
                 },
             );
             self.record(name, scheme.ty, fd.identifier.span, fd.doc.clone());
-            export_value(
-                iface.as_deref_mut(),
-                name,
-                is_pub,
-                scheme,
-                None,
-                params,
-                fd.doc.clone(),
-            );
+            export_value(iface.as_deref_mut(), name, is_pub, scheme, None);
         }
 
         // Not `get_or_create_local`: a decl's slot reaches the toplevel
@@ -618,8 +608,6 @@ impl Compiler {
                 p.is_pub(),
                 s,
                 Some(p.slot()),
-                p.param_names(),
-                p.doc(),
             );
         }
 
@@ -855,19 +843,7 @@ impl Compiler {
             }
             // Aliases and externals have no constructors; just export the type info.
             let ti = export_id.and_then(|id| self.env.lookup_type_info_by_id(id));
-            let def = DefinitionLocation::new(
-                td.identifier.span,
-                self.current_module_slice(),
-                EntityKind::Type,
-            );
-            export_type(
-                iface.as_deref_mut(),
-                &td.identifier.name,
-                is_public,
-                ti,
-                Some(def),
-                &td.doc,
-            );
+            export_type(iface.as_deref_mut(), &td.identifier.name, is_public, ti);
             return;
         };
         let ctors_public = is_public && !*opaque;
@@ -974,15 +950,7 @@ impl Compiler {
                 // Unconditional: `export_value` routes a non-`pub` name into
                 // `iface.private_names`, so a private ctor gives importers
                 // "'X' is private" rather than "no member 'X'".
-                export_value(
-                    iface.as_deref_mut(),
-                    name,
-                    ctors_public,
-                    scheme,
-                    None,
-                    labels,
-                    ctor.doc.clone(),
-                );
+                export_value(iface.as_deref_mut(), name, ctors_public, scheme, None);
             }
         });
 
@@ -997,19 +965,7 @@ impl Compiler {
         );
 
         let ti = self.env.lookup_type_info_by_id(type_id);
-        let def = DefinitionLocation::new(
-            td.identifier.span,
-            self.current_module_slice(),
-            EntityKind::Type,
-        );
-        export_type(
-            iface.as_deref_mut(),
-            type_name,
-            is_public,
-            ti,
-            Some(def),
-            &td.doc,
-        );
+        export_type(iface.as_deref_mut(), type_name, is_public, ti);
     }
 }
 
@@ -1076,16 +1032,12 @@ fn export_value(
     is_pub: bool,
     scheme: Scheme,
     slot: Option<GlobalSlot>,
-    param_names: Vec<String>,
-    doc: Option<String>,
 ) {
     let Some(iface) = iface else { return };
     if is_pub {
         let ev = ExportedValue {
             scheme,
             local_slot: slot,
-            param_names,
-            doc,
         };
         iface.values.insert(name.to_string(), ev);
     } else {
@@ -1098,20 +1050,13 @@ fn export_type(
     name: &str,
     is_pub: bool,
     ti: Option<TypeInfo>,
-    def: Option<DefinitionLocation>,
-    doc: &Option<String>,
 ) {
     let Some(iface) = iface else { return };
     if is_pub {
         if let Some(ti) = ti {
-            iface.types.insert(
-                name.to_string(),
-                ExportedType {
-                    info: ti,
-                    def,
-                    doc: doc.clone(),
-                },
-            );
+            iface
+                .types
+                .insert(name.to_string(), ExportedType { info: ti });
         }
     } else {
         iface.private_names.insert(name.to_string());

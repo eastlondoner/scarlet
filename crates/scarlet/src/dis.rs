@@ -1,203 +1,184 @@
-//! `al dis` — the emitted bytecode, as text. A debugging view, not a stable
-//! format.
+//! `scarlet dis` and the REPL's `:dis`: a compiled program's Core IR as text.
 //!
-//! Operands are printed raw rather than decoded per opcode. The only
-//! classification used is [`Op::has_jump_target`], which has no wildcard arm,
-//! so a new opcode fails to compile until it is placed.
+//! The stdlib compiles into the same [`Program`] as the user's code, so a
+//! listing always picks: the entry file's own functions, or every function
+//! whose name matches, from any module.
 
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
-use crate::bytecode::{Function, Instruction, Op, Program};
-use crate::core_ir::clif::{self, NativePlan};
-use crate::tivec::Idx as _;
-use crate::vm::inspect;
-use crate::vm::jit;
+use crate::core_ir::{CoreExpr, Program};
+use crate::module::ModuleKey;
 
-/// Render `program` as text: header, each function's code, then constants.
-pub fn disassemble(program: &Program) -> String {
-    render(program, None)
+/// Which functions a listing shows.
+#[derive(Clone, Copy)]
+pub enum Filter<'a> {
+    /// The entry file's functions, then its toplevel.
+    Entry,
+    /// Every function, from any module, whose name contains this.
+    Named(&'a str),
 }
 
-/// Only functions whose name contains `needle`.
-pub fn disassemble_fn(program: &Program, needle: &str) -> String {
-    render(program, Some(needle))
-}
-
-/// Why `disassemble_native` produced no listing.
-#[derive(Debug)]
-pub enum DisNativeError {
-    /// The host JIT module could not be created.
-    Jit(jit::JitError),
-    /// One matched function's native body failed to compile.
-    Compile {
-        function: String,
-        error: jit::JitError,
-    },
-}
-
-impl std::fmt::Display for DisNativeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            DisNativeError::Jit(e) => write!(f, "{e}"),
-            DisNativeError::Compile { function, error } => {
-                write!(f, "native compile of {function} failed: {error}")
-            }
+/// The listing, or `None` when `filter` matches no function.
+///
+/// Each function is preceded by its `fn#N`, the number a `call fn#N` or
+/// `closure fn#N` elsewhere in the listing refers to. The listing ends with
+/// the names of the constructors it shows, so `ctor 512.0(%1)` can be read.
+pub fn listing(program: &Program, filter: Filter<'_>) -> Option<String> {
+    let entry = ModuleKey::main();
+    let mut out = summary(program, &entry);
+    let mut shown: Vec<&CoreExpr> = Vec::new();
+    for (i, f) in (&program.fns).into_iter().enumerate() {
+        let keep = match filter {
+            Filter::Entry => f.module == entry.as_str(),
+            Filter::Named(needle) => f.name.contains(needle),
+        };
+        if keep {
+            let _ = write!(out, "\n; fn#{i}\n{f}");
+            shown.push(&f.core.body);
         }
     }
+    if let Filter::Entry = filter {
+        let _ = write!(out, "\n; toplevel\n{}", program.toplevel);
+        shown.push(&program.toplevel.core.body);
+    }
+    if shown.is_empty() {
+        return None;
+    }
+    types(program, &shown, &mut out);
+    Some(out)
 }
 
-impl std::error::Error for DisNativeError {}
-
-/// `--native <fn>`: the bytecode listing for functions matching `needle`, each
-/// compiled body followed by its CLIF and machine-code size.
-///
-/// `plans` are the [`NativePlan`]s the runtime would actually compile. Bodies
-/// are defined into a real host-ISA module to get the size, but nothing is
-/// finalized or run.
-pub fn disassemble_native(
-    program: &Program,
-    needle: &str,
-    plans: Vec<NativePlan>,
-    layouts: &std::collections::HashMap<
-        scarlet_vm::FuncIdx,
-        scarlet_core::core_ir::emit::FrameLayout,
-    >,
-) -> Result<String, DisNativeError> {
-    let mut out = render(program, Some(needle));
-    let mut module = jit::jit_module().map_err(DisNativeError::Jit)?;
-    let mut listed = false;
-    for plan in plans {
-        let idx = plan.func_idx.index();
-        let Some(f) = program.functions.get(idx) else {
+/// One comment line per type a constructor in `bodies` belongs to:
+/// `; 512 Option: .0 Some(value), .1 None`.
+fn types(program: &Program, bodies: &[&CoreExpr], out: &mut String) {
+    let mut ids = BTreeSet::new();
+    for body in bodies {
+        body.for_each_variant(|v| {
+            ids.insert(v.type_id);
+        });
+    }
+    if ids.is_empty() {
+        return;
+    }
+    out.push_str("\n; types\n");
+    for id in ids {
+        let Some(t) = program.types.get(&id) else {
+            let _ = writeln!(out, "; {} has no names", id.0);
             continue;
         };
-        if !f.name.contains(needle) {
-            continue;
-        }
-        let Some(layout) = layouts.get(&plan.func_idx) else {
-            continue;
-        };
-        match clif::compile(&mut module, &plan, program, layout) {
-            Ok(body) => {
-                let _ = writeln!(
-                    out,
-                    "\nnative fn#{idx} {} ({} bytes)",
-                    f.name, body.code_size
-                );
-                let _ = write!(out, "{}", body.clif);
-                if !body.clif.ends_with('\n') {
-                    let _ = writeln!(out);
-                }
-            }
-            Err(e) => {
-                return Err(DisNativeError::Compile {
-                    function: f.name.to_string(),
-                    error: jit::JitError::Module(e),
-                });
+        let _ = write!(out, "; {} {}:", id.0, t.name);
+        for (i, v) in t.variants.iter().enumerate() {
+            let sep = if i == 0 { " " } else { ", " };
+            let _ = write!(out, "{sep}.{i} {}", v.name);
+            if !v.fields.is_empty() {
+                let _ = write!(out, "({})", v.fields.join(", "));
             }
         }
-        listed = true;
+        out.push('\n');
     }
-    if !listed {
-        let _ = writeln!(
-            out,
-            "\n; no native body matches {needle:?} (no plan captured for it)"
-        );
-    }
-    Ok(out)
 }
 
-fn render(program: &Program, only: Option<&str>) -> String {
-    let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "; {} functions, {} instructions, {} constants, entry = fn#{}",
-        program.functions.len(),
-        program.code.len(),
-        program.constants.len(),
-        program.entry,
-    );
-
-    // Nothing promises function bodies are contiguous or in index order.
-    let mut fns: Vec<(usize, &Function)> = program.functions.iter().enumerate().collect();
-    fns.sort_by_key(|(_, f)| f.code_start);
-
-    for (idx, f) in fns {
-        if let Some(n) = only
-            && !f.name.contains(n)
-        {
-            continue;
-        }
-        let _ = writeln!(out);
-        let _ = write!(
-            out,
-            "fn#{idx} {} (arity {}, locals {}",
-            f.name, f.arity, f.locals
-        );
-        if f.capture_count > 0 {
-            let _ = write!(out, ", captures {}", f.capture_count);
-        }
-        let _ = writeln!(out, ") @{}..{}", f.code_start, f.code_start + f.code_len);
-
-        let start = f.code_start as usize;
-        let end = (f.code_start + f.code_len) as usize;
-        for (ip, instr) in program.code[start.min(program.code.len())..end.min(program.code.len())]
-            .iter()
-            .enumerate()
-        {
-            let _ = writeln!(out, "{}", line(program, ip as i32, instr, f.code_len));
-        }
-    }
-
-    if only.is_none() && !program.constants.is_empty() {
-        let _ = writeln!(out, "\nconstants:");
-        for (i, c) in program.constants.iter().enumerate() {
-            let _ = writeln!(out, "  c{i} = {}", inspect(c, program));
-        }
-    }
-    out
+/// One comment line on the program's shape, so a filtered listing still says
+/// what it was taken from.
+fn summary(program: &Program, entry: &ModuleKey) -> String {
+    let total = (&program.fns).into_iter().count();
+    let own = (&program.fns)
+        .into_iter()
+        .filter(|f| f.module == entry.as_str())
+        .count();
+    let start = match program.main {
+        Some(main) => format!("starts at {main} ({})", program.fns[main].name),
+        None => "runs its toplevel".to_string(),
+    };
+    format!(
+        "; {total} functions, {own} from this file; {} module inits; {} globals; {start}\n",
+        program.inits.len(),
+        program.globals,
+    )
 }
 
-/// One instruction: `  0007  JumpIfFalse   a=0 b=0 op=4    ; -> 0004 (+4)`.
-///
-/// All three fields always print, including zeros, since which ones an opcode
-/// uses is not knowable here. `ip` and jump operands are function-relative;
-/// there is no absolute address to print.
-fn line(program: &Program, ip: i32, instr: &Instruction, code_len: i32) -> String {
-    let fields = format!("a={} b={} op={}", instr.a, instr.b, instr.operand);
-    let mut s = format!(
-        "  {:04}  {:<16}{:<22}",
-        ip,
-        format!("{:?}", instr.op),
-        fields
-    );
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let mut comment = String::new();
-    if instr.op.has_jump_target() {
-        let _ = write!(
-            comment,
-            "-> {:04} ({:+})",
-            instr.operand,
-            instr.operand - ip
+    fn program(src: &str) -> Program {
+        let mut scanner = crate::scanner::new_scanner(src.to_string());
+        let parsed = crate::parser::new_parser(&mut scanner).parse_program();
+        let result =
+            crate::bytecode::compile(&crate::ast::Expression::BlockExpression(parsed.ast), None);
+        assert!(result.success(), "{:?}", result.diagnostics);
+        result.into_runnable().expect("a clean compile is runnable")
+    }
+
+    const SQUARE: &str = "fn square(x Int) Int { x * x }\n\
+                          pub fn main() {\n\
+                          \tprintln(square(3))\n\
+                          }\n";
+
+    #[test]
+    fn the_entry_listing_is_this_files_functions_and_its_toplevel() {
+        let text = listing(&program(SQUARE), Filter::Entry).expect("main has functions");
+        assert!(text.contains("fn main.square(%0:"), "{text}");
+        assert!(text.contains("IntMul(%0, %0)"), "{text}");
+        assert!(text.contains("\n; toplevel\nfn main.__main__("), "{text}");
+        assert!(
+            !text.contains("fn scarlet."),
+            "listed a stdlib function:\n{text}"
         );
-        // Jumps are intra-function, so an out-of-range target is a bug.
-        // `code_len` spans the terminator, so the last legal target is
-        // `code_len - 1`: that is where `emit` aims the merge of an `if` whose
-        // arms both return, and it lands on the terminator itself.
-        if instr.operand < 0 || instr.operand >= code_len {
-            let _ = write!(comment, "  !! outside 0..{code_len}");
-        } else if instr.operand == code_len - 1 {
-            let _ = write!(comment, "  (merge, lands on the terminator)");
-        }
-    } else if instr.op == Op::PushConst
-        && let Some(c) = program.constants.get(instr.operand as usize)
-    {
-        let _ = write!(comment, "{}", inspect(c, program));
     }
 
-    if comment.is_empty() {
-        return s.trim_end().to_string();
+    #[test]
+    fn a_named_listing_reaches_into_the_stdlib() {
+        let src = "import scarlet/string\n\
+                   pub fn main() {\n\
+                   \tprintln(string.replace('a', 'a', 'b'))\n\
+                   }\n";
+        let text = listing(&program(src), Filter::Named("replace")).expect("replace exists");
+        assert!(text.contains("fn scarlet/string.replace("), "{text}");
+        assert!(!text.contains("; toplevel"), "{text}");
     }
-    let _ = write!(s, "; {comment}");
-    s
+
+    /// A listing ends with the names of the constructors it shows, and only
+    /// those.
+    #[test]
+    fn the_listing_names_its_constructors() {
+        let src = "type Shape {\n\
+                   \tCircle(radius Int)\n\
+                   \tDot\n\
+                   }\n\
+                   fn area(s Shape) Int {\n\
+                   \tmatch s {\n\
+                   \t\tCircle(r) -> r * r\n\
+                   \t\tDot -> 0\n\
+                   \t}\n\
+                   }\n\
+                   pub fn main() {\n\
+                   \tprintln(area(Circle(radius: 2)))\n\
+                   }\n";
+        let text = listing(&program(src), Filter::Entry).expect("main has functions");
+        let (_, types) = text.split_once("\n; types\n").expect("a types section");
+        let lines: Vec<&str> = types.lines().collect();
+        assert_eq!(lines.len(), 1, "{types}");
+        assert!(
+            lines[0].ends_with(" Shape: .0 Circle(radius), .1 Dot"),
+            "{types}"
+        );
+    }
+
+    #[test]
+    fn a_name_nothing_has_lists_nothing() {
+        assert!(listing(&program(SQUARE), Filter::Named("nope")).is_none());
+    }
+
+    /// The header counts what the listing was taken from, so a filtered
+    /// listing still says how big the program is and where it starts.
+    #[test]
+    fn the_summary_names_where_the_program_starts() {
+        let text = listing(&program(SQUARE), Filter::Named("square")).expect("square exists");
+        let first = text.lines().next().unwrap_or_default();
+        assert!(first.starts_with("; "), "{first}");
+        assert!(first.contains("2 from this file"), "{first}");
+        assert!(first.ends_with("(main)"), "{first}");
+    }
 }

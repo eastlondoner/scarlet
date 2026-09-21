@@ -12,7 +12,7 @@
 //! only `&mut FnTable` and returns a [`FuncIdx`], never an address; the wrapper
 //! is an ordinary [`TypedFn`] emitted by the same loop as every other function.
 
-use crate::core_ir::{FuncIdx, Imm};
+use crate::core_ir::FuncIdx;
 use crate::tivec::TiVec;
 use crate::types::StrId;
 
@@ -56,11 +56,11 @@ impl FnRTy {
         self.ty
     }
 
-    pub(super) fn params(&self) -> &[RTy] {
+    fn params(&self) -> &[RTy] {
         &self.params
     }
 
-    pub(super) fn ret(&self) -> RTy {
+    fn ret(&self) -> RTy {
         self.ret
     }
 
@@ -89,11 +89,6 @@ pub(crate) fn eta_wrapper(
     param_name: StrId,
     target: EtaTarget,
     fn_ty: &FnRTy,
-    // The immediate the wrapped builtin carries. `Imm::None` for every
-    // target that does not read one; a wire op MUST be given its
-    // descriptor here, because nothing downstream can recover it — see
-    // `Elaborator::eta_wire_imm`.
-    imm: Imm,
 ) -> TypedExpr {
     // A fresh function, so its `BindingId` space starts at zero.
     let params: Vec<TypedBind> = fn_ty
@@ -132,9 +127,9 @@ pub(crate) fn eta_wrapper(
                 args,
             }
         }
-        EtaTarget::Builtin { op } => TypedExpr::Call {
+        EtaTarget::Builtin { intrinsic } => TypedExpr::Call {
             ty: ret,
-            callee: TypedCallee::Builtin { op, imm },
+            callee: TypedCallee::Builtin { intrinsic },
             args,
         },
     };
@@ -158,10 +153,10 @@ pub(crate) fn eta_wrapper(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bytecode::Op;
     use crate::core_ir::VariantRef;
     use crate::type_def::TypeId;
     use crate::types::PrimIds;
+    use scarlet_types::intrinsic::Intrinsic;
 
     const NAME: StrId = StrId(1);
     const PARAM: StrId = StrId(2);
@@ -179,14 +174,13 @@ mod tests {
         VariantRef {
             type_id: TypeId(9),
             variant_idx: 0,
-            type_name: StrId(10),
         }
     }
 
     #[test]
     fn only_a_function_type_makes_an_fn_rty() {
         let mut p = pool();
-        let int = p.mk_con(TypeId(1), StrId(0), &[]);
+        let int = p.mk_con(TypeId(1), &[]);
         let tup = p.mk_tuple(&[int, int]);
         let f = p.mk_fun(&[int, int], tup);
         assert!(FnRTy::of(&p, int).is_none());
@@ -201,8 +195,8 @@ mod tests {
     #[test]
     fn a_constructor_wrapper_constructs_from_its_parameters() {
         let mut p = pool();
-        let int = p.mk_con(TypeId(1), StrId(0), &[]);
-        let w = p.mk_con(TypeId(9), StrId(10), &[]);
+        let int = p.mk_con(TypeId(1), &[]);
+        let w = p.mk_con(TypeId(9), &[]);
         let ty = p.mk_fun(&[int], w);
         let fn_ty = FnRTy::of(&p, ty).expect("a Fun node");
 
@@ -216,7 +210,6 @@ mod tests {
                 arity: Arity(1),
             },
             &fn_ty,
-            Imm::None,
         );
 
         assert_eq!(
@@ -257,7 +250,7 @@ mod tests {
     #[test]
     fn a_builtin_wrapper_calls_the_opcode_with_its_parameters_in_order() {
         let mut p = pool();
-        let int = p.mk_con(TypeId(1), StrId(0), &[]);
+        let int = p.mk_con(TypeId(1), &[]);
         let ty = p.mk_fun(&[int, int], int);
         let fn_ty = FnRTy::of(&p, ty).expect("a Fun node");
 
@@ -266,9 +259,10 @@ mod tests {
             &mut fns,
             NAME,
             PARAM,
-            EtaTarget::Builtin { op: Op::Add },
+            EtaTarget::Builtin {
+                intrinsic: Intrinsic::StringLength,
+            },
             &fn_ty,
-            Imm::None,
         );
 
         assert_eq!(
@@ -285,8 +279,7 @@ mod tests {
             TypedExpr::Call {
                 ty: int,
                 callee: TypedCallee::Builtin {
-                    op: Op::Add,
-                    imm: Imm::None,
+                    intrinsic: Intrinsic::StringLength,
                 },
                 args: vec![
                     TypedExpr::Var {
@@ -305,8 +298,8 @@ mod tests {
     #[test]
     fn each_wrapper_is_named_by_its_index_in_fns() {
         let mut p = pool();
-        let int = p.mk_con(TypeId(1), StrId(0), &[]);
-        let w = p.mk_con(TypeId(9), StrId(10), &[]);
+        let int = p.mk_con(TypeId(1), &[]);
+        let w = p.mk_con(TypeId(9), &[]);
         let cty = p.mk_fun(&[int], w);
         let aty = p.mk_fun(&[int, int], int);
         let ctor_ty = FnRTy::of(&p, cty).expect("a Fun node");
@@ -322,15 +315,15 @@ mod tests {
                 arity: Arity(1),
             },
             &ctor_ty,
-            Imm::None,
         );
         let second = eta_wrapper(
             &mut fns,
             NAME,
             PARAM,
-            EtaTarget::Builtin { op: Op::Add },
+            EtaTarget::Builtin {
+                intrinsic: Intrinsic::StringLength,
+            },
             &add_ty,
-            Imm::None,
         );
 
         let idx = |e: &TypedExpr| match e {
@@ -346,8 +339,8 @@ mod tests {
     #[test]
     fn a_wrapper_names_its_slot_in_the_table_it_was_appended_to() {
         let mut p = pool();
-        let int = p.mk_con(TypeId(1), StrId(0), &[]);
-        let w = p.mk_con(TypeId(9), StrId(10), &[]);
+        let int = p.mk_con(TypeId(1), &[]);
+        let w = p.mk_con(TypeId(9), &[]);
         let ty = p.mk_fun(&[int], w);
         let fn_ty = FnRTy::of(&p, ty).expect("a Fun node");
 
@@ -374,7 +367,6 @@ mod tests {
                 arity: Arity(1),
             },
             &fn_ty,
-            Imm::None,
         );
 
         let TypedExpr::Closure { func_idx, .. } = value else {
@@ -389,8 +381,8 @@ mod tests {
     #[should_panic(expected = "one parameter per declared field")]
     fn a_constructor_whose_type_disagrees_with_its_declaration_is_rejected() {
         let mut p = pool();
-        let int = p.mk_con(TypeId(1), StrId(0), &[]);
-        let w = p.mk_con(TypeId(9), StrId(10), &[]);
+        let int = p.mk_con(TypeId(1), &[]);
+        let w = p.mk_con(TypeId(9), &[]);
         let ty = p.mk_fun(&[int], w);
         let fn_ty = FnRTy::of(&p, ty).expect("a Fun node");
 
@@ -404,7 +396,6 @@ mod tests {
                 arity: Arity(2),
             },
             &fn_ty,
-            Imm::None,
         );
     }
 }

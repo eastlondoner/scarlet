@@ -29,8 +29,8 @@ pub mod names {
 pub struct TypeRef {
     /// Compare via [`TypeRef::is`], never `==`: a pre-capture binding holds
     /// `TypeId::NONE`, which `==` would match.
-    pub id: TypeId,
-    pub name: &'static str,
+    pub(crate) id: TypeId,
+    pub(crate) name: &'static str,
 }
 
 impl TypeRef {
@@ -60,23 +60,23 @@ impl TypeRef {
 // Identity goes through `CtorRef::is`.
 #[derive(Debug, Clone, Copy)]
 pub struct CtorRef {
-    pub type_id: TypeId,
-    pub variant_idx: u16,
-    pub arity: u16,
+    pub(crate) type_id: TypeId,
+    pub(crate) variant_idx: u16,
 }
 
 impl CtorRef {
     const ZERO: Self = CtorRef {
         type_id: TypeId::NONE,
         variant_idx: 0,
-        arity: 0,
     };
+}
 
-    /// Whether `(type_id, variant_idx)` is this prelude constructor. Guards on
-    /// `type_id != NONE` so a pre-capture binding never falsely matches.
-    #[inline]
-    pub(crate) fn is(&self, type_id: TypeId, variant_idx: u16) -> bool {
-        type_id != TypeId::NONE && type_id == self.type_id && variant_idx == self.variant_idx
+impl From<CtorRef> for crate::core_ir::VariantRef {
+    fn from(c: CtorRef) -> Self {
+        crate::core_ir::VariantRef {
+            type_id: c.type_id,
+            variant_idx: c.variant_idx,
+        }
     }
 }
 
@@ -208,7 +208,6 @@ macro_rules! prelude_bindings {
                                 Ok(CtorRef {
                                     type_id: *type_id,
                                     variant_idx: *variant_idx,
-                                    arity: *a,
                                 })
                             } else {
                                 Err(PreludeCaptureError::CtorShape {
@@ -317,35 +316,7 @@ macro_rules! prelude_bindings {
     };
 }
 
-impl PreludeBindings {
-    /// Test-only stand-in: `bool`/`binary` bound to the given nominal ids,
-    /// `True` at variant 0 and `False` at 1 (the real prelude's order), and
-    /// every other binding left pending so nothing else falsely matches.
-    #[cfg(test)]
-    pub(crate) fn test_bool_binary(bool_id: TypeId, bin_id: TypeId) -> Self {
-        PreludeBindings {
-            bool: TypeRef {
-                id: bool_id,
-                name: "Bool",
-            },
-            binary: TypeRef {
-                id: bin_id,
-                name: "Binary",
-            },
-            true_: CtorRef {
-                type_id: bool_id,
-                variant_idx: 0,
-                arity: 0,
-            },
-            false_: CtorRef {
-                type_id: bool_id,
-                variant_idx: 1,
-                arity: 0,
-            },
-            ..PreludeBindings::default()
-        }
-    }
-}
+impl PreludeBindings {}
 
 prelude_bindings! {
     types: [

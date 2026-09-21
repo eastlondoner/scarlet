@@ -149,7 +149,7 @@ fn parse(tokens Array(Token)) Result(Expr, String) {
 	}
 }
 
-fn evaluate(e Expr, env Map(String, Int)) Result(Int, String) {
+fn evaluate(e Expr, env map.Map(String, Int)) Result(Int, String) {
 	match e {
 		Lit(n) -> Ok(n)
 		Var(name) -> match map.get(env, name) {
@@ -166,7 +166,7 @@ fn evaluate(e Expr, env Map(String, Int)) Result(Int, String) {
 fn combine(
 	l Expr,
 	r Expr,
-	env Map(String, Int),
+	env map.Map(String, Int),
 	op fn(Int, Int) Result(Int, String),
 ) Result(Int, String) {
 	a <- result.then(evaluate(l, env))
@@ -195,7 +195,7 @@ fn show(e Expr) String {
 }
 
 // `name = expression` binds a variable. Anything else is evaluated and printed.
-fn run_line(env Map(String, Int), line String) Map(String, Int) {
+fn run_line(env map.Map(String, Int), line String) map.Map(String, Int) {
 	match lex(line) {
 		Err(m) -> {
 			report(line, Err(m))
@@ -209,13 +209,13 @@ fn run_line(env Map(String, Int), line String) Map(String, Int) {
 	}
 }
 
-fn describe(tokens Array(Token), env Map(String, Int)) Result(String, String) {
+fn describe(tokens Array(Token), env map.Map(String, Int)) Result(String, String) {
 	e <- result.then(parse(tokens))
 	v <- result.map(evaluate(e, env))
 	'${show(e)} = ${v}'
 }
 
-fn bind(env Map(String, Int), line String, name String, rest Array(Token)) Map(String, Int) {
+fn bind(env map.Map(String, Int), line String, name String, rest Array(Token)) map.Map(String, Int) {
 	match result.then(parse(rest), fn(e) evaluate(e, env)) {
 		Ok(v) -> {
 			report(line, Ok('${name} = ${v}'))

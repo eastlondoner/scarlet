@@ -4,10 +4,6 @@ version = "0.1.0"
 edition = "2024"
 build = "build.rs"
 
-[features]
-# Interpreter dispatch instrumentation — forwarded to `scarlet_vm`, where the
-# dispatch loop lives. See its manifest.
-op-histogram = ["scarlet_vm/op-histogram"]
 
 [dependencies]
 scarlet_core = { path = "../scarlet_core" }
@@ -19,17 +15,9 @@ rustyline = "14"
 serde_json = "1"
 ureq = "2"
 
-[build-dependencies]
-scarlet_core = { path = "../scarlet_core" }
 
 [dev-dependencies]
 scarlet_core = { path = "../scarlet_core" }
-scarlet_vm = { path = "../scarlet_vm", features = ["alloc-counter"] }
-cranelift-codegen = { workspace = true }
-cranelift-frontend = { workspace = true }
-cranelift-jit = { workspace = true }
-cranelift-module = { workspace = true }
-cranelift-native = { workspace = true }
 serde_json = "1"
 # A certificate authority and leaf certificates minted per test, so the
 # negative TLS tests — untrusted issuer, expired, wrong hostname — are hermetic.

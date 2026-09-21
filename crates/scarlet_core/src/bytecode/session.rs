@@ -5,21 +5,18 @@
 //! arena that minted it. [`Compiler::reset_to`] destructures [`Watermark`]
 //! exhaustively so a new arena cannot join the snapshot without its rewind
 //! being written.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use super::compiler::{CompileResult, Compiler, new_compiler};
 use crate::ast;
 use crate::module::{self, ModulePath};
-use crate::reference::{
-    Definition, DefinitionKind, EntityKind, ModuleId, ModuleReferences, ReferenceGraph,
-    ReferenceGraphBuilder,
-};
+use crate::reference::{ModuleId, ModuleReferences, ReferenceGraph, ReferenceGraphBuilder};
 use crate::span::Span;
 use crate::tivec::Idx;
 use crate::type_def::{Type, TypeId};
-use crate::types::{DefinitionLocation, EnginePoolWatermark, EnvWatermark, Ty};
+use crate::types::{EnginePoolWatermark, EnvWatermark, Ty, ValueKind};
 
 /// One buffered name occurrence, holding the *live* `Ty`: resolution is
 /// deferred until all unifications have settled.
@@ -32,6 +29,16 @@ pub(super) struct RawRef {
     /// Interned at `record` time so `finalize_references` need not re-intern
     /// the path per occurrence.
     pub(super) module: ModuleId,
+}
+
+/// One name a module offers its importers, as a name list (REPL completion)
+/// wants it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Export {
+    pub name: String,
+    /// A function's parameter names, or a constructor's field labels, in
+    /// order. Empty for anything else.
+    pub params: Vec<String>,
 }
 
 /// Resolved type at one occurrence span. The reference graph is identity-only,
@@ -56,30 +63,37 @@ pub struct HoverFact {
 pub struct Watermark {
     engine: EnginePoolWatermark,
     env: EnvWatermark,
-    code: usize,
     functions: usize,
     constants: usize,
     local_count: i32,
 }
 
 impl Watermark {
+    /// A watermark `n` functions in, for ordering tests.
+    #[cfg(test)]
+    pub(crate) fn at(functions: usize) -> Self {
+        Watermark {
+            functions,
+            ..Watermark::default()
+        }
+    }
+
     /// Comparison key. Every field is an append-only pool length or a monotone
     /// counter, so an earlier watermark compares `<=` a later one. `env` is
     /// excluded: it is a rollback payload, not a position, so its field set can
     /// change without perturbing this ordering. Equal keys can therefore hide
     /// different env payloads, which is why `earlier`/`later` merge on ties.
-    fn ord_key(&self) -> (EnginePoolWatermark, usize, usize, usize, i32) {
+    fn ord_key(&self) -> (EnginePoolWatermark, usize, usize, i32) {
         // Exhaustive destructure: a new field must be consciously placed in or
         // out of the ordering.
         let Watermark {
             engine,
             env: _,
-            code,
             functions,
             constants,
             local_count,
         } = *self;
-        (engine, code, functions, constants, local_count)
+        (engine, functions, constants, local_count)
     }
 
     /// The earlier-compiled of two watermarks, order-independently. Use this,
@@ -158,24 +172,13 @@ impl PartialOrd for Watermark {
     }
 }
 
-/// One definition synthesised for a static/hydrated stdlib module from its
-/// interface's exported values.
-struct SynthDef {
-    name: String,
-    location: DefinitionLocation,
-    doc: Option<String>,
-    /// Function parameter names / constructor field labels, for hover.
-    param_names: Vec<String>,
-}
-
 impl Compiler {
     pub(crate) fn watermark(&self) -> Watermark {
         Watermark {
             engine: self.engine.pool_watermark(),
             env: self.env.watermark(),
-            code: self.program.code.len(),
-            functions: self.program.functions.len(),
-            constants: self.program.constants.len(),
+            functions: self.fns.len(),
+            constants: self.consts.len(),
             local_count: self.local_count,
         }
     }
@@ -189,15 +192,14 @@ impl Compiler {
     /// exhaustive destructure below makes a new snapshot field fail to compile
     /// until its rewind is written.
     ///
-    /// `w` must not be below the watermark captured right after `seed_static`:
-    /// that prefix is memcpy'd out of the stdlib blob and every `Ty`/`StrId`/
-    /// `ArenaSlice` frozen into `.rodata` indexes into it.
+    /// `w` must not be below the session's `seed`, because everything below it
+    /// is the stdlib itself. The prelude-as-entry teardown to `bare` is the one
+    /// deliberate exception, and it rebuilds the session afterwards.
     /// `IncrementalSession::rewind_to` is the clamp.
     fn reset_to(&mut self, w: &Watermark) {
         let Watermark {
             engine,
             env,
-            code,
             functions,
             constants,
             local_count,
@@ -209,22 +211,8 @@ impl Compiler {
         // by length, which cannot undo an in-place `define` overwrite, so an
         // import that shadows a prelude name must never touch the root scope.
         self.env.push_scope();
-        self.program.code.truncate(code);
-        self.program.functions.truncate(functions);
-        self.program.constants.truncate(constants);
-        // ABI templates are a prefix whose length `bind_abi` recorded.
-        // Descriptor templates live only in the suffix and must not survive,
-        // and neither must the index naming where they were: every
-        // `TemplateIdx` in `wire_templates` names a slot this truncate is
-        // about to drop or reuse for a different constructor.
-        self.program.templates.truncate(self.abi_template_count);
-        self.program.wire_templates.clear();
-        self.program.wire_descs.clear();
-        // Descriptors elaboration built for the compile being rewound. A
-        // check-only compile never drains them, so without this a later emit
-        // in the same session would mint templates for a call site that no
-        // longer exists.
-        self.wire_descs.clear();
+        self.fns.truncate(functions);
+        self.consts.truncate(constants);
         self.local_count = local_count;
         self.global_to_func.retain(|_, fi| fi.index() < functions);
         // Survivors are watermark-preserved entry-frame slots. Depth normalises
@@ -241,19 +229,12 @@ impl Compiler {
             }
         });
 
-        // Lowered Core IR is cleared, never truncated. A `CoreFn`'s `ConstId`s
-        // index `core.consts`, which is assigned wholesale rather than appended
-        // to, and its types index a `ResolvedPool` the elaborator builds fresh
-        // per compile and drops after emit. Neither has a length to rewind to,
-        // so no `core_fns` watermark would mean anything.
-        let crate::core_ir::CoreProgram {
-            fns,
-            consts,
-            toplevel,
-        } = &mut self.core;
-        fns.clear();
-        consts.clear();
-        *toplevel = crate::core_ir::CoreProgram::default().toplevel;
+        // Lowered toplevels are dropped, never truncated: they are recorded
+        // at the end of a module's compile, and a rewound compile's init code
+        // must not run as part of the next one.
+        self.inits.clear();
+        self.entry_toplevel = None;
+        self.main = None;
 
         // Recorded expression types hold `Ty` indices into the arena just
         // rewound; the next compile's typecheck walk re-records them all.
@@ -302,72 +283,18 @@ impl Compiler {
         let (references, facts) = self.finalize_references();
         (
             // A check-only session emits no program: the LSP reads only
-            // diagnostics and the graph, and cloning the hydrated stdlib
-            // `Program` per keystroke would be pure waste.
+            // diagnostics and the graph.
             CompileResult::analysis_only(self.engine.diagnostics.clone(), references),
             facts,
         )
     }
 
-    /// Synthesise reference-graph [`Definition`]s for a static/hydrated stdlib
-    /// module from its exported values' `Scheme.def` and its exported types'
-    /// `ExportedType.def`, both of which carry the real declaration span.
-    /// `None` for an interface exporting nothing.
-    ///
-    /// Every `DefId` and the owning container go through
-    /// [`Compiler::defid_of`], the same computation a populated use of the name
-    /// bakes into its occurrence target, so both share one canonical `DefId`
-    /// even when the precompiled `Scheme.def.module` spelling differs from the
-    /// `ModuleTable` key.
-    fn synth_refs_from_interface(
-        &mut self,
-        defs: &[SynthDef],
-        doc: Option<&str>,
-    ) -> Option<ModuleReferences> {
-        let mid = self.defid_of(defs.first()?.location).module;
-        let mut mr = ModuleReferences::new(mid);
-        mr.set_doc(doc.map(str::to_string));
-        for sd in defs {
-            let defid = self.defid_of(sd.location);
-            // A constructor's declaring-type `DefId` is not serialised, so its
-            // `ctor_of` edge is absent. Harmless: the dead-code pass that walks
-            // it only reports the entry module.
-            let kind = match defid.entity {
-                EntityKind::Function => DefinitionKind::Function {
-                    param_names: sd.param_names.clone(),
-                },
-                EntityKind::Constructor => DefinitionKind::Constructor {
-                    ctor_of: None,
-                    param_names: sd.param_names.clone(),
-                },
-                EntityKind::Constant => DefinitionKind::Constant,
-                EntityKind::Value => DefinitionKind::Value { alias_of: None },
-                EntityKind::Type => DefinitionKind::Type,
-                EntityKind::Field => DefinitionKind::Field,
-                EntityKind::ModuleAlias => DefinitionKind::ModuleAlias {
-                    decl_span: defid.span,
-                    imports_module: None,
-                },
-            };
-            mr.add_definition(Definition::new(
-                defid.module,
-                defid.span,
-                sd.name.clone(),
-                sd.doc.clone(),
-                true,
-                kind,
-            ));
-        }
-        Some(mr)
-    }
-
-    /// Build the workspace [`ReferenceGraph`] from the entry file's collector,
-    /// every from-source `CachedModule`'s persisted `module_refs`, and
-    /// definitions synthesised from hydrated stdlib interfaces. Built wholesale
-    /// each `check` so an evicted module's reverse edges vanish coherently.
+    /// Build the workspace [`ReferenceGraph`] from the entry file's collector
+    /// and every `CachedModule`'s persisted `module_refs`. Built wholesale each
+    /// `check` so an evicted module's reverse edges vanish coherently.
     fn build_reference_graph(&mut self) -> ReferenceGraph {
-        // Intern every loaded module path plus main, so a synthesised stdlib
-        // def gets a stable `ModuleId`.
+        // Intern every loaded module path plus main, so every module gets a
+        // stable `ModuleId`.
         let loaded_paths: Vec<ModulePath> = self
             .module_table
             .loaded_modules()
@@ -387,43 +314,10 @@ impl Compiler {
             graph.intern_module(p);
         }
 
-        // Every cached module's references; hydrated stdlib modules carry none,
-        // so their definitions are synthesised from the interface below. The
-        // reverse index is built once by `finish()`, not per insert.
-        let mut synth_inputs: Vec<(Vec<SynthDef>, Option<String>)> = Vec::new();
+        // Every cached module's references. The reverse index is built once by
+        // `finish()`, not per insert.
         for (_key, cm) in self.module_table.loaded_modules() {
-            match cm.module_refs() {
-                Some(mr) => graph.insert(Rc::clone(mr)),
-                None => {
-                    let values = cm.iface.values.iter().filter_map(|(name, ev)| {
-                        ev.scheme.def.map(|dl| SynthDef {
-                            name: name.clone(),
-                            location: dl,
-                            doc: ev.doc.clone(),
-                            param_names: ev.param_names.clone(),
-                        })
-                    });
-                    let types = cm.iface.types.iter().filter_map(|(name, et)| {
-                        et.def.map(|dl| SynthDef {
-                            name: name.clone(),
-                            location: dl,
-                            doc: et.doc.clone(),
-                            param_names: Vec::new(),
-                        })
-                    });
-                    let defs: Vec<SynthDef> = values.chain(types).collect();
-                    if !defs.is_empty() {
-                        synth_inputs.push((defs, cm.iface.doc.clone()));
-                    }
-                }
-            }
-        }
-        // Deferred out of the loop above: `defid_of` takes `&mut self`, which
-        // cannot overlap the `module_table` iteration.
-        for (defs, doc) in &synth_inputs {
-            if let Some(synth) = self.synth_refs_from_interface(defs, doc.as_deref()) {
-                graph.insert(Rc::new(synth));
-            }
+            graph.insert(Rc::clone(cm.module_refs()));
         }
 
         // The entry file's own refs must be copied: the collector is reused for
@@ -479,13 +373,14 @@ pub struct IncrementalSession {
     seed: Watermark,
     /// Watermark before anything at all was seeded — the floor a
     /// prelude-as-entry check rewinds to, since the prelude cannot be checked
-    /// on top of itself. Equals `seed` for blob-seeded sessions, which never
-    /// check the prelude as an entry.
+    /// on top of itself.
     bare: Watermark,
     /// Whether the prelude seed is currently in place. A prelude-as-entry
     /// check tears it down (`bare` rewind); the next ordinary check re-seeds.
-    /// Always true for blob-seeded sessions.
     seeded: bool,
+    /// Module bodies compiled while seeding, which [`Self::compile_count`]
+    /// leaves out.
+    seed_compiles: u32,
     /// Watermark immediately before the previous entry-body analysis, i.e.
     /// after every imported module had been compiled.
     last_entry: Option<Watermark>,
@@ -497,41 +392,42 @@ pub struct IncrementalSession {
     type_facts: Vec<HoverFact>,
 }
 
+impl Default for IncrementalSession {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl IncrementalSession {
-    pub fn new(stdlib: &'static crate::static_ir::StaticStdlib) -> Self {
-        let mut c = new_compiler(None, true);
-        c.collect_hover_facts = true;
-        c.seed_static(stdlib);
-        let seed = c.watermark();
-        IncrementalSession {
-            c,
-            seed,
-            bare: seed,
-            seeded: true,
-            last_entry: None,
-            graph: Rc::new(ReferenceGraph::new()),
-            type_facts: Vec::new(),
-        }
+    /// A session over the stdlib embedded in the binary.
+    pub fn new() -> Self {
+        Self::with_stdlib_root(None)
     }
 
     /// A session that compiles the stdlib from the `.scrl` sources under
-    /// `stdlib_root` (the in-repo `src/std`) instead of seeding the
-    /// precompiled blob. Used when editing the stdlib itself: every `scarlet/...`
-    /// module is then an ordinary on-disk `File` module — compiled, cached,
-    /// hashed and invalidated exactly like user code — so the reference graph
-    /// and hover facts carry full fidelity for stdlib sources.
+    /// `stdlib_root` (the in-repo `src/std`) instead of the embedded copy.
+    /// Used when editing the stdlib itself: every `scarlet/...` module is then
+    /// an ordinary on-disk `File` module — compiled, cached, hashed and
+    /// invalidated exactly like user code — so the reference graph and hover
+    /// facts carry full fidelity for stdlib sources.
     pub fn new_from_source(stdlib_root: std::path::PathBuf) -> Self {
+        Self::with_stdlib_root(Some(stdlib_root))
+    }
+
+    fn with_stdlib_root(stdlib_root: Option<std::path::PathBuf>) -> Self {
         let mut c = new_compiler(None, true);
         c.collect_hover_facts = true;
-        c.stdlib_source_root = Some(stdlib_root);
+        c.stdlib_source_root = stdlib_root;
         let bare = c.watermark();
         c.register_prelude();
         let seed = c.watermark();
+        let seed_compiles = c.module_table.compile_count();
         IncrementalSession {
             c,
             seed,
             bare,
             seeded: true,
+            seed_compiles,
             last_entry: None,
             graph: Rc::new(ReferenceGraph::new()),
             type_facts: Vec::new(),
@@ -548,14 +444,16 @@ impl IncrementalSession {
         self.c.module_scope = crate::bytecode::ModuleScope::Script;
     }
 
+    /// Module bodies the session's checks have compiled, not counting cache
+    /// hits or the prelude it compiled when it started. Telemetry only.
     pub fn compile_count(&self) -> u32 {
-        self.c.module_table.compile_count()
+        self.c.module_table.compile_count() - self.seed_compiles
     }
 
     /// The one rewind path. `seed` is a hard floor: everything below it is the
-    /// stdlib blob memcpy'd out of `.rodata`, and the `Ty`/`StrId`/`ArenaSlice`
-    /// indices frozen into the binary cannot be re-minted. Clamping here rather
-    /// than at each caller means a new rewind site cannot forget.
+    /// stdlib, compiled when the session started, and rewinding past it would
+    /// drop the stdlib too. Clamping here rather than at each caller means a
+    /// new rewind site cannot forget.
     fn rewind_to(&mut self, w: Watermark) {
         self.c.reset_to(&w.later(self.seed));
     }
@@ -647,13 +545,7 @@ impl IncrementalSession {
             // with none of the partially-rewound world to reason about. Rare
             // (only after editing `scrl.scrl` and switching file), so the full
             // stdlib recompile it implies is acceptable.
-            #[allow(clippy::expect_used)]
-            let root = self
-                .c
-                .stdlib_source_root
-                .clone()
-                .expect("only a from-source session tears down its seed");
-            *self = Self::new_from_source(root);
+            *self = Self::with_stdlib_root(self.c.stdlib_source_root.clone());
         }
 
         // The previous entry's contributions are dropped; cached modules' arena
@@ -670,7 +562,7 @@ impl IncrementalSession {
             .c
             .module_table
             .user_modules()
-            .filter(|(_, cm)| cm.watermark().is_none_or(|w| w >= seed))
+            .filter(|(_, cm)| cm.watermark >= seed)
             .map(|(k, _)| k.clone())
             .collect();
         let dirty: Vec<module::ModuleKey> = candidates
@@ -792,17 +684,62 @@ impl IncrementalSession {
             .min_by_key(|f| f.span.width())?;
         Some((f.name.clone(), f.ty.clone(), f.doc.clone()))
     }
+
+    /// What the module at `path` exports, types first. A module no check has
+    /// imported yet is compiled first, by checking an entry that imports it,
+    /// so it lands in the cache through the same door as any other import.
+    /// One that does not resolve or does not compile exports nothing.
+    pub fn exports(&mut self, path: &ModulePath) -> Vec<Export> {
+        let key = module::ModuleKey::of(path);
+        if self.c.module_table.get(&key).is_none() {
+            let mut scanner = crate::scanner::new_scanner(format!("import {key}\n"));
+            let parsed = crate::parser::new_parser(&mut scanner).parse_program();
+            if crate::diagnostic::has_errors(&parsed.diagnostics) {
+                return Vec::new();
+            }
+            self.check(&ast::Expression::BlockExpression(parsed.ast), None);
+        }
+        let Some(iface) = self.c.module_table.get(&key) else {
+            return Vec::new();
+        };
+        let engine = &self.c.engine;
+        let types = iface.types.keys().map(|name| Export {
+            name: name.clone(),
+            params: Vec::new(),
+        });
+        let values = iface.values.iter().map(|(name, ev)| {
+            let params = match ev.scheme.kind {
+                ValueKind::ModuleFn { param_labels } | ValueKind::Builtin { param_labels, .. } => {
+                    engine.strs_of(param_labels)
+                }
+                ValueKind::Constructor { field_labels, .. } => engine.strs_of(field_labels),
+                ValueKind::Local => Vec::new(),
+            };
+            Export {
+                name: name.clone(),
+                params,
+            }
+        });
+        // One name, one entry: a record type names its single constructor
+        // after itself.
+        let mut seen = HashSet::new();
+        types
+            .chain(values)
+            .filter(|e| seen.insert(e.name.clone()))
+            .collect()
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Watermark;
-    use crate::bytecode::Value;
+    use std::rc::Rc;
+
+    use super::{Export, IncrementalSession, Watermark};
     use crate::bytecode::compiler::new_compiler;
-    use crate::core_ir::{Atom, ConstId, CoreExpr, CoreFn};
+    use crate::core_ir::{Atom, Const, CoreExpr, CoreFn, LoweredFn};
     use crate::type_def::TypeId;
     use crate::typed_ir::RTy;
-    use crate::types::EnvWatermark;
+    use crate::types::{EnvWatermark, PrimIds};
 
     /// Watermarks with equal `ord_key` can carry different env payloads.
     /// `earlier` must be symmetric and merge them toward the deeper rollback.
@@ -866,7 +803,7 @@ mod tests {
     fn earlier_and_later_follow_ord_when_keys_differ() {
         let older = Watermark::default();
         let newer = Watermark {
-            code: 10,
+            functions: 10,
             env: EnvWatermark {
                 root_scope: 4,
                 ..EnvWatermark::default()
@@ -879,136 +816,107 @@ mod tests {
         assert_eq!(newer.later(older).env, newer.env);
     }
 
-    /// The resolved-type pool is compile-local, so a `CoreFn` cannot outlive
-    /// the compile that lowered it: `reset_to` must clear `core.fns` outright
-    /// rather than truncate it, and `Watermark` carries no field for it.
+    /// `reset_to` rewinds the function table and the constant pool to the
+    /// watermark, and drops every lowered toplevel: a rewound compile's init
+    /// code must not run as part of the next one.
     #[test]
-    fn reset_to_clears_lowered_core_fns_because_the_pool_is_compile_local() {
+    fn reset_to_rewinds_functions_and_consts_and_drops_toplevels() {
         let mut c = new_compiler(None, false);
-        let name = c.engine.intern("f");
-        let lowered = |name| CoreFn {
-            name,
-            params: Vec::new(),
-            body: CoreExpr::Tail(Atom::Const(ConstId(0))),
-            ret_ty: RTy(0),
-        };
-
-        // Lowered below the watermark: a length-based rewind would preserve it.
-        c.core.fns.push(lowered(name));
-        let w = c.watermark();
-        c.core.fns.push(lowered(name));
-
-        c.reset_to(&w);
-
-        assert!(
-            c.core.fns.is_empty(),
-            "core.fns must be cleared, not truncated: {} lowered bodies survived \
-             the rewind holding RTys into a pool that no longer exists",
-            c.core.fns.len()
+        let pool = Rc::new(crate::typed_ir::ResolvedPool::new(PrimIds::default()));
+        let top = LoweredFn::new(
+            crate::module::ModuleKey::main().to_string(),
+            "m".to_string(),
+            CoreFn {
+                params: Vec::new(),
+                body: CoreExpr::Tail(Atom::Nil),
+                ret_ty: RTy(0),
+            },
+            pool,
         );
-    }
-
-    /// `core.consts` is assigned wholesale, not appended to, so it has no
-    /// watermark. Rewinding it to another pool's length would leave a stale
-    /// prefix no surviving `ConstId` was minted against.
-    #[test]
-    fn reset_to_clears_core_consts_rather_than_truncating_to_another_pool() {
-        let mut c = new_compiler(None, false);
 
         // Anchored to whatever `new_compiler` seeded, not a literal, so the
         // test survives that seed growing.
-        let base = c.program.constants.len();
-        c.program.constants.push(Value::bool(true));
+        let (fns, consts) = (c.fns.len(), c.consts.len());
+        c.fns.push(None);
+        c.consts.push(Const::Int(1));
         let w = c.watermark();
-        assert_eq!(w.constants, base + 1);
-
-        // A compile then grows `program.constants` and clones it wholesale.
-        c.program.constants.push(Value::bool(false));
-        c.program.constants.push(Value::nil());
-        c.core.consts = c.program.constants.clone();
+        c.fns.push(None);
+        c.consts.push(Const::Int(2));
+        c.inits.push(top);
 
         c.reset_to(&w);
 
         assert_eq!(
-            c.program.constants.len(),
-            base + 1,
-            "program.constants rewinds to its own watermark"
+            c.fns.len(),
+            fns + 1,
+            "function slots rewind to the watermark"
         );
-        assert!(
-            c.core.consts.is_empty(),
-            "core.consts must be cleared, not truncated to program.constants.len() \
-             ({} entries survived) — a stale prefix is indexed by no live ConstId",
-            c.core.consts.len()
-        );
+        assert_eq!(c.consts.len(), consts + 1, "consts rewind to the watermark");
+        assert!(c.inits.is_empty(), "a rewound compile's inits are dropped");
     }
 
-    /// Descriptor templates are a suffix past `abi_template_count`. A rewind
-    /// must drop them and keep the ABI prefix: clearing the table would
-    /// invalidate every ABI `TemplateIdx`, and leaving the suffix would leave
-    /// a stale one behind.
+    fn path(s: &str) -> crate::module::ModulePath {
+        s.split('/').map(str::to_string).collect()
+    }
+
+    fn export<'a>(exports: &'a [Export], name: &str) -> &'a Export {
+        exports
+            .iter()
+            .find(|e| e.name == name)
+            .unwrap_or_else(|| panic!("{name} is not exported"))
+    }
+
     #[test]
-    fn reset_to_truncates_templates_to_the_abi_prefix() {
-        use scarlet_vm::abi::TemplateIdx;
-        use scarlet_vm::template::EnumTemplate;
-
-        fn dummy(program: &crate::bytecode::Program) -> EnumTemplate {
-            EnumTemplate::build(&mut program.frozen.builder(), TypeId(0), 0, "T", "V", &[])
-        }
-
-        let mut c = new_compiler(None, false);
-        c.program.templates.push(dummy(&c.program));
-        c.program.templates.push(dummy(&c.program));
-        c.abi_template_count = 2;
-
-        let w = c.watermark();
-        let suffix = c.program.templates.push(dummy(&c.program));
-        assert_eq!(c.program.templates.len(), 3);
-        assert_eq!(suffix, TemplateIdx(2));
-
-        c.reset_to(&w);
-
+    fn a_modules_functions_export_with_their_parameter_names() {
+        let mut session = IncrementalSession::new();
+        let exports = session.exports(&path("scarlet/string"));
         assert_eq!(
-            c.program.templates.len(),
-            2,
-            "rewind must keep the ABI prefix, not clear the table"
+            export(&exports, "replace").params,
+            ["s", "pattern", "replacement"]
         );
-        assert!(
-            c.program.templates.get(suffix).is_none(),
-            "a descriptor TemplateIdx must not survive rewind"
-        );
-        assert!(c.program.templates.get(TemplateIdx(0)).is_some());
-        assert!(c.program.templates.get(TemplateIdx(1)).is_some());
+        // `@vm` functions carry their names the same way.
+        assert_eq!(export(&exports, "length").params, ["s"]);
     }
 
-    /// Descriptors elaboration built for a compile that is being rewound must
-    /// go with it. A check-only compile never reaches the drain in
-    /// `compile_impl`, so without the clear a later emit in the same session
-    /// would mint templates for a `wire` call site the edit deleted.
+    /// The prelude is compiled when the session starts, so it is listed
+    /// without another check running.
     #[test]
-    fn reset_to_clears_the_descriptors_the_rewound_compile_built() {
-        use crate::core_ir::VariantRef;
-        use crate::type_def::TypeId;
-        use crate::typed_ir::wire::{Desc, Node, WireVariant};
+    fn the_prelude_exports_without_a_check() {
+        let mut session = IncrementalSession::new();
+        let before = session.compile_count();
+        let exports = session.exports(&path("scarlet"));
+        assert_eq!(export(&exports, "println").params, ["x"]);
+        assert_eq!(session.compile_count(), before);
+    }
 
-        let mut c = new_compiler(None, false);
-        let name = c.engine.intern("Colour");
-        let w = c.watermark();
-        c.wire_descs
-            .push(Desc::from_parts(vec![Node::Data(vec![WireVariant {
-                variant: VariantRef {
-                    type_id: TypeId(500),
-                    variant_idx: 0,
-                    type_name: name,
-                },
-                name,
-                fields: Vec::new(),
-            }])]));
+    #[test]
+    fn a_constructor_exports_with_its_field_labels() {
+        let mut session = IncrementalSession::new();
+        let exports = session.exports(&path("scarlet/http"));
+        assert_eq!(export(&exports, "Fixed").params, ["len", "b"]);
+        assert!(export(&exports, "Post").params.is_empty());
+        // A record's constructor shares its type's name and is listed once.
+        let responses = exports.iter().filter(|e| e.name == "Response").count();
+        assert_eq!(responses, 1);
+    }
 
-        c.reset_to(&w);
+    /// The prelude compiles when the session starts, not in a check.
+    #[test]
+    fn a_new_session_counts_no_compiles() {
+        assert_eq!(IncrementalSession::new().compile_count(), 0);
+    }
 
-        assert!(
-            c.wire_descs.is_empty(),
-            "a rewound compile's descriptors must not reach the next one"
-        );
+    #[test]
+    fn an_unknown_module_exports_nothing() {
+        let mut session = IncrementalSession::new();
+        assert!(session.exports(&path("scarlet/nope")).is_empty());
+    }
+
+    #[test]
+    fn the_stdlib_lists_nested_modules_and_the_prelude() {
+        let modules = crate::module::stdlib_modules();
+        assert!(modules.contains(&path("scarlet")));
+        assert!(modules.contains(&path("scarlet/net/tls")));
+        assert!(modules.is_sorted());
     }
 }

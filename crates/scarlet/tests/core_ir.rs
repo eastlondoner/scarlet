@@ -13,23 +13,31 @@ fn golden_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden/core_ir")
 }
 
-/// Parse + typecheck + lower `source` and return the pretty-printed Core.
+/// Parse + typecheck + lower `source` and return the pretty-printed Core of
+/// the entry file's functions, its toplevel last. The stdlib compiles into
+/// the same program, and is left out.
 ///
 /// Every printed id is an index into a pool shared with the prelude, so its
 /// absolute value moves on any stdlib edit. All are renumbered by order of
-/// first appearance, and each referenced constant's `Value` is printed in a
+/// first appearance, and each referenced constant's value is printed in a
 /// `where` block so the snapshot still shows what the program computes.
 fn lower(source: &str) -> String {
     let ast = parse(source);
-    let r = scarlet::bytecode::compile(&ast, None, Some(&scarlet::STDLIB));
+    let r = scarlet::bytecode::compile(&ast, None);
     assert!(
         r.success(),
         "compile failed:\n{source}\n--- diagnostics ---\n{:#?}",
         r.diagnostics
     );
-    let emitted = r.into_runnable().expect("a successful compile emits");
-    let core: &scarlet::core_ir::CoreProgram = &emitted.core;
-    let raw = format!("{core}");
+    let program = r.into_runnable().expect("a successful compile is runnable");
+    let entry = scarlet::module::ModuleKey::main();
+    let mut raw = String::new();
+    for f in &program.fns {
+        if f.module == entry.as_str() {
+            raw.push_str(&format!("{f}\n"));
+        }
+    }
+    raw.push_str(&format!("toplevel:\n{}", program.toplevel));
     // Consts first: the `where` block needs both the original index and the
     // new name.
     let const_map = renumber(&raw, b'c');
@@ -37,7 +45,6 @@ fn lower(source: &str) -> String {
     // type — rather than an interner offset.
     let mut out = apply_renumber(&raw, b':', ":t", &renumber(&raw, b':'));
     out = apply_renumber(&out, b'c', "c", &const_map);
-    out = apply_renumber(&out, b's', "s", &renumber(&raw, b's'));
     // `fn#N`/`@gN` are absolute program offsets shared with the stdlib, so
     // dense-renumber them like the rest.
     out = renumber_prefixed(&out, "fn#");
@@ -47,7 +54,7 @@ fn lower(source: &str) -> String {
         rows.sort_unstable();
         out.push_str("where\n");
         for (new, orig) in rows {
-            let v = core
+            let v = program
                 .consts
                 .get(orig)
                 .map(|c| format!("{c:?}"))
@@ -336,6 +343,40 @@ core_golden!(
      }\n\
      pub fn main() {\n\
      \tf(True)\n\
+     }\n"
+);
+
+// `True`, `False` and `Nil` are immediates, never the prelude's
+// constructors, and a match on a Bool is an `if`. A match on Nil is its arm,
+// and an arm that binds the value binds it with a `let`. Perceus runs after,
+// so no drop of a Bool is marked as a cell to reuse.
+core_golden!(
+    bool_match_is_if,
+    "fn pick(b Bool) Int {\n\
+     \tmatch b {\n\
+     \t\tFalse -> 0\n\
+     \t\tTrue -> 1\n\
+     \t}\n\
+     }\n\
+     fn yes(b Bool) Bool {\n\
+     \tmatch b {\n\
+     \t\tTrue -> False\n\
+     \t\t_ -> True\n\
+     \t}\n\
+     }\n\
+     fn unit(n Nil) Int {\n\
+     \tmatch n {\n\
+     \t\tNil -> 2\n\
+     \t}\n\
+     }\n\
+     fn same(b Bool) Bool {\n\
+     \tmatch b {\n\
+     \t\tTrue -> False\n\
+     \t\tx -> x\n\
+     \t}\n\
+     }\n\
+     pub fn main() {\n\
+     \tpick(yes(same(True))) + unit(Nil)\n\
      }\n"
 );
 
@@ -840,32 +881,101 @@ mod unlowerable {
     #[test]
     fn al_check_reports_it_rather_than_passing() {
         let (expr, at) = program_with_an_error_node();
-        let r = scarlet::bytecode::check(&expr, None, Some(&scarlet::STDLIB));
+        let r = scarlet::bytecode::check(&expr, None);
         assert_rejected(&r, at, "check");
     }
 
     #[test]
     fn al_run_reports_it_rather_than_panicking() {
         let (expr, at) = program_with_an_error_node();
-        let r = scarlet::bytecode::compile(&expr, None, Some(&scarlet::STDLIB));
+        let r = scarlet::bytecode::compile(&expr, None);
         assert_rejected(&r, at, "compile");
     }
 
     /// Rejecting the `ErrorNode` is a gate on the module, not a mute button on
     /// the pipeline: the same program with a readable `main` body still
-    /// compiles and runs, and `main`'s value is what the entry frame halts
-    /// with.
+    /// compiles to a program that starts at `main`.
     #[test]
-    fn the_same_program_without_the_error_node_compiles_and_runs() {
+    fn the_same_program_without_the_error_node_compiles() {
         let expr = crate::common::parse("pub fn main() {\n\t1 + 1\n}\n");
-        let r = scarlet::bytecode::compile(&expr, None, Some(&scarlet::STDLIB));
+        let r = scarlet::bytecode::compile(&expr, None);
         assert!(r.success(), "{:?}", r.diagnostics);
-        let program = r
-            .into_runnable()
-            .expect("a successful compile emits")
-            .program;
-        let mut vm = scarlet::vm::new_vm(program).expect("vm init");
-        let val = vm.run().expect("vm run");
-        assert_eq!(scarlet::vm::inspect(&val, vm.program()), "2");
+        let program = r.into_runnable().expect("a successful compile is runnable");
+        assert!(program.main.is_some(), "a program with `main` starts there");
     }
+}
+
+/// Every constructor a program builds or matches on has its type's names in
+/// `Program::types`, down to the variant: the prelude's, the imported
+/// modules', and the entry file's own.
+#[test]
+fn every_constructor_has_names() {
+    let src = "import scarlet/http\n\
+               import scarlet/json\n\
+               import scarlet/map\n\
+               import scarlet/string\n\
+               type Shape {\n\
+               \tCircle(radius Int)\n\
+               \tDot\n\
+               }\n\
+               pub fn main() {\n\
+               \tprintln(string.inspect(Circle(radius: 1)))\n\
+               }\n";
+    let r = scarlet::bytecode::compile(&parse(src), None);
+    assert!(r.success(), "{:?}", r.diagnostics);
+    let program = r.into_runnable().expect("a successful compile is runnable");
+    let bodies = (&program.fns)
+        .into_iter()
+        .chain(&program.inits)
+        .chain([&program.toplevel]);
+    let mut seen = 0;
+    for f in bodies {
+        f.core.body.for_each_variant(|v| {
+            seen += 1;
+            let names = program.types.get(&v.type_id).unwrap_or_else(|| {
+                panic!("{}.{}: type {} has no names", f.module, f.name, v.type_id.0)
+            });
+            assert!(
+                names.variants.get(usize::from(v.variant_idx)).is_some(),
+                "{}.{}: {} has no variant {}",
+                f.module,
+                f.name,
+                names.name,
+                v.variant_idx
+            );
+        });
+    }
+    assert!(
+        seen > 100,
+        "only {seen} constructors: the stdlib did not compile in"
+    );
+    for v in program.abi.variants() {
+        let names = program
+            .types
+            .get(&v.type_id)
+            .expect("the VM's constructors have names");
+        assert!(names.variants.get(usize::from(v.variant_idx)).is_some());
+    }
+    let option = program
+        .types
+        .get(&program.abi.some.type_id)
+        .expect("Option");
+    assert_eq!(option.name, "Option");
+    assert_eq!(
+        option
+            .variants
+            .get(usize::from(program.abi.none.variant_idx))
+            .map(|v| v.name.as_str()),
+        Some("None")
+    );
+    let shape = program
+        .types
+        .values()
+        .find(|t| t.name == "Shape")
+        .expect("the entry file's own type");
+    let circle = shape.variants.first().expect("Circle");
+    assert_eq!(
+        (circle.name.as_str(), circle.fields.as_slice()),
+        ("Circle", &["radius".to_string()][..])
+    );
 }

@@ -614,6 +614,7 @@ fn a_catch_all_before_an_aliased_arm_is_still_unreachable() {
 /// same variant built any other way. Carrying the written name onto the value
 /// made `G(9) == color.Green(9)` false and printed `G(9)`.
 #[test]
+#[ignore = "needs the VM"]
 fn an_alias_does_not_change_a_constructed_value_identity() {
     let proj = Project::new("alias_ctor_value_identity");
     proj.write("color.scrl", COLOR_MAKE_SRC);
@@ -653,6 +654,7 @@ fn an_alias_colliding_with_a_real_variant_does_not_capture_it() {
 /// the VM, so an alias-named `Hex` was a `Radix` the builtin did not
 /// recognise: `expected Radix, got 'Radix'`, exit 1.
 #[test]
+#[ignore = "needs the VM"]
 fn an_aliased_stdlib_constructor_reaches_a_vm_builtin() {
     let proj = Project::new("alias_ctor_stdlib");
     proj.write(

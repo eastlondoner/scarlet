@@ -1,4 +1,4 @@
-fn s0(%0:t0, %1:t1, %2:t2) -> :t1
+fn main.clamp(%0:t0, %1:t1, %2:t2) -> :t1
   letc j0 =
     letc j1 =
       match %0 :t1
@@ -6,31 +6,30 @@ fn s0(%0:t0, %1:t1, %2:t2) -> :t1
           ret %7
     match %0 :t1
       | %5 ->
-        let %6:t3 = GtInt(%5, %2)
+        let %6:t3 = IntGt(%5, %2)
         if %6 :t1
           ret %2
         else
           goto j1
   match %0 :t1
     | %3 ->
-      let %4:t3 = LtInt(%3, %1)
+      let %4:t3 = IntLt(%3, %1)
       if %4 :t1
         ret %1
       else
         goto j0
 
-fn s1() -> :t1
+fn main.main() -> :t1
   let %0:t4 = c0
   let %1:t4 = c1
   let %2:t4 = c2
   ret call fn#0(%0, %1, %2)
 
 toplevel:
-  let %0:t5@g0 = closure fn#0()
-  drop %0
-  let %1:t6@g1 = closure fn#1()
-  drop %1
-  ret PushNil()
+fn main.__main__() -> :t5
+  let %0:t6@g0 = closure fn#0()
+  let %1:t7@g1 = closure fn#1()
+  ret nil
 where
   c0 = Int(5)
   c1 = Int(0)

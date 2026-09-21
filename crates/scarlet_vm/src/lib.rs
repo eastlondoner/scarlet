@@ -1,12 +1,9 @@
-//! The Scarlet virtual machine: the bytecode ISA ([`bytecode`]), NaN-boxed values
-//! and heap layouts ([`bytecode::value`]), the per-process reference-counted
-//! heap ([`heap`]), the program-lifetime frozen area ([`frozen`]), and the
-//! interpreter, schedulers and JIT ([`vm`]).
+//! The Scarlet VM: runs a compiled `Program`.
 //!
-//! This crate must never depend on a language crate; Cargo enforces it. Any
-//! front end that produces a [`bytecode::Program`] — including its
-//! `templates`/`abi` tables binding the [`abi::AbiSlot`] outcomes its emitted
-//! ops construct — can run here.
+//! It reads nothing but `scarlet_ir`, the contract with the compiler. The plan
+//! it follows, and why, is `docs/vm-design.md`. It is being built one feature
+//! at a time, so a program that needs something not built yet stops with
+//! [`Stop::NotBuiltYet`], saying what.
 
 #![cfg_attr(
     not(test),
@@ -19,26 +16,40 @@
         clippy::unimplemented,
     )
 )]
-// Unsafe is confined to designated modules, each with its own scoped
-// `allow(unsafe_code)` and justification.
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 
-pub mod abi;
-pub mod bytecode;
-pub mod frozen;
-pub mod heap;
-mod ids;
-pub mod native_rc;
-pub mod template;
-pub mod tivec;
-pub mod vm;
-pub mod wire;
+mod array;
+mod bigint;
+mod code;
+mod exec;
+mod heap;
+mod show;
+mod value;
 
-pub use abi::{AbiSlot, TemplateIdx};
-pub use ids::{FuncIdx, TypeId};
-pub use template::{AbiTable, EnumTemplate};
+use std::io::Write;
 
-/// Compile-time assertion that `T: Send`. Use as `const _: () = assert_send::<T>();`.
-pub const fn assert_send<T: Send>() {}
-/// Compile-time assertion that `T: Send + Sync`.
-pub const fn assert_send_sync<T: Send + Sync>() {}
+use scarlet_ir::core_ir::Program;
+
+/// Why a run ended before the program did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Stop {
+    /// The program reached something the VM does not run yet.
+    NotBuiltYet(String),
+    /// Where the program's output goes was closed, like a pipe into `head`.
+    /// Nothing is wrong with the program, so this stops it quietly.
+    OutputClosed,
+    /// The program's heap grew past what the VM can address. A limit of the
+    /// machine, like running out of memory, not a bug in the program.
+    HeapFull,
+    /// The program broke a promise the compiler makes about every program,
+    /// like a `match` having an arm for every value. Only a compiler bug
+    /// gives one, so this says what, rather than guessing on.
+    BadProgram(String),
+}
+
+/// Run `program`, writing what it prints to `out`.
+pub fn run(program: &Program, out: &mut dyn Write) -> Result<(), Stop> {
+    let code = code::load(program);
+    exec::Machine::new(&code, out).run()?;
+    Ok(())
+}
