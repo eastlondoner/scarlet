@@ -188,21 +188,27 @@ fn slots(heap: &Heap, v: Value) -> Vec<Value> {
     }
 }
 
-/// The child holding element `idx` of a branch at `shift`, and how many
-/// elements come before that child. The scan starts at the radix guess
-/// `idx >> shift`, which never overshoots, since a child holds at most
-/// `1 << shift` elements.
-fn size_slot(sizes: &[usize], idx: usize, shift: usize) -> (usize, usize) {
+/// Where an element sits in a branch: which child holds it, and how many
+/// elements the children before that one hold.
+struct Slot {
+    child: usize,
+    before: usize,
+}
+
+/// The slot of element `idx` in a branch at `shift`. The scan starts at the
+/// radix guess `idx >> shift`, which never overshoots, since a child holds at
+/// most `1 << shift` elements.
+fn size_slot(sizes: &[usize], idx: usize, shift: usize) -> Slot {
     let last = sizes.len().saturating_sub(1);
-    let mut k = (idx >> shift).min(last);
-    while k < last && sizes.get(k).is_some_and(|s| *s <= idx) {
-        k += 1;
+    let mut child = (idx >> shift).min(last);
+    while child < last && sizes.get(child).is_some_and(|s| *s <= idx) {
+        child += 1;
     }
-    let before = match k.checked_sub(1) {
+    let before = match child.checked_sub(1) {
         Some(p) => sizes.get(p).copied().unwrap_or(0),
         None => 0,
     };
-    (k, before)
+    Slot { child, before }
 }
 
 fn empty(heap: &mut Heap) -> Result<Cell, Full> {
@@ -268,9 +274,9 @@ pub(crate) fn get(heap: &Heap, array: Cell, i: usize) -> Option<Value> {
                 sizes,
                 children,
             } => {
-                let (k, before) = size_slot(&sizes, idx, shift);
-                idx -= before;
-                n = *children.get(k)?;
+                let slot = size_slot(&sizes, idx, shift);
+                idx -= slot.before;
+                n = *children.get(slot.child)?;
             }
         }
     }
@@ -521,12 +527,12 @@ fn tree_take(heap: &mut Heap, n: Value, m: usize) -> Result<Value, Full> {
             if m >= sizes.last().copied().unwrap_or(0) {
                 return Ok(own(heap, n));
             }
-            let (k, before) = size_slot(&sizes, m - 1, shift);
-            let Some(&child) = children.get(k) else {
+            let slot = size_slot(&sizes, m - 1, shift);
+            let Some(&child) = children.get(slot.child) else {
                 return Ok(own(heap, n));
             };
-            let cut = tree_take(heap, child, m - before)?;
-            let mut kept = own_all(heap, children.get(..k).unwrap_or(&[]));
+            let cut = tree_take(heap, child, m - slot.before)?;
+            let mut kept = own_all(heap, children.get(..slot.child).unwrap_or(&[]));
             kept.push(cut);
             branch(heap, shift, &kept)
         }
@@ -549,13 +555,13 @@ fn tree_drop(heap: &mut Heap, n: Value, m: usize) -> Result<Value, Full> {
             sizes,
             children,
         }) => {
-            let (k, before) = size_slot(&sizes, m, shift);
-            let Some(&child) = children.get(k) else {
+            let slot = size_slot(&sizes, m, shift);
+            let Some(&child) = children.get(slot.child) else {
                 return Ok(Value::NIL);
             };
-            let cut = tree_drop(heap, child, m - before)?;
+            let cut = tree_drop(heap, child, m - slot.before)?;
             let mut kept = vec![cut];
-            kept.extend(own_all(heap, children.get(k + 1..).unwrap_or(&[])));
+            kept.extend(own_all(heap, children.get(slot.child + 1..).unwrap_or(&[])));
             branch(heap, shift, &kept)
         }
     }
