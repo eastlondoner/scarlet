@@ -2,13 +2,15 @@
 
 ### Scarlet programming language
 
-A statically-typed and expression-oriented programming language for developer productivity.
+A statically typed, expression-oriented programming language. It is not finished, and the syntax and standard library still change between releases.
 
 [Documentation](https://scarlet.industries/docs/language)
 
 ---
 
 ```scarlet
+import scarlet/array
+
 type Shape {
 	Circle(r Float)
 	Rect(w Float, h Float)
@@ -27,9 +29,13 @@ pub fn main() {
 }
 ```
 
+```sh
+curl -fsSL scarlet.industries/install.sh | bash
+```
+
 ```
 scarlet run <file.scrl>         Run a program
-scarlet repl                    Start interactive REPL
+scarlet repl                    Start an interactive REPL
 scarlet check <file.scrl>       Type-check without running
-scarlet fmt [glob path]         Format source files
+scarlet fmt [path]              Format source files
 ```
