@@ -1,10 +1,5 @@
-// Pattern matching, on a stream of UI input events.
-//
-// A match must be exhaustive: leaving out a variant is a compile error
-// ("Match is not exhaustive, missing: Quit"), and so is an arm that an earlier
-// arm already covers ("This pattern is unreachable; a previous pattern matches
-// the same values"). That is why `describe` below has no `else`: the four
-// variants of Event are the whole space, and the compiler knows it.
+// Pattern matching, on a stream of UI input events. A match must be
+// exhaustive, so describe below has no fallback arm: the compiler checks it.
 
 import scarlet/array
 import scarlet/string
@@ -23,11 +18,11 @@ type Event {
 
 fn describe(e Event) String {
 	match e {
-		// A nested constructor pattern reaches into the payload's payload.
+		// A nested pattern reaches into the payload's payload.
 		Click(Point(0, 0), _) -> 'click at the origin'
-		// A guard refines a pattern with a test the pattern cannot express.
+		// A guard refines a pattern with a test the pattern can't express.
 		Click(Point(x, y), _) if x == y -> 'click on the diagonal at ${x}'
-		// Fields can be matched by label, and `..` drops the ones not named.
+		// Fields match by label; .. drops the ones not named.
 		Click(at: p, ..) -> 'click at ${p.x},${p.y}'
 		Key(27, _) -> 'escape'
 		Key(code, True) -> 'shift + key ${code}'
@@ -40,8 +35,8 @@ fn describe(e Event) String {
 	}
 }
 
-// Range patterns are end-exclusive, exactly like range expressions: 400..500
-// matches 400 through 499. `else` is the wildcard arm.
+// Range patterns are end-exclusive: 400..500 matches 400 through 499.
+// else is the wildcard arm.
 fn status_class(code Int) String {
 	match code {
 		// An or-pattern lets several literals share one body.
@@ -63,8 +58,7 @@ fn effect(method String) String {
 	}
 }
 
-// Matching a tuple destructures both scrutinees in one pattern, which keeps
-// the four cases side by side instead of nested in an if/else.
+// Matching a tuple keeps the four cases side by side instead of nested ifs.
 fn quadrant(p Point) String {
 	match (p.x >= 0, p.y >= 0) {
 		(True, True) -> 'top right'
@@ -74,7 +68,7 @@ fn quadrant(p Point) String {
 	}
 }
 
-// Array patterns match by shape; `..rest` binds whatever is left over.
+// Array patterns match by shape; ..rest binds whatever is left over.
 fn batch(codes Array(Int)) String {
 	match codes {
 		[] -> 'empty batch'

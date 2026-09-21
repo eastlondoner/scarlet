@@ -1,12 +1,6 @@
-// Absence versus failure. Two types, two jobs:
-//
-//   Option(a)     — the value may not be there. Nothing went wrong.
-//   Result(a, e)  — the operation could fail, and `e` says why.
-//
-// The stdlib convention: a fallible operation returns `Result(_, Nil)` even
-// when the error carries no data, because `Result` means "this can fail" and
-// chains with `result.then`. `Option` is reserved for "may be absent" — a
-// lookup that finds nothing, an index past the end.
+// Absence versus failure. Option(a) is a value that may not be there but
+// nothing went wrong; Result(a, e) is an operation that could fail, and e
+// says why.
 
 import scarlet/array
 import scarlet/binary.{Dec}
@@ -15,17 +9,14 @@ import scarlet/option
 import scarlet/result
 import scarlet/string
 
-// Failure: a domain error type. Give the variants payloads — the caller wants
-// to report the bad input, not just that "something broke".
+// A domain error type. Give the variants payloads: the caller wants the bad
+// input, not just that "something broke".
 type ParseError {
 	Empty
 	NotANumber(text String)
 }
 
-// binary.parse_int is the stdlib's fallible primitive, so it returns
-// Result(Int, Nil): "it failed", with nothing more to say. Lift that anonymous
-// failure into the domain error with result.map_err — that is the whole job of
-// map_err, and it is why Nil errors are fine at the bottom of a stack.
+// map_err lifts binary.parse_int's bare Result(Int, Nil) into our own error type.
 fn parse_score(s String) Result(Int, ParseError) {
 	trimmed = string.trim(s)
 	if string.length(trimmed) == 0 {
@@ -46,14 +37,18 @@ fn show(r Result(Int, ParseError)) String {
 	}
 }
 
-// then chains the *next* fallible step, short-circuiting on the first Err —
-// validate only ever sees a number that parsed.
 fn validate(n Int) Result(Int, ParseError) {
 	if n >= 0 && n <= 100 {
 		Ok(n)
 	} else {
 		Err(NotANumber('${n} out of range'))
 	}
+}
+
+// `<-` hands the rest of the block to result.then: it runs only on Ok.
+fn checked(s String) Result(Int, ParseError) {
+	n <- result.then(parse_score(s))
+	validate(n)
 }
 
 pub fn main() {
@@ -68,14 +63,13 @@ pub fn main() {
 	println('map       ${option.map(found, string.length)}')
 	println('unwrap    ${option.unwrap(found, 'nobody')} ${option.unwrap(missing, 'nobody')}')
 
-	// then chains a lookup that may itself find nothing (flat_map in other
-	// languages); or_else supplies a whole alternative Option, lazily.
+	// then chains a lookup that may itself find nothing; or_else supplies a
+	// lazy alternative.
 	initial = option.then(found, fn(u) string.split(u, '')[0])
 	println('then      ${option.unwrap(initial, '?')}')
 	println('or_else   ${option.unwrap(option.or_else(missing, fn() Some('anonymous')), '?')}')
 
-	// `or` is the shorthand for "this Option, or that value": it unwraps or falls
-	// back in one expression.
+	// or unwraps an Option, or falls back to a value, in one expression.
 	println('or        ${users[9] or 'out of range'}')
 	println('')
 
@@ -90,11 +84,9 @@ pub fn main() {
 	println('or        ${good or 0} ${bad or 0}')
 
 	println('then      ${show(result.then(good, validate))}')
-	println('then      ${show(result.then(parse_score('900'), validate))}')
-	println('then      ${show(result.then(bad, validate))}')
+	array.each(['900', 'abc'], fn(s) println('then      ${show(checked(s))}'))
 
-	// `or` works on Result too, and its receiver form binds the error payload, so
-	// recovery can look at *why* it failed. The body may be a block.
+	// or's receiver form binds the error, so recovery can act on why it failed.
 	score = parse_score('oops') or e -> {
 		match e {
 			Empty -> println('recover   nothing to parse')
@@ -106,8 +98,7 @@ pub fn main() {
 	println('score     ${score}')
 	println('')
 
-	// Errors from the stdlib are typed enums, not strings — scarlet/io reports the path
-	// it could not read, so the handler does not have to reconstruct it.
+	// io errors are typed enums: NotFound carries the path it could not read.
 	match io.read_text('no-such-file.txt') {
 		Ok(contents) -> println('read ${string.length(contents)} chars')
 		Err(NotFound(path)) -> println('io        no such file: ${path}')

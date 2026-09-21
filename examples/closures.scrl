@@ -1,6 +1,5 @@
 // Closures and higher-order functions. A function is a value: it can capture
-// the bindings around it, be stored in an array, be passed to another function,
-// and be returned from one.
+// bindings, be stored, passed, and returned like any other value.
 
 import scarlet/array
 import scarlet/option
@@ -12,14 +11,13 @@ type Line {
 	cents Int
 }
 
-/** Returns a function that adds `k`. The returned closure carries `k` with it. */
+/** Returns a function that adds k; the closure carries k with it. */
 fn adder(k Int) fn(Int) Int {
 	fn(x) x + k
 }
 
-// A predicate factory: `floor` outlives this call, inside the closure. The
-// parameter is annotated because a field access needs to know the record it is
-// reading — inference alone cannot pick a type out of `.qty`.
+// floor outlives this call, inside the closure. Annotated because .qty alone
+// can't tell inference the record type.
 fn at_least(floor Int) fn(Line) Bool {
 	fn(o Line) o.qty >= floor
 }
@@ -45,8 +43,8 @@ pub fn main() {
 	array.each(lines, fn(line) println('bulk: ${line}'))
 	println('revenue: ${revenue} cents over ${array.length(orders)} orders')
 
-	// A closure captures the *value* a name holds when the closure is made, so
-	// rebinding the name afterwards does not reach back into the closure.
+	// A closure captures the value a name holds when made; rebinding
+	// afterwards doesn't reach into it.
 	base = 10
 	add_base = adder(base)
 	base = 100
@@ -60,8 +58,7 @@ pub fn main() {
 	qtys = [..array.map(orders, fn(o) o.qty), ..{ 1..3 }]
 	println('quantities ${string.inspect(qtys)}')
 
-	// `find` hands back an Option, `option.map` works inside it, and `or` supplies
-	// the fallback when there is nothing there.
+	// find returns an Option; option.map works inside it, or supplies the fallback.
 	biggest = array.find(orders, fn(o) o.qty > 30)
 	println('biggest sku: ${option.map(biggest, fn(o) o.sku) or 'none'}')
 

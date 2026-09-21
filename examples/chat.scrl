@@ -1,24 +1,5 @@
-// A live chatroom in one file: one room, a dashboard served from this file,
-// messages pushed to every browser over server-sent events.
-//
-//	main
-//	└─ app                     one-for-one, 10 restarts a minute
-//	   ├─ room                 permanent worker: members, history, the counters
-//	   └─ http                 (declared by http.serve_in)
-//	      ├─ connections       factory: one disposable member per connection —
-//	      │                    every open browser tab is one of these, parked
-//	      │                    on its own mailbox inside its SSE response
-//	      └─ acceptor × cores
-//
-// A browser tab GETs /events; the connection's process subscribes its own
-// mailbox to the room and then serves the response body straight out of that
-// mailbox, so a message is one send per tab. The room monitors each tab's
-// process and drops it when the tab goes away. The tab's process watches the
-// room's place in the tree: when the room crashes (there is a button for
-// that) the supervisor restarts it at the same address, every tab rejoins the
-// new incarnation without reconnecting, and all that is lost is the history.
-//
-// Run it and open http://localhost:8080 in a few tabs. PORT overrides the port.
+// A live chatroom. One supervised room process, pushed to every tab over SSE.
+// Run it and open http://localhost:8080 in a few tabs. PORT sets the port.
 
 import scarlet/array
 import scarlet/binary
@@ -35,6 +16,7 @@ import scarlet/process
 import scarlet/process.{
 	Disposable,
 	Down,
+	Exit,
 	FactoryOf,
 	Gone,
 	OneForAll,
@@ -53,42 +35,36 @@ import scarlet/process.{
 	Transient,
 	Worker,
 }
+import scarlet/result
 import scarlet/string
 
 const HISTORY = 100
 const MAX_NAME = 24
 const MAX_TEXT = 500
 const MAX_SAY = 4096
-// A tab that has heard nothing for this long is sent a comment, which is how a
-// tab that silently went away is found out: the write fails, the connection's
-// process ends, and the room's monitor on it fires.
+// Idle tabs get pinged, so a closed tab fails its write and leaves.
 const HEARTBEAT_MS = 15_000
 
-// ---- the room ------------------------------------------------------------------------
+// The room
 
 type RoomMsg {
-	// A tab's process, and the mailbox its response body is being served from.
 	Join(who Pid, feed Subject(Feed))
 	Say(name String, text String)
-	// The monitor placed at Join, wrapped into the room's own message type.
 	Left(down Down)
 	Crash
 }
 
-// What a tab's process receives: rendered SSE frames from the room, and the
-// watch it holds on the room's place in the tree.
+// What a tab hears: frames from the room, and the room exiting.
 type Feed {
 	Frame(bytes Binary)
-	RoomExit(exit process.Exit)
+	RoomExit(exit Exit)
 }
 
 type Room {
 	inbox Subject(RoomMsg)
-	// The room's own place in the tree: its restart count is on the dashboard,
-	// and its parent is the whole application, which the dashboard draws.
 	place Supervised
 	members Map(Pid, Subject(Feed))
-	// The last HISTORY message frames, oldest first, replayed to each joiner.
+	// The last HISTORY frames, oldest first.
 	history Array(Binary)
 	said Int
 }
@@ -108,7 +84,7 @@ fn room(inbox Subject(RoomMsg)) Nil {
 fn room_loop(r Room) Nil {
 	match process.receive(r.inbox) {
 		Join(who, feed) -> {
-			_ = process.monitor(who, r.inbox, fn(down) Left(down))
+			_ = process.monitor(who, r.inbox, Left)
 			replay(feed, r.history)
 			joined = Room(..r, members: map.set(r.members, who, feed))
 			announce(joined)
@@ -132,23 +108,20 @@ fn room_loop(r Room) Nil {
 	}
 }
 
-// Someone came or went: the counters and the tree have both changed.
 fn announce(r Room) Nil {
 	broadcast(r.members, stats_frame(r))
 	broadcast(r.members, tree_frame(r))
 }
 
-// One send per member of a frame rendered once; the bytes are shared, not
-// copied, so a message to a thousand tabs is a thousand sends of one Binary.
+// The frame is one shared Binary, not a copy per tab.
 fn broadcast(members Map(Pid, Subject(Feed)), frame Binary) Nil {
 	map.fold(members, Nil, fn(_, _who, feed) process.send(feed, Frame(frame)))
 }
 
-// The whole history goes to a joiner as one chunk.
 fn replay(feed Subject(Feed), history Array(Binary)) Nil {
 	match history {
 		[] -> Nil
-		_ -> process.send(feed, Frame(array.fold(history, <<>>, fn(acc, f) binary.append(acc, f))))
+		_ -> process.send(feed, Frame(binary.concat(history)))
 	}
 }
 
@@ -160,57 +133,48 @@ fn remember(history Array(Binary), frame Binary) Array(Binary) {
 	[..kept, frame]
 }
 
-// ---- frames --------------------------------------------------------------------------
-//
-// Server-sent events: a frame is `event:` and `data:` lines ending in a blank
-// line; a browser joins several data lines with newlines, which is how a
-// multi-line message crosses. The name rides as the first data line.
+// Frames
+
+// An SSE event: one `data:` line each, then a blank line.
+fn sse(event String, lines Array(String)) Binary {
+	framed = array.fold(lines, 'event: ${event}\n', fn(acc, line) acc + 'data: ${line}\n')
+	binary.from_string(framed + '\n')
+}
 
 fn message_frame(name String, text String) Binary {
-	head = 'event: message\ndata: ${name}\n'
-	framed = array.fold(string.split(text, '\n'), head, fn(acc, line) acc + 'data: ${line}\n')
-	binary.from_string(framed + '\n')
+	sse('message', [name, ..string.split(text, '\n')])
 }
 
 fn stats_frame(r Room) Binary {
 	restarts = process.info(r.place).restarts
-	binary.from_string('event: stats\ndata: ${map.size(r.members)} ${r.said} ${restarts}\n\n')
+	sse('stats', ['${map.size(r.members)} ${r.said} ${restarts}'])
 }
 
 fn tree_frame(r Room) Binary {
-	lines = render(process.parent(r.place), '', r.place)
-	framed = array.fold(lines, 'event: tree\n', fn(acc, line) acc + 'data: ${line}\n')
-	binary.from_string(framed + '\n')
+	sse('tree', render(process.parent(r.place), '', r.place))
 }
 
 const HELLO = <<'retry: 1000\n\n'>>
 const PING = <<': ping\n\n'>>
-const RESTARTED = <<
-	'event: system\ndata: the room process crashed and was restarted; this tab rejoined it\n\n',
->>
+const RESTARTED = sse(
+	'system',
+	['the room process crashed and was restarted; this tab rejoined it'],
+)
 
-// ---- the tree, as text ---------------------------------------------------------------
+// The tree, as text
 
-// `node` and everything under it, one line each. Runs of identical siblings
-// (one acceptor per core) collapse into one line with a multiplier.
+// One line per node. Identical siblings collapse into one line with a count.
 fn render(node Supervised, indent String, me Supervised) Array(String) {
 	blocks = array.map(process.children(node), fn(child) render(child, indent + '  ', me))
-	array.fold(
-		collapse(blocks),
-		[indent + describe(node, me)],
-		fn(out, block) array.concat(out, block),
-	)
+	array.fold(collapse(blocks), [indent + describe(node, me)], array.concat)
 }
 
 fn describe(node Supervised, me Supervised) String {
 	info = process.info(node)
 	what = match info.kind {
 		Process -> 'process'
-		Worker(policy) -> if node == me {
-			'room  ${policy_name(policy)} worker'
-		} else {
-			'${policy_name(policy)} worker'
-		}
+		Worker(policy) if node == me -> 'room  ${policy_name(policy)} worker'
+		Worker(policy) -> '${policy_name(policy)} worker'
 		SupervisorOf(strategy) -> 'supervisor ' + strategy_name(strategy)
 		FactoryOf(Disposable) -> 'factory disposable, ${process.count(node)} live'
 		FactoryOf(Restarted(restarts, within_ms)) ->
@@ -258,40 +222,36 @@ fn collapse(blocks Array(Array(String))) Array(Array(String)) {
 		[(prev, n), ..rest] if prev == block -> [(prev, n + 1), ..rest]
 		_ -> [(block, 1), ..acc]
 	})
-	array.map(array.reverse(runs), fn(run) {
-		(block, n) = run
-		match block {
-			[first, ..rest] if n > 1 -> ['${first} ×${n}', ..rest]
-			_ -> block
-		}
+	array.map(array.reverse(runs), fn(run) match run {
+		([first, ..rest], n) if n > 1 -> ['${first} ×${n}', ..rest]
+		(block, _) -> block
 	})
 }
 
-// ---- http ----------------------------------------------------------------------------
+// HTTP
 
 fn route(req Request, chat Subject(RoomMsg)) Response {
 	match (req.method, http.path(req)) {
 		(Get, <<'/'>>) -> page()
 		(Get, <<'/events'>>) -> events(chat)
-		(Post, <<'/say'>>) -> say(req, chat)
-		(Post, <<'/crash'>>) -> {
-			process.send(chat, Crash)
-			no_content()
+		(Post, <<'/say'>>) -> match parse_say(req) {
+			Ok(msg) -> send(chat, msg)
+			Err(bad) -> bad
 		}
+		(Post, <<'/crash'>>) -> send(chat, Crash)
 		_ -> http.not_found()
 	}
 }
 
-// Runs in the connection's own process, which is what makes this work: the
-// mailbox made here belongs to that process, and the response body below is
-// pulled by that same process, so it may receive on it. The body's first
-// chunk is ready before anything has been received, so the response head goes
-// out at once; after that each pull is one message from the room. The
-// connection lives exactly as long as this body: a tab that closes makes the
-// next write fail, which ends the process, which fires the room's monitor.
+fn send(chat Subject(RoomMsg), msg RoomMsg) Response {
+	process.send(chat, msg)
+	no_content()
+}
+
+// Runs in the connection's own process, so its body can receive on `feed`.
 fn events(chat Subject(RoomMsg)) Response {
 	feed = process.subject()
-	_ = process.watch(process.supervised(chat), feed, fn(exit) RoomExit(exit))
+	_ = process.watch(process.supervised(chat), feed, RoomExit)
 	process.send(chat, Join(process.self(), feed))
 	Response(
 		status: 200,
@@ -303,47 +263,44 @@ fn events(chat Subject(RoomMsg)) Response {
 fn live(chat Subject(RoomMsg), feed Subject(Feed)) Body {
 	fn() match process.receive_within(feed, HEARTBEAT_MS) {
 		Ok(Frame(bytes)) -> Ok(Chunk(bytes, live(chat, feed)))
-		Ok(RoomExit(exit)) -> match exit.status {
-			// The address survived the process behind it: join the new one.
-			Running -> {
-				process.send(chat, Join(process.self(), feed))
-				Ok(Chunk(RESTARTED, live(chat, feed)))
-			}
-			// The supervisor gave up: the program is on its way out. Ending
-			// the stream makes the browser retry, which finds nobody.
-			Restarting -> Ok(Done([]))
-			Gone -> Ok(Done([]))
+		// Same address, new room: rejoin it.
+		Ok(RoomExit(Exit(status: Running, ..))) -> {
+			process.send(chat, Join(process.self(), feed))
+			Ok(Chunk(RESTARTED, live(chat, feed)))
 		}
+		// The supervisor gave up, so the program is exiting.
+		Ok(RoomExit(_)) -> Ok(Done([]))
 		Err(Nil) -> Ok(Chunk(PING, live(chat, feed)))
 	}
 }
 
-// The body is the name on the first line and the message on the rest.
-fn say(req Request, chat Subject(RoomMsg)) Response {
-	match body.collect(req.body, MAX_SAY) {
-		Err(_) -> text(413, 'too long')
-		Ok(bytes) -> match binary.to_string(bytes) {
-			Err(Nil) -> text(400, 'not utf-8')
-			Ok(s) -> match string.split(s, '\n') {
-				[] -> text(400, 'empty')
-				[first, ..rest] -> {
-					name = string.trim(without(first, '\r'))
-					message = string.trim(without(join(rest, '\n'), '\r'))
-					if name == '' || string.length(name) > MAX_NAME {
-						text(400, 'bad name')
-					} else if message == '' || string.length(message) > MAX_TEXT {
-						text(400, 'bad message')
-					} else {
-						process.send(chat, Say(name, message))
-						no_content()
-					}
-				}
-			}
-		}
+// The body is a name, a newline, then the message.
+fn parse_say(req Request) Result(RoomMsg, Response) {
+	bytes <- result.then(or_reply(body.collect(req.body, MAX_SAY), 413, 'too long'))
+	s <- result.then(or_reply(binary.to_string(bytes), 400, 'not utf-8'))
+	// A stray \r would end an SSE line early.
+	(first, rest) = match string.split(without(s, '\r'), '\n') {
+		[first, ..rest] -> (first, join(rest, '\n'))
+		[] -> ('', '')
+	}
+	name <- result.then(field(first, MAX_NAME, 'bad name'))
+	message <- result.then(field(rest, MAX_TEXT, 'bad message'))
+	Ok(Say(name, message))
+}
+
+fn or_reply(r Result(a, e), status Int, why String) Result(a, Response) {
+	result.map_err(r, fn(_) text(status, why))
+}
+
+fn field(s String, max Int, why String) Result(String, Response) {
+	trimmed = string.trim(s)
+	if trimmed == '' || string.length(trimmed) > max {
+		Err(text(400, why))
+	} else {
+		Ok(trimmed)
 	}
 }
 
-// A bare carriage return would end an SSE line early, so none may get in.
 fn without(s String, needle String) String {
 	join(string.split(s, needle), '')
 }
@@ -383,36 +340,23 @@ fn text(status Int, s String) Response {
 	)
 }
 
-// ---- main ----------------------------------------------------------------------------
-
-fn port() Int {
-	match os.get_env('PORT') {
-		Some(p) -> binary.parse_int(binary.from_string(p), Dec) or 8080
-		None -> 8080
-	}
-}
+// Main
 
 pub fn main() Nil {
-	// The crash button counts against this. Past it the supervisor gives up,
-	// which kills this process: the program exits non-zero, as it should when
-	// something is failing faster than restarting can help.
+	// Past 10 crashes a minute the supervisor gives up and the program exits.
 	app <- process.root(OneForOne(restarts: 10, within_ms: 60_000))
 	chat = process.permanent(app, room)
-	match http.serve_in(app, '0.0.0.0', port(), fn(req) route(req, chat)) {
-		Ok(_) -> println('chat is up on http://localhost:${port()}')
-		// Nothing to serve with: failing this process takes the tree down and
-		// exits non-zero, instead of `root` parking a program that does nothing.
+	port = binary.parse_int(binary.from_string(os.get_env('PORT') or '8080'), Dec) or 8080
+	match http.serve_in(app, '0.0.0.0', port, fn(req) route(req, chat)) {
+		Ok(_) -> println('chat is up on http://localhost:${port}')
 		Err(e) -> {
-			println('cannot listen on port ${port()}: ${e}')
+			println('cannot listen on port ${port}: ${e}')
 			process.kill(process.self())
 		}
 	}
 }
 
-// ---- the dashboard -------------------------------------------------------------------
-//
-// One page, no build step, no dependencies. Messages are rendered with
-// textContent, so nothing anyone types is ever interpreted as markup.
+// The dashboard. Messages render with textContent, never as markup.
 
 const PAGE = binary.from_string(join(PAGE_LINES, '\n'))
 

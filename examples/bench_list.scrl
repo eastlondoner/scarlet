@@ -1,8 +1,6 @@
-// List-path correctness + shape oracle for the sequence representation.
-// Reifies a real Array (NOT a lazy Range) via the double-spread idiom
-// `[..{0..n}, ..[]]`, then exercises every scarlet/array consumer and producer
-// plus a random-access micro-loop. Prints only reduced scalars so the
-// golden is tiny and stable across any semantics-preserving rep change.
+// Correctness + shape oracle for the sequence representation. `[..{0..n}, ..[]]`
+// reifies a real Array (not a lazy Range), then every array consumer and
+// producer runs over it. Only reduced scalars print, so the golden stays tiny.
 
 import scarlet/array
 

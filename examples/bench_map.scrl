@@ -31,8 +31,7 @@ fn churn(m map.Map(Int, Int), i Int) Int {
 	}
 }
 
-// Sized so the run is ~1s: below that the 10ms timer granularity dominates
-// and the benchmark cannot resolve the regressions it exists to catch.
+// Sized to run ~1s: below that the 10ms timer can't resolve a regression.
 fn repeat_lookups(m map.Map(Int, Int), rounds Int, acc Int) Int {
 	if rounds == 0 {
 		acc

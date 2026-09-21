@@ -1,14 +1,10 @@
-// Tail recursion. A call in tail position — the last thing a function does
-// before handing its answer back — reuses the current stack frame instead of
-// pushing a new one. So a loop written as recursion runs in constant stack
-// space, and `internal.stack_depth` is the proof: it stays flat no matter how
-// deep the recursion goes.
+// Tail recursion. A tail call reuses the current stack frame instead of
+// pushing a new one, so recursion here runs in constant stack space.
 
 import scarlet/internal
 
-// The accumulator is what makes the call a tail call. Without it the `+` would
-// have to happen after the recursive call returned, and every frame would have
-// to stay alive waiting to do its addition.
+// The accumulator makes this a tail call: without it, + would wait for the
+// recursive call to return.
 fn sum_to(n Int, acc Int) Int {
 	if n == 0 {
 		acc
@@ -17,7 +13,7 @@ fn sum_to(n Int, acc Int) Int {
 	}
 }
 
-// Recurse `hops` times and report the live frame count at the bottom.
+// Recurse hops times and report the live frame count at the bottom.
 fn depth_after(hops Int) Int {
 	if hops == 0 {
 		internal.stack_depth()
@@ -26,9 +22,8 @@ fn depth_after(hops Int) Int {
 	}
 }
 
-// Mutual recursion is optimised the same way: is_even's call to is_odd is in
-// tail position, and so is is_odd's call back, so the two swap places in one
-// frame rather than stacking a million of them.
+// Mutual tail calls optimise the same way: is_even and is_odd swap in one
+// frame instead of stacking a million of them.
 fn is_even(n Int) Bool {
 	if n == 0 {
 		True
@@ -48,8 +43,7 @@ fn is_odd(n Int) Bool {
 pub fn main() {
 	println(sum_to(1000000, 0))
 
-	// Three frames: the entry frame, main, and the single live frame of
-	// depth_after — however many hops it has made.
+	// Three frames total: entry, main, and depth_after's one live frame.
 	println('depth after 1 hop: ${depth_after(1)}')
 	println('depth after 1000000 hops: ${depth_after(1000000)}')
 
