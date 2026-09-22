@@ -372,7 +372,7 @@ struct ElabFrame {
 // which `analyse_module` sets `walking_module_statements`. The mode bools in
 // this struct that did carry an invariant are already enums — see
 // [`UnusedBindings`] and [`ModuleScope`]; these four carry none between them.
-#[cfg_attr(dylint_lib = "mordant", allow(bool_cluster))]
+#[cfg_attr(mordant, allow(bool_cluster))]
 pub struct Compiler {
     // --- Lowered program ---
     /// Every function this compile reserved, indexed by [`FuncIdx`], and filled

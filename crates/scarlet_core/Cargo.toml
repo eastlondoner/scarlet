@@ -4,11 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 
-# `cargo mordant` sets `--cfg dylint_lib="mordant"` and plain cargo does not, so
-# the `#[cfg_attr(dylint_lib = "mordant", ...)]` suppression on `Compiler` is an
+# `cargo mordant` sets `--cfg mordant` and plain cargo does not, so
+# the `#[cfg_attr(mordant, ...)]` suppression on `Compiler` is an
 # unexpected cfg to every other build — and `clippy -- -D warnings` fails on it.
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(dylint_lib, values("mordant"))'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(mordant)'] }
 
 [dependencies]
 scarlet_syntax = { path = "../scarlet_syntax" }
