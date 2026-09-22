@@ -20,9 +20,11 @@
 
 mod array;
 mod bigint;
+mod binary;
 mod code;
 mod eq;
 mod exec;
+mod float;
 mod heap;
 mod show;
 mod value;

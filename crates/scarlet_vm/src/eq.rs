@@ -11,6 +11,7 @@
 //! first pair that differs.
 
 use crate::array::{self, Seq};
+use crate::binary;
 use crate::heap::{Cell, Heap, Kind};
 use crate::value::{Value, View};
 
@@ -27,12 +28,13 @@ pub(crate) fn equal(heap: &Heap, a: Value, b: Value) -> bool {
 
 /// Compare one pair: decide it now, or queue what it holds.
 fn pair(heap: &Heap, a: Value, b: Value, todo: &mut Vec<(Value, Value)>) -> bool {
-    // Every value has one form, so the same word is the same value. The
-    // exception would be a float's two zeros, which floats will have to meet.
+    // Every value but a Float has one form, so the same word is the same
+    // value. A Float compares as a number, so its two zeros are equal.
     if a.bits() == b.bits() {
         return true;
     }
     match (a.view(), b.view()) {
+        (View::Float(x), View::Float(y)) => x == y,
         (View::Cell(x), View::Cell(y)) => cells(heap, x, y, todo),
         // Immediates, small Ints and functions with no captures are equal
         // only when they are the same word, which the check above decided.
@@ -53,6 +55,10 @@ fn pair(heap: &Heap, a: Value, b: Value, todo: &mut Vec<(Value, Value)>) -> bool
 fn cells(heap: &Heap, x: Cell, y: Cell, todo: &mut Vec<(Value, Value)>) -> bool {
     if let (Some(a), Some(b)) = (array::seq(heap, x), array::seq(heap, y)) {
         return arrays(heap, a, b, todo);
+    }
+    // A slice equals a binary holding the same bits.
+    if let (Some(a), Some(b)) = (binary::bits(heap, x), binary::bits(heap, y)) {
+        return binary::equal(heap, a, b);
     }
     let (Some(kx), Some(ky)) = (heap.kind(x), heap.kind(y)) else {
         return false;
@@ -76,8 +82,14 @@ fn cells(heap: &Heap, x: Cell, y: Cell, todo: &mut Vec<(Value, Value)>) -> bool 
                 && queue(todo, captures(heap, x), captures(heap, y))
         }
         Kind::Tuple => queue(todo, heap.elements(x).collect(), heap.elements(y).collect()),
-        // Arrays were compared above; a tree's inner nodes are never values.
-        Kind::ArrayRoot | Kind::ArrayLeaf | Kind::ArrayBranch | Kind::Range => false,
+        // Arrays and binaries were compared above; a tree's inner nodes are
+        // never values.
+        Kind::ArrayRoot
+        | Kind::ArrayLeaf
+        | Kind::ArrayBranch
+        | Kind::Range
+        | Kind::Binary
+        | Kind::BinarySlice => false,
     }
 }
 
