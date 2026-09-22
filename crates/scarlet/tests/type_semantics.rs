@@ -456,7 +456,6 @@ run_case! {
 }
 
 #[test]
-#[ignore = "needs the VM"]
 fn ctor_record_update_overrides_and_projects() {
     // Record-update builds a fresh value: `base` is left untouched.
     run_outputs(
@@ -470,6 +469,48 @@ fn ctor_record_update_overrides_and_projects() {
          }\n",
         "al\n19\n18\n",
     );
+}
+
+reject_case! {
+    /// `..base` fills a field it leaves out with `base.field`, so on a type
+    /// with several variants that field has to be on all of them.
+    ctor_record_update_refuses_a_field_another_variant_lacks: (
+        "type S {\n\tA(v Int, r Int)\n\tB(v Int)\n}\n\
+         pub fn main() {\n\
+         \tb = B(v: 1)\n\
+         \ta = A(..b)\n\
+         \tprintln('${a}')\n\
+         }\n",
+        "The spread cannot fill field 'r', which is not present on every variant of 'S' (missing on 'B')",
+    ),
+}
+
+run_case! {
+    /// A field is found by its name, so it may sit in a different slot in
+    /// each variant: `a.x` is `b.x`, not whatever `B` holds first.
+    ctor_record_update_reads_fields_by_name: (
+        "type S {\n\tA(x Int, y Int)\n\tB(y Int, x Int)\n}\n\
+         pub fn main() {\n\
+         \tb = B(y: 1, x: 2)\n\
+         \ta = A(..b, y: 3)\n\
+         \tprintln('${a}')\n\
+         \tprintln('${b.x} ${a.x}')\n\
+         }\n",
+        "A(2, 3)\n2 2\n",
+    ),
+}
+
+reject_case! {
+    /// By name, but still of one type: a `.x` that is an `Int` on one variant
+    /// and a `String` on another has no type to be.
+    field_access_refuses_a_field_whose_type_differs_by_variant: (
+        "type S {\n\tA(x Int)\n\tB(x String)\n}\n\
+         fn get(s S) Int { s.x }\n\
+         pub fn main() {\n\
+         \tprintln(get(A(1)))\n\
+         }\n",
+        "Type mismatch: expected 'Int', got 'String'",
+    ),
 }
 
 reject_case! {

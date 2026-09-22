@@ -158,12 +158,18 @@ enum FieldMismatch {
     NotNominal,
     /// Variant list is empty, so no field can exist.
     NoVariants,
+    /// A variant with no field of that name, so a value of it has nothing to
+    /// read.
     MissingOn(StrId),
-    PositionDiffers {
-        variant: StrId,
-        at: usize,
-        expected: usize,
-    },
+}
+
+/// A field every variant of a type declares, found by its name.
+struct SharedField {
+    /// Its type, which every variant agrees on.
+    ty: Ty,
+    /// Where it sits in each variant, by variant index. Variants may disagree:
+    /// a read looks the field up by name, not by position.
+    slots: SmallVec<[u32; 4]>,
 }
 
 // ============================================================================
@@ -3608,11 +3614,13 @@ impl Compiler {
 
             return match scheme.kind {
                 ValueKind::Constructor {
+                    type_id,
                     arity,
                     field_labels,
                     ..
                 } => self.compile_ctor_call(
                     name,
+                    type_id,
                     arity as usize,
                     field_labels,
                     inst_ty,
@@ -3944,6 +3952,7 @@ impl Compiler {
     fn compile_ctor_call(
         &mut self,
         variant_name: &str,
+        type_id: TypeId,
         arity: usize,
         field_labels_sl: ArenaSlice<pool::StrSlices>,
         inst_ty: Ty,
@@ -4046,6 +4055,8 @@ impl Compiler {
             let base_ty = self.compile_expr(e);
             regions[ai] = self.close_walk_region();
             self.engine.unify_at(result_ty, base_ty, e.span());
+            let unfilled = (0..arity).filter(|&i| slots.get(i).is_none_or(Option::is_none));
+            self.check_spread_fills(type_id, result_ty, field_labels_sl, unfilled, e.span());
         }
 
         for (i, slot_expr) in slots.iter().enumerate() {
@@ -4066,6 +4077,52 @@ impl Compiler {
         }
 
         result_ty
+    }
+
+    /// `C(..base, ...)` fills each field it leaves out with `base.field`, so
+    /// each of those has to be a field `base.field` could read: present on
+    /// every variant of the type, by name. On a type with one variant that is
+    /// every field. On a type with several it is only the fields they all
+    /// share, and a spread that leaves out any other is refused, since which
+    /// variant `base` is is not known until it runs.
+    fn check_spread_fills(
+        &mut self,
+        type_id: TypeId,
+        result_ty: Ty,
+        field_labels: ArenaSlice<pool::StrSlices>,
+        unfilled: impl Iterator<Item = usize>,
+        span: Span,
+    ) {
+        let resolved = self.engine.find(result_ty);
+        let (type_name, type_args) = match self.engine.node(resolved) {
+            TypeNode::Con { name, args, .. } => (
+                self.engine.str(name).to_string(),
+                self.engine.children_of(args).to_vec(),
+            ),
+            _ => return,
+        };
+        let Some(info) = self.env.lookup_type_info_by_id(type_id) else {
+            return;
+        };
+        let labels: SmallVec<[StrId; 4]> =
+            SmallVec::from_slice(self.engine.str_ids_of(field_labels));
+        for i in unfilled {
+            let Some(&label) = labels.get(i) else {
+                continue;
+            };
+            if let Err(FieldMismatch::MissingOn(variant)) =
+                self.field_in_variants(info, &type_args, label, Some(span))
+            {
+                let field = self.engine.str(label).to_string();
+                let why = self.missing_on(variant, &type_name);
+                self.error(
+                    format!(
+                        "The spread cannot fill field '{field}', which {why}; write '{field}:' in the call"
+                    ),
+                    span,
+                );
+            }
+        }
     }
 
     // ========================================================================
@@ -4181,10 +4238,10 @@ impl Compiler {
         self.engine.fresh_var()
     }
 
-    /// Single source of truth for the nominal `.field` lookup: the slot index a
-    /// `TupleIndex` must address, plus the field's instantiated type. A field
-    /// is only projectable when EVERY variant carries that label at the same
-    /// position and at a unifiable type.
+    /// Single source of truth for the nominal `.field` lookup, by name: where
+    /// the field sits in each variant, plus its instantiated type. A field is
+    /// only readable when EVERY variant carries that label at a unifiable
+    /// type. Its position may differ from one variant to the next.
     ///
     /// `unify_span` is `Some` on the typecheck path, where the per-variant
     /// field types still have to be unified (and any mismatch reported); the
@@ -4195,9 +4252,10 @@ impl Compiler {
         type_args: &[Ty],
         field_id: StrId,
         unify_span: Option<Span>,
-    ) -> Result<(usize, Ty), FieldMismatch> {
+    ) -> Result<SharedField, FieldMismatch> {
         let variants = info.variants().ok_or(FieldMismatch::NotNominal)?;
-        let mut found: Option<(usize, Ty)> = None;
+        let mut ty: Option<Ty> = None;
+        let mut slots = SmallVec::new();
         // Variant/VariantField are Copy and the pools are append-only, so copy
         // each entry out by index instead of `to_vec()`ing the slices to
         // survive the `&mut engine` calls in the loop body.
@@ -4212,31 +4270,35 @@ impl Compiler {
             let Some((i, fty)) = hit else {
                 return Err(FieldMismatch::MissingOn(v.name));
             };
+            slots.push(i as u32);
             let substituted = self
                 .engine
                 .substitute_type_vars(fty, info.type_params, type_args);
-            match found {
-                Some((prev, existing)) => {
+            match ty {
+                Some(existing) => {
                     if let Some(span) = unify_span {
                         self.engine.unify_at(existing, substituted, span);
                     }
-                    if prev != i {
-                        return Err(FieldMismatch::PositionDiffers {
-                            variant: v.name,
-                            at: i,
-                            expected: prev,
-                        });
-                    }
                 }
-                None => found = Some((i, substituted)),
+                None => ty = Some(substituted),
             }
         }
-        found.ok_or(FieldMismatch::NoVariants)
+        let ty = ty.ok_or(FieldMismatch::NoVariants)?;
+        Ok(SharedField { ty, slots })
+    }
+
+    /// The end of a sentence naming a field some variant of `type_name` lacks.
+    fn missing_on(&self, variant: StrId, type_name: &str) -> String {
+        format!(
+            "is not present on every variant of '{type_name}' (missing on '{}')",
+            self.engine.str(variant)
+        )
     }
 
     /// Project `.field` out of a value. Because the runtime value's variant is
     /// not statically known, the field is only accessible if EVERY variant of
-    /// the receiver type carries a label of that name and at the same type.
+    /// the receiver type carries a label of that name and at the same type,
+    /// wherever in the variant it sits.
     ///
     /// Delegates the walk to [`Compiler::field_in_variants`], which lower also
     /// uses, so the typecheck-approved slot index and the emitted `TupleIndex`
@@ -4279,7 +4341,7 @@ impl Compiler {
 
         let field_id = self.engine.intern(field);
         let result_ty = match self.field_in_variants(info, &type_args, field_id, Some(field_span)) {
-            Ok((_, ty)) => ty,
+            Ok(field) => field.ty,
             // A variant list with no variants at all: nothing to project, and
             // the empty type was already diagnosed at its declaration.
             Err(FieldMismatch::NoVariants) => self.engine.fresh_var(),
@@ -4290,28 +4352,8 @@ impl Compiler {
                 );
             }
             Err(FieldMismatch::MissingOn(variant)) => {
-                let variant = self.engine.str(variant).to_string();
-                return self.field_access_bail(
-                    format!(
-                        "Field '{}' is not present on every variant of '{}' (missing on '{}')",
-                        field, type_name, variant
-                    ),
-                    field_span,
-                );
-            }
-            Err(FieldMismatch::PositionDiffers {
-                variant,
-                at,
-                expected,
-            }) => {
-                let variant = self.engine.str(variant).to_string();
-                return self.field_access_bail(
-                    format!(
-                        "Field '{}' is not at the same position in every variant of '{}' (position {} in '{}', expected {})",
-                        field, type_name, at, variant, expected
-                    ),
-                    field_span,
-                );
+                let why = self.missing_on(variant, &type_name);
+                return self.field_access_bail(format!("Field '{field}' {why}"), field_span);
             }
         };
         let qualified = format!("{}.{}", type_name, field);

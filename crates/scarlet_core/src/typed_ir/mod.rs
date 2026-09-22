@@ -23,7 +23,8 @@ pub(crate) mod zonk;
 
 pub use elaborate::WalkStep;
 pub(crate) use elaborate::{
-    ElabCtx, OrShape, PreludeTys, elaborate_body, elaborate_toplevel, elaborator_bug,
+    ElabCtx, FieldAt, OrShape, PreludeTys, VariantLayout, elaborate_body, elaborate_toplevel,
+    elaborator_bug,
 };
 pub(crate) use eta::FnTable;
 pub(crate) use resolve::Denotation;
@@ -300,15 +301,13 @@ pub enum TypedExpr {
         recv: Box<TypedExpr>,
         idx: u32,
     },
-    /// `recv.field`, with the field index the checker resolved.
-    ///
-    /// `checked` selects `GetField` over `GetFieldUnchecked`: only a projection
-    /// out of a `..base` spread has to verify the tag at runtime.
+    /// Field `idx` of `recv`, where every variant `recv` could be holds it.
+    /// A `.field` whose variants hold it in different slots is a
+    /// [`TypedExpr::Match`] instead, which reads each variant's own.
     Field {
         ty: RTy,
         recv: Box<TypedExpr>,
         idx: u32,
-        checked: bool,
     },
     /// `args` is exactly the variant's arity, in declared-field order. The
     /// elaborator has reordered labels and expanded `..base` spreads into
