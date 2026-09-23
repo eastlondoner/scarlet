@@ -89,7 +89,7 @@ jobs:
   mordant:
     runs-on: ubuntu-latest
     env:
-      MORDANT_REV: d0dca0026f0662a94e929a8a697d711be5eafd9b
+      MORDANT_REV: 52896c0cc7c1751bbe29672dbc1f007d7d52f3f3
       MORDANT_TOOLCHAIN: nightly-2026-09-01
     steps:
       - name: Checkout
