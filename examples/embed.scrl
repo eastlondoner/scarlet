@@ -1,0 +1,37 @@
+// A file can be part of the program. `@embed` reads it when the program is
+// compiled, so nothing has to ship beside it, and a missing file is a compile
+// error rather than a surprise at run time. The path is relative to this
+// file, wherever the program is run from.
+
+import scarlet/array
+import scarlet/binary
+import scarlet/result
+import scarlet/string
+
+// A `String` const takes the file's text, which must be UTF-8.
+@embed('embed/poem.txt')
+const poem String
+
+// A `Binary` const takes the file's bytes as they are: here, the eight every
+// PNG file starts with.
+@embed('embed/png_signature.bin')
+pub const png_signature Binary
+
+// A const is made once, so reading one in a function copies nothing.
+fn is_png(file Binary) Bool {
+	match binary.slice_bytes(file, 0, 8) {
+		Ok(start) -> start == png_signature
+		Err(Nil) -> False
+	}
+}
+
+pub fn main() {
+	lines = string.split(string.trim(poem), '\n')
+	println('${array.length(lines)} lines, ${string.length(poem)} characters')
+	println(string.trim(poem))
+
+	println(png_signature)
+	println(binary.slice_bytes(png_signature, 1, 3) |> result.then(binary.to_string))
+	println(is_png(png_signature))
+	println(is_png(binary.from_string(poem)))
+}

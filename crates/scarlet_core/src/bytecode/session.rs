@@ -248,6 +248,8 @@ impl Compiler {
         self.toplevel_decls.clear();
         self.toplevel_binds.clear();
         self.walking_module_statements = false;
+        // The entry's embedded files: the next entry records its own.
+        self.embedded_files.clear();
 
         self.undo_log.clear();
         self.scope_marks.clear();
@@ -474,26 +476,66 @@ impl IncrementalSession {
             .map(|(_, cm)| &cm.iface.path)
     }
 
-    /// Evict the cached module compiled from `path` and its dependents so the
-    /// next `check()` recompiles them. Called from LSP `didChangeWatchedFiles`
-    /// when a file changes on disk outside the editor.
+    /// Evict the cached module compiled from `path`, every cached module with
+    /// an `@embed` const that read `path`, and their dependents, so the next
+    /// `check()` recompiles them. Called from LSP `didChangeWatchedFiles` when
+    /// a file changes on disk outside the editor.
     pub fn invalidate_path(&mut self, path: &Path) {
         self.c.module_table.clear_overlay(path);
-        let key = self
+        let mut keys: Vec<module::ModuleKey> = self
             .c
             .module_table
             .user_modules()
-            .find(|(_, cm)| cm.source_path() == Some(path))
-            .map(|(k, _)| k.clone());
-        if let Some(k) = key
-            && let Some(w) = self.c.module_table.invalidate(&k)
-        {
-            let floor = self
-                .last_entry
-                .map_or(w, |le| le.earlier(w))
-                .later(self.seed);
-            self.last_entry = Some(floor);
+            .filter(|(_, cm)| cm.source_path() == Some(path))
+            .map(|(k, _)| k.clone())
+            .collect();
+        keys.extend(self.embedders_of(path));
+        for k in keys {
+            if let Some(w) = self.c.module_table.invalidate(&k) {
+                let floor = self
+                    .last_entry
+                    .map_or(w, |le| le.earlier(w))
+                    .later(self.seed);
+                self.last_entry = Some(floor);
+            }
         }
+    }
+
+    /// Evict only the cached modules that embedded `path`, and their
+    /// dependents: what a change to a file that is not a module means to a
+    /// session that did not compile it as one.
+    pub fn invalidate_embedded(&mut self, path: &Path) {
+        for k in self.embedders_of(path) {
+            if let Some(w) = self.c.module_table.invalidate(&k) {
+                let floor = self
+                    .last_entry
+                    .map_or(w, |le| le.earlier(w))
+                    .later(self.seed);
+                self.last_entry = Some(floor);
+            }
+        }
+    }
+
+    /// The cached modules that embedded `path`, compared by its resolved form
+    /// (the key an embed is recorded under), so an editor's `a/../b` finds `b`.
+    fn embedders_of(&self, path: &Path) -> Vec<module::ModuleKey> {
+        match module::lexical_absolute(path) {
+            Ok(p) => self.c.module_table.embedders_of(&p),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Every file an `@embed` const read in the last `check`: the entry's own
+    /// and those of every cached module. What an editor must watch, since a
+    /// change to one is a change to the program.
+    pub fn embedded_files(&self) -> std::collections::BTreeSet<PathBuf> {
+        self.c
+            .module_table
+            .user_modules()
+            .flat_map(|(_, cm)| cm.embeds())
+            .chain(&self.c.embedded_files)
+            .map(|f| f.path().to_path_buf())
+            .collect()
     }
 
     pub fn set_overlay(&mut self, path: PathBuf, text: String) {
@@ -630,6 +672,7 @@ impl IncrementalSession {
             // an import's slot.
             self.c.toplevel_binds.clear();
             self.c.toplevel_decls.clear();
+            self.c.embedded_files.clear();
             // Must precede the watermark capture below.
             self.c.bump_type_ids_past_reserved();
             let mut wm = self.c.watermark();

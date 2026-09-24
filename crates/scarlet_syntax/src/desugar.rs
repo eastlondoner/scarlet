@@ -121,7 +121,11 @@ fn desugar_node(node: &mut Node) {
 fn desugar_statement(s: &mut Statement) {
     match s {
         Statement::Declaration { decl, .. } => match decl.as_mut() {
-            Declaration::Const(c) => desugar_expr(&mut c.init),
+            Declaration::Const(c) => {
+                if let ConstInit::Expr(e) = &mut c.init {
+                    desugar_expr(e)
+                }
+            }
             Declaration::Function(f) => {
                 if let FnBody::Block(e) = &mut f.body {
                     desugar_expr(e)

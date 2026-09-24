@@ -262,6 +262,10 @@
         {
           "type": "identifier",
           "named": true
+        },
+        {
+          "type": "string",
+          "named": true
         }
       ]
     }
@@ -1171,7 +1175,7 @@
       },
       "value": {
         "multiple": false,
-        "required": true,
+        "required": false,
         "types": [
           {
             "type": "array_expression",
@@ -1253,9 +1257,13 @@
       }
     },
     "children": {
-      "multiple": false,
+      "multiple": true,
       "required": false,
       "types": [
+        {
+          "type": "attribute",
+          "named": true
+        },
         {
           "type": "visibility_modifier",
           "named": true

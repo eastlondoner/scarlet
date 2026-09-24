@@ -1,5 +1,6 @@
 //! LSP wire helpers: JSON shaping, URI/path translation, protocol constants.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value as Json, json};
@@ -32,6 +33,26 @@ pub(super) fn uri_to_path(uri: &str) -> Option<PathBuf> {
         .decode_utf8()
         .ok()?;
     Some(PathBuf::from(&*decoded))
+}
+
+/// One `FileSystemWatcher` per embedded file. A client that takes a
+/// `RelativePattern` gets the file's name under its directory, which needs no
+/// glob syntax for the directory's own characters; any other gets the
+/// absolute path as its glob.
+pub(super) fn embed_watchers(paths: &BTreeSet<PathBuf>, relative: bool) -> Json {
+    paths
+        .iter()
+        .filter_map(|p| {
+            let pattern = if relative {
+                let dir = p.parent()?;
+                let name = p.file_name()?.to_string_lossy();
+                json!({ "baseUri": reference::path_to_uri(dir), "pattern": name })
+            } else {
+                json!(p.to_string_lossy())
+            };
+            Some(json!({ "globPattern": pattern }))
+        })
+        .collect()
 }
 
 /// Decode an LSP `WorkspaceFolder[]` into filesystem paths, skipping malformed
@@ -279,7 +300,31 @@ pub(super) fn clean_doc_comment(doc: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{clean_doc_comment, qualifier_before};
+    use super::{clean_doc_comment, embed_watchers, qualifier_before};
+
+    #[test]
+    fn an_embedded_file_is_watched_by_its_own_path() {
+        let paths = [
+            std::path::PathBuf::from("/proj/shaders/world.metal"),
+            std::path::PathBuf::from("/proj/lib.metallib"),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            embed_watchers(&paths, false),
+            serde_json::json!([
+                { "globPattern": "/proj/lib.metallib" },
+                { "globPattern": "/proj/shaders/world.metal" },
+            ])
+        );
+        assert_eq!(
+            embed_watchers(&paths, true),
+            serde_json::json!([
+                { "globPattern": { "baseUri": "file:///proj", "pattern": "lib.metallib" } },
+                { "globPattern": { "baseUri": "file:///proj/shaders", "pattern": "world.metal" } },
+            ])
+        );
+    }
 
     #[test]
     fn qualifier_found_right_after_the_dot() {

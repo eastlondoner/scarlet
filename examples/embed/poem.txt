@@ -1,0 +1,4 @@
+Roses are red,
+this file is too:
+it was read by the compiler
+and compiled into you.

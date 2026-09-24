@@ -80,11 +80,13 @@ module.exports = grammar({
 
     // Declarations -----------------------------------------------------------
 
+    // Arguments are identifiers (`@vm(add)`) or plain strings
+    // (`@embed('world.metal')`); the compiler refuses an interpolated one.
     attribute: ($) =>
       seq(
         '@',
         field('name', $.identifier),
-        optional(seq(token.immediate('('), commaSep($.identifier), ')')),
+        optional(seq(token.immediate('('), commaSep(choice($.identifier, $.string)), ')')),
       ),
 
     import_declaration: ($) =>
@@ -156,14 +158,15 @@ module.exports = grammar({
       seq(field('name', $.identifier), field('type', $._type)),
 
     const_declaration: ($) =>
-      seq(
+      prec.right(seq(
+        repeat($.attribute),
         optional($.visibility_modifier),
         kw('const'),
         field('name', choice($.identifier, $.type_identifier)),
         optional(field('type', $._type)),
-        '=',
-        field('value', $._expression),
-      ),
+        // Absent on an `@embed(...)` const, whose value is the file.
+        optional(seq('=', field('value', $._expression))),
+      )),
 
     // Types ------------------------------------------------------------------
 

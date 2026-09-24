@@ -87,32 +87,57 @@ impl std::fmt::Display for ModuleKey {
 /// Errs with [`ResolveError::UnresolvablePath`] when `p` has no absolute
 /// form; falling back to the path as given would mint a relative identity.
 pub fn file_module_path(p: &Path) -> Result<ModulePath, ResolveError> {
-    // Lexically normalised, deliberately not `canonicalize()`, which resolves
-    // symlinks. On macOS a temp dir is `/var/...` but canonically
-    // `/private/var/...`, which made the LSP hand the editor two different
-    // URIs for one project. Identity must match the path the editor uses.
-    let abs =
-        std::path::absolute(p).map_err(|_| ResolveError::UnresolvablePath(p.to_path_buf()))?;
+    let abs = lexical_absolute(p)?;
     let mut out: Vec<String> = Vec::new();
     for c in abs.components() {
         match c {
             std::path::Component::RootDir => out.push(String::new()),
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                if out.len() > 1 {
-                    out.pop();
-                }
-            }
             std::path::Component::Normal(seg) => out.push(seg.to_string_lossy().into_owned()),
             std::path::Component::Prefix(pre) => {
                 out.push(pre.as_os_str().to_string_lossy().into_owned());
             }
+            // `lexical_absolute` leaves none of these.
+            std::path::Component::CurDir | std::path::Component::ParentDir => {}
         }
     }
     if let Some(last) = out.last_mut()
         && let Some(stem) = last.strip_suffix(".scrl")
     {
         *last = stem.to_string();
+    }
+    Ok(out)
+}
+
+/// `p` made absolute and normalised as text: `.` dropped, `..` taking the
+/// previous segment off (never the root). The identity of a file on disk, for
+/// a module ([`file_module_path`]) and for a file an `@embed` names.
+///
+/// Lexically normalised, deliberately not `canonicalize()`, which resolves
+/// symlinks. On macOS a temp dir is `/var/...` but canonically
+/// `/private/var/...`, which made the LSP hand the editor two different URIs
+/// for one project. Identity must match the path the editor uses.
+///
+/// Errs with [`ResolveError::UnresolvablePath`] when `p` has no absolute form;
+/// falling back to the path as given would mint a relative identity.
+pub fn lexical_absolute(p: &Path) -> Result<PathBuf, ResolveError> {
+    let abs =
+        std::path::absolute(p).map_err(|_| ResolveError::UnresolvablePath(p.to_path_buf()))?;
+    let mut out = PathBuf::new();
+    for c in abs.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if matches!(
+                    out.components().next_back(),
+                    Some(std::path::Component::Normal(_))
+                ) {
+                    out.pop();
+                }
+            }
+            std::path::Component::RootDir
+            | std::path::Component::Prefix(_)
+            | std::path::Component::Normal(_) => out.push(c),
+        }
     }
     Ok(out)
 }

@@ -3,7 +3,7 @@
 //! Answers position queries and computes diagnostics but never touches stdio;
 //! the transport layer in `mod.rs` does that.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde_json::Value as Json;
@@ -58,6 +58,10 @@ pub struct Workspace {
     /// for the transport layer to publish. Without them an importer's Problems
     /// panel goes stale after an in-memory edit to one of its imports.
     pending_diagnostics: Vec<(String, Vec<Json>)>,
+    /// The files `@embed` consts read, by the document whose analysis read
+    /// them (its own and its imports'). Kept per document because a session
+    /// forgets an entry's embeds when it analyses the next one.
+    embeds: HashMap<String, BTreeSet<PathBuf>>,
 }
 
 impl Workspace {
@@ -70,6 +74,7 @@ impl Workspace {
             entry_uri: None,
             open: HashSet::new(),
             pending_diagnostics: Vec::new(),
+            embeds: HashMap::new(),
         }
     }
 
@@ -99,6 +104,7 @@ impl Workspace {
             self.analyze_document(uri, &text);
         } else {
             self.documents.remove(uri);
+            self.embeds.remove(uri);
             if let Some(p) = &path
                 && let Some(r) = self.roots.get_mut(&owning_root(&self.workspace_roots, p).0)
             {
@@ -131,9 +137,21 @@ impl Workspace {
                 r.xrefs.refresh(uri, Vec::new());
             }
         }
+        // An embedded file can sit outside the root of the module that
+        // embeds it (`@embed('../../assets/x')`), so every session is asked.
+        for r in self.roots.values_mut() {
+            r.session.invalidate_embedded(&path);
+        }
         if ty == WatchedChange::Deleted {
             self.documents.remove(uri);
+            self.embeds.remove(uri);
         }
+    }
+
+    /// Every file an `@embed` const read in the documents analysed so far: what
+    /// the client must watch, since a change to one changes a program.
+    pub fn embedded_files(&self) -> BTreeSet<PathBuf> {
+        self.embeds.values().flatten().cloned().collect()
     }
 
     /// Re-analyse every client-open document and return its fresh diagnostics.
@@ -335,6 +353,12 @@ impl Workspace {
             Some(m) => session.check_as(&ast_expr, base_dir, m.clone()),
             None => session.check(&ast_expr, base_dir),
         };
+        let embedded = session.embedded_files();
+        if embedded.is_empty() {
+            self.embeds.remove(uri);
+        } else {
+            self.embeds.insert(uri.to_string(), embedded);
+        }
 
         // Type / unused diagnostics only for a buffer that fully parsed: a
         // partial AST yields noise for the region still being typed.

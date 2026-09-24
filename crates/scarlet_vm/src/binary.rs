@@ -37,6 +37,10 @@ pub(crate) struct Bits {
 /// and the word holding its length.
 pub(crate) const MAX_BYTES: usize = (crate::heap::MAX_CELL_WORDS - 2) * 8;
 
+// The compiler refuses an `@embed` past this limit, so a constant it accepts
+// always fits a cell.
+const _: () = assert!(MAX_BYTES == scarlet_ir::core_ir::MAX_CONST_BYTES);
+
 /// The bits `cell` holds, or `None` when it is not a binary.
 pub(crate) fn bits(heap: &Heap, cell: Cell) -> Option<Bits> {
     let d = heap.data(cell);

@@ -60,6 +60,22 @@ impl ElabCtx for Compiler {
     fn binary_const(&mut self, bytes: Vec<u8>, bit_len: u64) -> crate::core_ir::ConstId {
         self.const_binary(bytes, bit_len)
     }
+    fn embedded(&mut self, slot: GlobalSlot) -> Option<(Ty, crate::core_ir::ConstId)> {
+        let decl = self.toplevel_decls.iter().find(|d| d.slot == slot)?;
+        // Copied, not taken: the record stays whole however often it is read.
+        let (value, ty_of): (Const, fn(&mut Compiler) -> Ty) = match decl.embed.as_ref()? {
+            Embedded::String(text) => (Const::String(text.clone()), Compiler::ty_string),
+            Embedded::Binary(bytes) => (
+                Const::Binary {
+                    bytes: bytes.clone(),
+                    bit_len: bytes.len() as u64 * 8,
+                },
+                Compiler::ty_binary,
+            ),
+        };
+        let ty = ty_of(self);
+        Some((ty, self.add_constant(value)))
+    }
     fn resolve_name(&mut self, name: &str) -> Option<(Ty, Denotation)> {
         let scheme = self.env.lookup(name)?;
         let kind = scheme.kind;

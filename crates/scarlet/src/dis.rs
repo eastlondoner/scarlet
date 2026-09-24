@@ -7,8 +7,9 @@
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
-use crate::core_ir::{CoreExpr, Program};
+use crate::core_ir::{Const, ConstId, CoreExpr, Program};
 use crate::module::ModuleKey;
+use crate::tivec::Idx as _;
 
 /// Which functions a listing shows.
 #[derive(Clone, Copy)]
@@ -23,7 +24,8 @@ pub enum Filter<'a> {
 ///
 /// Each function is preceded by its `fn#N`, the number a `call fn#N` or
 /// `closure fn#N` elsewhere in the listing refers to. The listing ends with
-/// the names of the constructors it shows, so `ctor 512.0(%1)` can be read.
+/// the values of the constants it loads, so `c3` can be read, and the names
+/// of the constructors it shows, so `ctor 512.0(%1)` can be.
 pub fn listing(program: &Program, filter: Filter<'_>) -> Option<String> {
     let entry = ModuleKey::main();
     let mut out = summary(program, &entry);
@@ -45,8 +47,68 @@ pub fn listing(program: &Program, filter: Filter<'_>) -> Option<String> {
     if shown.is_empty() {
         return None;
     }
+    consts(program, &shown, &mut out);
     types(program, &shown, &mut out);
     Some(out)
+}
+
+/// How much of a long `String` or `Binary` constant a listing shows. An
+/// `@embed` const is a whole file, and a listing is not the place to read one.
+const SHOWN_CHARS: usize = 48;
+const SHOWN_BYTES: usize = 16;
+
+/// One comment line per constant `bodies` load: `; c3 'hello'`. A long
+/// string or binary is cut short, with its whole length.
+fn consts(program: &Program, bodies: &[&CoreExpr], out: &mut String) {
+    let mut ids = BTreeSet::new();
+    for body in bodies {
+        body.for_each_const(|c: ConstId| {
+            ids.insert(c);
+        });
+    }
+    if ids.is_empty() {
+        return;
+    }
+    out.push_str("\n; consts\n");
+    for id in ids {
+        let _ = write!(out, "; {id} ");
+        match program.consts.get(id.index()) {
+            Some(Const::Int(n)) => {
+                let _ = writeln!(out, "{n}");
+            }
+            Some(Const::Float(x)) => {
+                let _ = writeln!(out, "{x:?}");
+            }
+            Some(Const::String(text)) => {
+                let shown: String = text.chars().take(SHOWN_CHARS).collect();
+                let _ = write!(out, "'{}'", shown.escape_debug());
+                if shown.len() < text.len() {
+                    let _ = write!(out, "... ({} bytes)", text.len());
+                }
+                out.push('\n');
+            }
+            Some(Const::Binary { bytes, bit_len }) => {
+                let shown: Vec<String> = bytes
+                    .iter()
+                    .take(SHOWN_BYTES)
+                    .map(|b| b.to_string())
+                    .collect();
+                let more = if bytes.len() > SHOWN_BYTES {
+                    ", ..."
+                } else {
+                    ""
+                };
+                let _ = write!(out, "<<{}{more}>>", shown.join(", "));
+                if bytes.len() > SHOWN_BYTES || bit_len % 8 != 0 {
+                    let _ = write!(out, " ({bit_len} bits)");
+                }
+                out.push('\n');
+            }
+            None => {
+                let _ = writeln!(out, "is not in the program");
+            }
+        }
+    }
 }
 
 /// One comment line per type a constructor in `bodies` belongs to:
@@ -126,6 +188,22 @@ mod tests {
             !text.contains("fn scarlet."),
             "listed a stdlib function:\n{text}"
         );
+    }
+
+    /// A listing names each constant it loads, and cuts a long one short: an
+    /// `@embed` const is a whole file.
+    #[test]
+    fn a_listing_shows_its_constants_and_cuts_long_ones_short() {
+        let long = "x".repeat(200);
+        let src = format!(
+            "pub fn main() {{\n\tprintln('hi')\n\tprintln('{long}')\n\tprintln(<<1, 2>>)\n}}\n"
+        );
+        let text = listing(&program(&src), Filter::Entry).expect("main exists");
+        assert!(text.contains("\n; consts\n"), "{text}");
+        assert!(text.contains(" 'hi'\n"), "{text}");
+        let cut = format!(" '{}'... (200 bytes)\n", "x".repeat(48));
+        assert!(text.contains(&cut), "{text}");
+        assert!(!text.contains(&"x".repeat(49)), "{text}");
     }
 
     #[test]

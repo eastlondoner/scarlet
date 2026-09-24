@@ -380,7 +380,14 @@ impl Formatter {
             parts.push(text("@"));
             parts.push(text(a.name.name.clone()));
             if !a.args.is_empty() {
-                let args: Vec<Doc> = a.args.iter().map(|id| text(id.name.clone())).collect();
+                let args: Vec<Doc> = a
+                    .args
+                    .iter()
+                    .map(|arg| match arg {
+                        ast::AttrArg::Ident(id) => text(id.name.clone()),
+                        ast::AttrArg::Str(s) => text(quoted(&s.value)),
+                    })
+                    .collect();
                 parts.push(delimited("(", args, ")"));
             }
             parts.push(hardline());
@@ -392,7 +399,7 @@ impl Formatter {
         let attrs = match dcl {
             ast::Declaration::Function(f) => self.attributes(&f.attributes),
             ast::Declaration::Type(t) => self.attributes(&t.attributes),
-            ast::Declaration::Const(_) => nil(),
+            ast::Declaration::Const(c) => self.attributes(&c.attributes),
         };
         let prefix = if is_public { text("pub ") } else { nil() };
         let body = match dcl {
@@ -401,13 +408,12 @@ impl Formatter {
                     Some(t) => d![text(" "), self.type_(t)],
                     None => nil(),
                 };
-                d![
-                    text("const "),
-                    text(s.identifier.name.clone()),
-                    ty,
-                    text(" = "),
-                    self.expr(&s.init)
-                ]
+                let init = match &s.init {
+                    ast::ConstInit::Expr(e) => d![text(" = "), self.expr(e)],
+                    // The value is the file; the attribute above names it.
+                    ast::ConstInit::Embed(_) => nil(),
+                };
+                d![text("const "), text(s.identifier.name.clone()), ty, init]
             }
             ast::Declaration::Function(func) => self.fn_decl(func),
             ast::Declaration::Type(s) => self.type_decl(s),
@@ -1398,6 +1404,12 @@ mod tests {
             ("vm_attribute_on_own_line",
              "@vm(tcp_listen) pub fn listen(p Int) Result(Server, String)\n",
              "@vm(tcp_listen)\npub fn listen(p Int) Result(Server, String)\n"),
+            ("embed_const_keeps_its_attribute_and_no_initializer",
+             "@embed(\"shaders/world.metal\") pub const world String\n",
+             "@embed('shaders/world.metal')\npub const world String\n"),
+            ("embed_binary_const_with_doc",
+             "/// The compiled library.\n@embed('world.metallib')\nconst lib Binary\n",
+             "/// The compiled library.\n@embed('world.metallib')\nconst lib Binary\n"),
             ("external_type_body_less",
              "pub type Socket\n",
              "pub type Socket\n"),
