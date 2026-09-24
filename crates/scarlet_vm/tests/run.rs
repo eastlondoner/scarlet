@@ -954,6 +954,75 @@ fn floats_are_never_nan_or_infinite() {
     );
 }
 
+/// `scarlet/float`'s maths: a `Result` exactly where there is no real
+/// answer, and IEEE's answer everywhere else, with no NaN or infinity.
+#[test]
+fn float_maths_follows_the_rule() {
+    prints(
+        "import scarlet/float\n\
+         fn big(x Float, n Int) Float { if n == 0 { x } else { big(x * 10.0, n - 1) } }\n\
+         fn root(f Float) String {\n\
+         \tmatch float.sqrt(f) {\n\
+         \t\tOk(r) -> 'ok ${r}'\n\
+         \t\tErr(Nil) -> 'err'\n\
+         \t}\n\
+         }\n\
+         pub fn main() {\n\
+         \tprintln(root(4.0))\n\
+         \tprintln(root(-0.0))\n\
+         \tprintln(root(-1.0))\n\
+         \tprintln(root(big(-1.0, 400)))\n\
+         \tprintln(root(1.0 / big(-1.0, 300)))\n\
+         \tprintln(root(big(1.0, 400)) == 'ok 13407807929942596000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000.0')\n\
+         \tprintln(float.sin(0.0))\n\
+         \tprintln(float.sin(-0.0))\n\
+         \tprintln(float.cos(-0.0))\n\
+         \tprintln(float.tan(-0.0))\n\
+         \tprintln(float.tan(float.pi / 2.0))\n\
+         \tprintln(float.sin(big(1.0, 400)))\n\
+         \tprintln(float.atan2(-0.0, -0.0))\n\
+         \tprintln(float.atan2(0.0, -1.0) == float.pi)\n\
+         \tprintln(float.atan2(big(1.0, 400), big(1.0, 400)) == float.pi / 4.0)\n\
+         \tprintln(float.clamp(2.0, 0.0, 1.0))\n\
+         \tprintln(float.clamp(-2.0, 0.0, 1.0))\n\
+         \tprintln(float.clamp(0.5, 1.0, 0.0))\n\
+         }\n",
+        "ok 2.0\nok -0.0\nerr\nerr\nerr\nTrue\n0.0\n-0.0\n1.0\n-0.0\n\
+         16331239353195370.0\n0.004961954789184062\n0.0\nTrue\nTrue\n1.0\n0.0\n0.0\n",
+    );
+}
+
+/// The trigonometry makes no cells: a Float lives in the value word. `sqrt`
+/// makes one, its `Result`, whether `Ok` or `Err(Nil)`.
+#[test]
+fn float_maths_makes_only_the_cells_it_returns() {
+    prints(
+        "import scarlet/float\n\
+         import scarlet/internal\n\
+         pub fn main() {\n\
+         \tx = 0.5\n\
+         \tmade = internal.cells_made()\n\
+         \ts = float.sin(x)\n\
+         \tc = float.cos(x)\n\
+         \tt = float.tan(x)\n\
+         \ta = float.atan2(x, x)\n\
+         \ttrig = internal.cells_made() - made\n\
+         \tmade = internal.cells_made()\n\
+         \tok = float.sqrt(x)\n\
+         \troot = internal.cells_made() - made\n\
+         \tmade = internal.cells_made()\n\
+         \terr = float.sqrt(-x)\n\
+         \tfailed = internal.cells_made() - made\n\
+         \tprintln(trig)\n\
+         \tprintln(root)\n\
+         \tprintln(failed)\n\
+         \tprintln(s + c + t + a > 0.0)\n\
+         \tprintln('${ok} ${err}')\n\
+         }\n",
+        "0\n1\n1\nTrue\nOk(0.7071067811865476) Err(Nil)\n",
+    );
+}
+
 /// Binaries: literals of every segment kind, shown as the old VM showed
 /// them, taken apart by patterns, and the core of `scarlet/binary`.
 #[test]

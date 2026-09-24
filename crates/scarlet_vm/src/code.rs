@@ -1229,6 +1229,10 @@ fn built(i: Intrinsic, argc: usize) -> bool {
         | Intrinsic::FloatTruncate
         | Intrinsic::FloatFromInt
         | Intrinsic::FloatToString
+        | Intrinsic::FloatSin
+        | Intrinsic::FloatCos
+        | Intrinsic::FloatTan
+        | Intrinsic::FloatSqrt
         | Intrinsic::BinaryFromString
         | Intrinsic::BinaryToString
         | Intrinsic::BinaryBitSize
@@ -1240,6 +1244,7 @@ fn built(i: Intrinsic, argc: usize) -> bool {
         | Intrinsic::IntBitwiseNot => 1,
         Intrinsic::StringSplit
         | Intrinsic::FloatFromDecimal
+        | Intrinsic::FloatAtan2
         | Intrinsic::StringContains
         | Intrinsic::IntBitwiseAnd
         | Intrinsic::IntBitwiseOr

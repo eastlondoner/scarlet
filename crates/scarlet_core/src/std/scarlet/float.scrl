@@ -20,6 +20,37 @@ pub fn from_int(n Int) Float
 @vm(float__to_string)
 pub fn to_string(f Float) String
 
+// Radians.
+pub const pi = 3.141592653589793
+
+@vm(float__sin)
+pub fn sin(f Float) Float
+
+@vm(float__cos)
+pub fn cos(f Float) Float
+
+// Finite for every Float: no Float is exactly on a pole, since pi / 2.0 is
+// not a Float.
+@vm(float__tan)
+pub fn tan(f Float) Float
+
+// The angle of the point `(x, y)` from the positive x axis, in radians from
+// -pi to pi. The origin has no angle, so `atan2(0.0, 0.0)` is `0.0`.
+@vm(float__atan2)
+pub fn atan2(y Float, x Float) Float
+
+@vm(float__sqrt)
+fn sqrt_raw(f Float) Float
+
+// `Err(Nil)` for a negative `f`, which has no real square root.
+pub fn sqrt(f Float) Result(Float, Nil) {
+	if f < 0.0 {
+		Err(Nil)
+	} else {
+		Ok(sqrt_raw(f))
+	}
+}
+
 pub fn max(a Float, b Float) Float {
 	if a > b { a } else { b }
 }
@@ -35,4 +66,9 @@ pub fn abs(f Float) Float {
 	} else {
 		f
 	}
+}
+
+// When `lo > hi`, `hi` wins.
+pub fn clamp(f Float, lo Float, hi Float) Float {
+	min(max(f, lo), hi)
 }
