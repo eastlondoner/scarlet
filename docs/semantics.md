@@ -54,9 +54,10 @@ Erlang crashes in these cases, and Scarlet gives a harmless value instead.
 
 **Built:** there is no implicit conversion between Int and Float, so `1 + 1.5` is a type error.
 
+**Built: a maths function returns `Result(Float, Nil)` exactly where it has no real answer.** That is where IEEE 754 would signal "invalid" (a NaN) or "divide by zero" (an exact infinity from a finite input), so `float.sqrt(-1.0)` is `Err(Nil)`. This is the rule above that a stdlib function never makes up a value to hide a failure; the operators are the exception, since `/` and `%` cannot return a `Result`, as `int.divide` beside `/` shows. An answer too large stops at the largest float, as `*` does. Everywhere else the answer is IEEE's: `sqrt(-0.0)` is `Ok(-0.0)`, and `sin`, `cos`, `tan` and `atan2` return a plain `Float`, since every Float has an answer. The one place IEEE's answer shows a zero's sign that Scarlet does not otherwise show is the origin, so `atan2(y, x)` is `0.0` whenever `x == 0.0 && y == 0.0`. The transcendental functions use one implementation, a port of musl's, so every machine prints the same digits.
+
 **Open:**
 
-- What `sqrt(-1.0)` returns, once maths functions exist.
 - A float literal too large to represent is the largest float today, by the rule above. It could become a compile error instead, as an oversized Int literal already is.
 
 ## Arrays

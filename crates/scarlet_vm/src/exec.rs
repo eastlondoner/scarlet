@@ -1354,6 +1354,14 @@ impl<'c, 'h, 'o> Machine<'c, 'h, 'o> {
                     .map_err(|_| Stop::BadProgram(format!("`{text}` is not a float")))?;
                 Ok(Value::float(f))
             }
+            Intrinsic::FloatSin => Ok(float::Maths1::Sin.apply(self.float_of(v)?)),
+            Intrinsic::FloatCos => Ok(float::Maths1::Cos.apply(self.float_of(v)?)),
+            Intrinsic::FloatTan => Ok(float::Maths1::Tan.apply(self.float_of(v)?)),
+            Intrinsic::FloatSqrt => Ok(float::Maths1::Sqrt.apply(self.float_of(v)?)),
+            Intrinsic::FloatAtan2 => {
+                let (y, x) = (self.float_of(v)?, self.float_of(arg(self, 1))?);
+                Ok(float::Maths2::Atan2.apply(y, x))
+            }
             Intrinsic::FloatToString => {
                 let text = float::text(self.float_of(v)?);
                 Ok(Value::cell(

@@ -114,6 +114,49 @@ pub fn main() {
 	println('float.to_string: ${float.to_string(1.0)} ${float.to_string(0.25)}')
 	println('from_int: ${float.from_int(3)} ${float.from_int(-3)}')
 
+	// --- Float: maths -----------------------------------------------------------
+
+	// A maths function returns a Result exactly where it has no real answer.
+	// A negative has no real square root, however small or large; -0.0 does.
+	println('sqrt: ${float.sqrt(4.0)} ${float.sqrt(0.0)} ${float.sqrt(-0.0)}')
+	println(
+		'sqrt err: ${float.sqrt(
+			-1.0,
+		)} ${float.sqrt(
+			-0.5 / big / big,
+		)} ${float.sqrt(-big * big * big * big * big * big * big * big)}',
+	)
+	println('sqrt or: ${float.sqrt(3.0 * 3.0 + 4.0 * 4.0) or 0.0} ${float.sqrt(-4.0) or 0.0}')
+
+	// Signed zeros go through sin and tan as IEEE has them.
+	println('sin: ${float.sin(0.0)} ${float.sin(-0.0)}')
+	println('cos: ${float.cos(0.0)} ${float.cos(-0.0)}')
+	println('tan: ${float.tan(0.0)} ${float.tan(-0.0)}')
+
+	// The origin has no angle: every sign of each zero is 0.0.
+	println(
+		'atan2 origin: ${float.atan2(
+			0.0,
+			0.0,
+		)} ${float.atan2(0.0, -0.0)} ${float.atan2(-0.0, 0.0)} ${float.atan2(-0.0, -0.0)}',
+	)
+	println(
+		'atan2 pi: ${float.atan2(0.0, -1.0) == float.pi} ${float.atan2(1.0, 0.0) == float.pi / 2.0}',
+	)
+
+	// Past either bound the bound; when lo > hi, hi wins.
+	println(
+		'clamp: ${float.clamp(
+			2.5,
+			0.0,
+			1.0,
+		)} ${float.clamp(
+			-2.5,
+			0.0,
+			1.0,
+		)} ${float.clamp(0.25, 0.0, 1.0)} ${float.clamp(0.25, 1.0, 0.0)}',
+	)
+
 	println('to_string: ${int.to_string(0)} ${int.to_string(-42)} ${int.to_string(int.min_value)}')
 	println('parse: ${string.inspect(parse_int('42'))} ${string.inspect(parse_int('0'))}')
 	signed = string.inspect(parse_int('-42'))
