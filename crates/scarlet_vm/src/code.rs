@@ -1232,7 +1232,9 @@ fn built(i: Intrinsic, argc: usize) -> bool {
         | Intrinsic::BinaryFromString
         | Intrinsic::BinaryToString
         | Intrinsic::BinaryBitSize
-        | Intrinsic::BinaryByteSize => 1,
+        | Intrinsic::BinaryByteSize
+        | Intrinsic::BinaryConcat
+        | Intrinsic::BinaryFromBytes => 1,
         Intrinsic::BinaryToAsciiLower
         | Intrinsic::StringTrim
         | Intrinsic::StringToGraphemes
@@ -1250,7 +1252,10 @@ fn built(i: Intrinsic, argc: usize) -> bool {
         | Intrinsic::BinaryByteAt
         | Intrinsic::BinaryParseInt
         | Intrinsic::BinaryEqIgnoreAsciiCase
-        | Intrinsic::BinaryFromIntAscii => 2,
+        | Intrinsic::BinaryFromIntAscii
+        | Intrinsic::BinaryRepeat
+        | Intrinsic::BinaryFromFloats32
+        | Intrinsic::BinaryToFloats32 => 2,
         Intrinsic::BinarySliceBits | Intrinsic::BinaryIndexOf => 3,
         _ => return false,
     };

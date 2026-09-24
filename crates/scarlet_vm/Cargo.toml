@@ -26,6 +26,9 @@ simd-json = { version = "0.17", default-features = false, features = ["runtime-d
 memchr = "2"
 # `scarlet/http/h1`'s head parser: `hyper`'s, SIMD and allocation-free.
 httparse = "1"
+# A binary's words read as its bytes, in place, with no `unsafe` of our own:
+# what a file write or a Metal buffer copies from (`binary.rs`).
+bytemuck = "1"
 
 [dev-dependencies]
 # Tests write their programs in Scarlet and compile them. Only the tests see

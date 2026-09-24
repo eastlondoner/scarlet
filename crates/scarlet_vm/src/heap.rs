@@ -134,6 +134,10 @@ pub(crate) struct Heap {
     /// The cells a [`Heap::release`] still has to give a reference up for.
     /// Kept between calls so a release does not allocate.
     dying: Vec<Cell>,
+    /// Bytes [`Heap::copy_bytes`] has moved from one cell to another, so a
+    /// test can pin how an operation copies.
+    #[cfg(test)]
+    copied: usize,
 }
 
 impl Heap {
@@ -449,6 +453,24 @@ impl Heap {
         }
     }
 
+    /// A new cell of `kind` with `words` words after its header, for the
+    /// caller to fill through [`Self::data_mut`]. What they hold before then
+    /// is whatever the cell last held.
+    pub(crate) fn make_uninit(&mut self, kind: Kind, words: usize) -> Result<Cell, Full> {
+        self.alloc(kind, words)
+    }
+
+    /// The words of `cell` after its header, to write. Empty for a cell the
+    /// heap does not have.
+    pub(crate) fn data_mut(&mut self, cell: Cell) -> &mut [u64] {
+        let n = size(self.word(cell, 0)).saturating_sub(1);
+        let start = cell.word as usize + 1;
+        match self.chunks.get_mut(cell.chunk as usize) {
+            Some(Some(c)) => c.words.get_mut(start..start + n).unwrap_or(&mut []),
+            _ => &mut [],
+        }
+    }
+
     /// A new tuple cell holding `elements`. Each element's reference passes
     /// to the cell.
     pub(crate) fn tuple(&mut self, elements: &[Value]) -> Result<Cell, Full> {
@@ -499,6 +521,74 @@ impl Heap {
 
     pub(crate) fn reused(&self) -> usize {
         self.reused
+    }
+
+    #[cfg(test)]
+    pub(crate) fn copied(&self) -> usize {
+        self.copied
+    }
+
+    /// Copy `n` bytes of `src`'s words, from byte `from`, into `dst`'s words
+    /// from byte `to`, each counted from the first word after the header and
+    /// read in the words' order in memory, straight from one cell to the
+    /// other. `false`, copying nothing, when either range runs past its cell
+    /// or `src` is `dst`.
+    ///
+    /// Memory order is the order of a binary's bytes only on a little-endian
+    /// host (`binary::BYTES_IN_PLACE`), so only a caller that checks that
+    /// reads it as bytes.
+    pub(crate) fn copy_bytes(
+        &mut self,
+        src: Cell,
+        from: usize,
+        dst: Cell,
+        to: usize,
+        n: usize,
+    ) -> bool {
+        let span = |heap: &Self, cell: Cell, at: usize| {
+            let room = size(heap.word(cell, 0)).saturating_sub(1) * 8;
+            let end = at.checked_add(n).filter(|&end| end <= room)?;
+            let base = (cell.word as usize + 1) * 8;
+            Some(base + at..base + end)
+        };
+        let (Some(s), Some(d)) = (span(self, src, from), span(self, dst, to)) else {
+            return false;
+        };
+        if src == dst {
+            return false;
+        }
+        if src.chunk == dst.chunk {
+            let Some(Some(c)) = self.chunks.get_mut(src.chunk as usize) else {
+                return false;
+            };
+            let bytes: &mut [u8] = bytemuck::cast_slice_mut(&mut c.words[..]);
+            // Two live cells never overlap, so this is a copy, not a move.
+            bytes.copy_within(s, d.start);
+            #[cfg(test)]
+            {
+                self.copied += n;
+            }
+            return true;
+        }
+        let Ok([Some(a), Some(b)]) = self
+            .chunks
+            .get_disjoint_mut([src.chunk as usize, dst.chunk as usize])
+        else {
+            return false;
+        };
+        let from: &[u8] = bytemuck::cast_slice(&a.words[..]);
+        let into: &mut [u8] = bytemuck::cast_slice_mut(&mut b.words[..]);
+        match (from.get(s), into.get_mut(d)) {
+            (Some(from), Some(into)) => {
+                into.copy_from_slice(from);
+                #[cfg(test)]
+                {
+                    self.copied += n;
+                }
+                true
+            }
+            _ => false,
+        }
     }
 
     fn word(&self, cell: Cell, i: usize) -> u64 {
@@ -732,6 +822,33 @@ mod tests {
         assert_eq!(heap.live(), 2);
         heap.release(cell);
         assert_eq!(heap.live(), 0);
+    }
+
+    /// A copy between two cells, in one chunk or two, moves exactly the
+    /// bytes asked for; one that runs past either cell, or from a cell into
+    /// itself, copies nothing. The words are written as numbers, so the bytes
+    /// they hold in memory are a little-endian host's.
+    #[cfg(target_endian = "little")]
+    #[test]
+    fn copy_bytes_copies_inside_both_cells_or_not_at_all() {
+        let mut heap = Heap::default();
+        let src = heap
+            .make(Kind::Binary, &[0x0807_0605_0403_0201])
+            .expect("room");
+        let dst = heap.make(Kind::Binary, &[0]).expect("room");
+        let big = heap.make(Kind::Binary, &vec![0; 4096]).expect("room");
+        assert_ne!(src.chunk, big.chunk);
+        assert!(heap.copy_bytes(src, 2, dst, 5, 3));
+        assert_eq!(heap.data(dst), &[0x0504_0300_0000_0000]);
+        assert!(heap.copy_bytes(src, 0, big, 4088, 8));
+        assert_eq!(heap.data(big)[511], 0x0807_0605_0403_0201);
+        assert_eq!(heap.copied(), 11);
+        assert!(!heap.copy_bytes(src, 6, dst, 0, 3));
+        assert!(!heap.copy_bytes(src, 0, dst, 6, 3));
+        assert!(!heap.copy_bytes(src, 0, src, 4, 2));
+        assert!(!heap.copy_bytes(src, usize::MAX, dst, 0, 1));
+        assert_eq!(heap.copied(), 11);
+        assert_eq!(heap.data(dst), &[0x0504_0300_0000_0000]);
     }
 
     #[test]

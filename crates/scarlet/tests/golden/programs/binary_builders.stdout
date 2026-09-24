@@ -1,0 +1,43 @@
+from_bytes [1, 2, 255]: Ok(<<1, 2, 255>>)
+from_bytes [256]: Err(Nil)
+from_bytes [-1]: Err(Nil)
+from_bytes []: Ok(<<>>)
+from_bytes [0, 256, 1]: Err(Nil)
+from_bytes 253..256: Ok(<<253, 254, 255>>)
+from_bytes 254..257: Err(Nil)
+from_bytes -1..2: Err(Nil)
+repeat 3: Ok(<<1, 2, 1, 2, 1, 2>>)
+repeat 0: Ok(<<>>)
+repeat -1: Err(Nil)
+repeat bits: Ok(<<182, 1:size(1)>>)
+repeat empty: Ok(<<>>)
+concat []: <<>>
+concat empties: <<>>
+concat mixed: <<1, 2, 63, 31:size(5)>>
+concat == fold, 500 random mixes: PASS
+1.0 little: <<0, 0, 128, 63>>
+1.0 big: <<63, 128, 0, 0>>
+largest f32: <<255, 255, 127, 127>>
+1.0e39 stops at the largest f32: PASS
+-1.0e39: <<255, 255, 127, 255>>
+half an ulp past it stops there too: PASS
+-0.0: <<0, 0, 0, 128>>
+1.0e-40, a subnormal: <<194, 22, 1, 0>>
+none: <<>>
+round trip little: [
+  1.5, -2.25, 0.0, -0.0, 1024.0, 0.10000000149011612, 
+  0.0000000000000000000000000000000000000000999994610111476
+]
+round trip big: [
+  1.5, -2.25, 0.0, -0.0, 1024.0, 0.10000000149011612, 
+  0.0000000000000000000000000000000000000000999994610111476
+]
+bytes survive a round trip: PASS
+read in the other order: [0.00000000000000000000000000000000000000004600602988224807]
+5 bytes: Err(Nil)
+31 bits: Err(Nil)
+empty: []
++infinity: Err(Nil)
+-infinity: Err(Nil)
+a NaN: Err(Nil)
+a NaN after a float: Err(Nil)

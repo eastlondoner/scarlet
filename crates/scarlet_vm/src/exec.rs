@@ -805,6 +805,110 @@ impl<'c, 'h, 'o> Machine<'c, 'h, 'o> {
                     None => self.err_nil(),
                 }
             }
+            // One cell, and each byte copied once (`binary::join`), where a
+            // fold over `append` copied everything so far at every part.
+            Intrinsic::BinaryConcat => {
+                let parts = self.items(self.seq(v)?, "binaries")?;
+                let parts = parts
+                    .into_iter()
+                    .map(|p| self.binary(p))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let cell = binary::join(&mut self.heap, &parts).map_err(full)?;
+                Ok(Value::cell(cell))
+            }
+            // A negative count is `Err(Nil)`, and one too long for a binary a
+            // full heap, as `crypto.random_bytes` has them.
+            Intrinsic::BinaryRepeat => {
+                let b = self.binary(v)?;
+                let n = match self.int_of(arg(self, 1))? {
+                    Int::Small(n) => u64::try_from(n).ok(),
+                    Int::Big(n) if n.sign() == Sign::Minus => None,
+                    Int::Big(_) => Some(u64::MAX),
+                };
+                let Some(n) = n else {
+                    return self.err_nil();
+                };
+                let cell = binary::repeat(&mut self.heap, b, n).map_err(full)?;
+                self.ok(Value::cell(cell))
+            }
+            // Any Int outside 0 to 255 is `Err(Nil)`, never its low 8 bits.
+            Intrinsic::BinaryFromBytes => {
+                let bytes = match self.seq(v)? {
+                    Seq::Tree(a) => {
+                        let items = array::elements(&self.heap, a);
+                        let mut bytes = Vec::with_capacity(items.len());
+                        for x in items {
+                            let byte = match self.int_of(x)? {
+                                Int::Small(n) => u8::try_from(n).ok(),
+                                Int::Big(_) => None,
+                            };
+                            let Some(byte) = byte else {
+                                return self.err_nil();
+                            };
+                            bytes.push(byte);
+                        }
+                        bytes
+                    }
+                    Seq::Range { start, end } => {
+                        if array::range_len(start, end) == 0 {
+                            Vec::new()
+                        } else {
+                            let (Ok(start), Ok(end)) = (u8::try_from(start), u8::try_from(end - 1))
+                            else {
+                                return self.err_nil();
+                            };
+                            (start..=end).collect()
+                        }
+                    }
+                };
+                self.ok_bytes(&bytes)
+            }
+            // Written straight into the new cell, 4 bytes a Float.
+            Intrinsic::BinaryFromFloats32 => {
+                let xs = self.items(self.seq(v)?, "Floats")?;
+                let endian = self.endian(arg(self, 1))?;
+                let len = (xs.len() as u64)
+                    .checked_mul(32)
+                    .filter(|&len| len <= binary::MAX_BITS)
+                    .ok_or(Stop::HeapFull)?;
+                let made = binary::fill(&mut self.heap, len, |out| {
+                    for (four, x) in out.chunks_exact_mut(4).zip(&xs) {
+                        let View::Float(f) = x.view() else {
+                            return Err(*x);
+                        };
+                        four.copy_from_slice(&binary::f32_bytes(binary::narrow(f), endian));
+                    }
+                    Ok(())
+                })
+                .map_err(full)?;
+                match made {
+                    Ok(cell) => Ok(Value::cell(cell)),
+                    Err(x) => Err(Stop::BadProgram(format!("{x:?} as a Float"))),
+                }
+            }
+            // An infinity or a NaN is `Err(Nil)`: no Float holds one, and
+            // standing another value in for it would hide the failure.
+            Intrinsic::BinaryToFloats32 => {
+                let b = self.binary(v)?;
+                let endian = self.endian(arg(self, 1))?;
+                if !b.len.is_multiple_of(32) {
+                    return self.err_nil();
+                }
+                let bytes = binary::byte_view(&self.heap, b);
+                let (groups, _) = bytes.as_chunks::<4>();
+                let floats: Option<Vec<Value>> = groups
+                    .iter()
+                    .map(|&four| binary::read_f32(four, endian).map(|x| Value::float(x.into())))
+                    .collect();
+                drop(bytes);
+                match floats {
+                    Some(xs) => {
+                        let a = array::from_values(&mut self.heap, &xs).map_err(full)?;
+                        self.ok(Value::cell(a))
+                    }
+                    None => self.err_nil(),
+                }
+            }
             Intrinsic::StringInspect => {
                 let mut text = Vec::new();
                 self.show(v, &mut text)?;
@@ -1511,6 +1615,25 @@ impl<'c, 'h, 'o> Machine<'c, 'h, 'o> {
             (View::Nullary(r), Some(radix)) if r == radix.dec => Ok(10),
             (View::Nullary(r), Some(radix)) if r == radix.hex => Ok(16),
             _ => Err(Stop::BadProgram(format!("{v:?} as a `binary.Radix`"))),
+        }
+    }
+
+    /// The byte order a `scarlet/binary.Endian` stands for.
+    fn endian(&self, v: Value) -> Result<binary::Endian, Stop> {
+        match (v.view(), self.code.abi.endian) {
+            (View::Nullary(e), Some(endian)) if e == endian.big => Ok(binary::Endian::Big),
+            (View::Nullary(e), Some(endian)) if e == endian.little => Ok(binary::Endian::Little),
+            _ => Err(Stop::BadProgram(format!("{v:?} as a `binary.Endian`"))),
+        }
+    }
+
+    /// The elements of `s`, an array of `what`, with no reference added. A
+    /// range holds Ints, so only an empty one is an array of anything else.
+    fn items(&self, s: Seq, what: &str) -> Result<Vec<Value>, Stop> {
+        match s {
+            Seq::Tree(a) => Ok(array::elements(&self.heap, a)),
+            Seq::Range { start, end } if array::range_len(start, end) == 0 => Ok(Vec::new()),
+            Seq::Range { .. } => Err(Stop::BadProgram(format!("a range of Ints as {what}"))),
         }
     }
 

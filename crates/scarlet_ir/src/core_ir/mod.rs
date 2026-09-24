@@ -147,6 +147,9 @@ pub struct Abi {
     /// `scarlet/binary.Radix`, when the program loads that module: the base
     /// `binary.parse_int` and `binary.from_int_ascii` are asked for.
     pub radix: Option<Radix>,
+    /// `scarlet/binary.Endian`, when the program loads that module: the byte
+    /// order `binary.from_floats32` and `binary.to_floats32` are asked for.
+    pub endian: Option<Endian>,
     /// `scarlet/io.IoError`, when the program loads that module: what a file
     /// read or write that failed says went wrong.
     pub io: Option<IoErrors>,
@@ -162,6 +165,13 @@ pub struct Abi {
 pub struct Radix {
     pub dec: VariantRef,
     pub hex: VariantRef,
+}
+
+/// The constructors of `scarlet/binary.Endian`.
+#[derive(Debug, Clone, Copy)]
+pub struct Endian {
+    pub big: VariantRef,
+    pub little: VariantRef,
 }
 
 /// The constructors of `scarlet/io.IoError` the VM builds, each named for the
@@ -318,6 +328,9 @@ impl Abi {
         let mut all = vec![self.some, self.none, self.ok, self.err];
         if let Some(r) = self.radix {
             all.extend([r.dec, r.hex]);
+        }
+        if let Some(e) = self.endian {
+            all.extend([e.big, e.little]);
         }
         if let Some(io) = self.io {
             all.extend(io.variants());
