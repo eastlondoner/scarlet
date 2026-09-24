@@ -1,0 +1,24 @@
+[package]
+name = "metal-window-spike"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "metal-window-spike"
+path = "src/main.rs"
+
+# Standalone: a throwaway spike, not a member of the repo workspace (the root
+# manifest would otherwise pull it in). Nothing in the workspace depends on it.
+[workspace]
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6.4", features = ["exception"] }
+objc2-foundation = "0.3.2"
+objc2-app-kit = "0.3.2"
+objc2-metal = "0.3.2"
+objc2-quartz-core = "0.3.2"
+objc2-core-foundation = "0.3.2"
+objc2-core-graphics = "0.3.2"
+dispatch2 = "0.3.1"
+block2 = "0.6.2"
