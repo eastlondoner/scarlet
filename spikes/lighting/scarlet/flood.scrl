@@ -1,0 +1,80 @@
+// Block-light flood fill in Scarlet, to measure what one light update costs in
+// the interpreter. One torch (level 14) in a 32^3 box of air, breadth first,
+// Minecraft's rule: a neighbour gets level - max(1, opacity). The light values
+// live in a Map from cell index to level, since arrays are immutable and have
+// no in-place set. Opacity comes from a function of position (a wall at x = 20
+// with a gap), so each step does the work a real lookup would.
+
+import scarlet/map
+
+const SIZE = 32
+
+type Cells {
+	Empty
+	Cons(cell Int, level Int, rest Cells)
+}
+
+fn opacity(x Int, y Int, _z Int) Int {
+	if x == 20 && y > 12 {
+		15
+	} else {
+		0
+	}
+}
+
+fn visit(light map.Map(Int, Int), next Cells, x Int, y Int, z Int, level Int) (map.Map(Int, Int), Cells) {
+	if x < 0 || y < 0 || z < 0 || x >= SIZE || y >= SIZE || z >= SIZE {
+		(light, next)
+	} else {
+		op = opacity(x, y, z)
+		v = level - if op < 1 { 1 } else { op }
+		i = x + SIZE * {y + SIZE * z}
+		if v > { map.get(light, i) or 0 } {
+			(map.set(light, i, v), Cons(i, v, next))
+		} else {
+			(light, next)
+		}
+	}
+}
+
+fn spread(light map.Map(Int, Int), frontier Cells, next Cells) (map.Map(Int, Int), Cells) {
+	match frontier {
+		Empty -> (light, next)
+		Cons(i, level, rest) -> {
+			x = i % SIZE
+			y = {i / SIZE} % SIZE
+			z = i / {SIZE * SIZE}
+			a = visit(light, next, x - 1, y, z, level)
+			b = visit(a.0, a.1, x + 1, y, z, level)
+			c = visit(b.0, b.1, x, y - 1, z, level)
+			d = visit(c.0, c.1, x, y + 1, z, level)
+			e = visit(d.0, d.1, x, y, z - 1, level)
+			f = visit(e.0, e.1, x, y, z + 1, level)
+			spread(f.0, rest, f.1)
+		}
+	}
+}
+
+fn fill(light map.Map(Int, Int), frontier Cells) map.Map(Int, Int) {
+	match frontier {
+		Empty -> light
+		_ -> {
+			r = spread(light, frontier, Empty)
+			fill(r.0, r.1)
+		}
+	}
+}
+
+fn torch(round Int, total Int) Int {
+	if round == 0 {
+		total
+	} else {
+		start = 16 + SIZE * {16 + SIZE * 16}
+		light = fill(map.set(map.new(), start, 14), Cons(start, 14, Empty))
+		torch(round - 1, total + map.size(light))
+	}
+}
+
+pub fn main() {
+	println(torch(50, 0))
+}

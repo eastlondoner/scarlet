@@ -1,0 +1,17 @@
+[package]
+name = "lighting-spike"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Not a member of the repo workspace: a standalone spike.
+[workspace]
+
+[dependencies]
+objc2 = { version = "0.6", features = ["exception"] }
+objc2-foundation = "0.3"
+objc2-metal = "0.3"
+png = "0.17"
+
+[profile.test]
+opt-level = 2
