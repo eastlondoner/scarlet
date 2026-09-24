@@ -110,12 +110,12 @@ pub struct Identifier {
 }
 
 /// `@name` or `@name(arg, ...)` ahead of a declaration. Args are bare
-/// identifiers, never expressions, so the parser never has to guess whether
-/// `@x(a + b)` is an attribute or an error.
+/// identifiers or plain string literals, never expressions, so the parser
+/// never has to guess whether `@x(a + b)` is an attribute or an error.
 #[derive(Debug, Clone)]
 pub struct Attribute {
     pub name: Identifier,
-    pub(crate) args: Vec<Identifier>,
+    pub(crate) args: Vec<AttrArg>,
     pub span: Span,
 }
 
@@ -123,9 +123,18 @@ impl Attribute {
     /// `args` is `pub(crate)` because only the parser builds one; a consumer
     /// outside this crate (`@exhaustive`'s arity check, in `scarlet_core`)
     /// only ever needs to read it back.
-    pub fn args(&self) -> &[Identifier] {
+    pub fn args(&self) -> &[AttrArg] {
         &self.args
     }
+}
+
+/// One argument of an [`Attribute`]: `@vm(add)` takes an identifier,
+/// `@embed('world.metal')` a string. The string is a plain literal: the parser
+/// refuses interpolation, so its value is known without evaluating anything.
+#[derive(Debug, Clone)]
+pub enum AttrArg {
+    Ident(Identifier),
+    Str(StringLiteral),
 }
 
 #[derive(Debug, Clone)]
@@ -224,9 +233,30 @@ pub struct VariableBinding {
 #[derive(Debug, Clone)]
 pub struct ConstBinding {
     pub doc: Option<String>,
+    pub attributes: Vec<Attribute>,
     pub identifier: Identifier,
     pub typ: Option<TypeIdentifier>,
-    pub init: Expression,
+    pub init: ConstInit,
+    pub span: Span,
+}
+
+/// Where a `const`'s value comes from. Not `Option<Expression>` read beside
+/// the attributes: as with [`FnBody`], the parser decides once, so a const
+/// with neither an initializer nor `@embed` cannot be built.
+#[derive(Debug, Clone)]
+pub enum ConstInit {
+    /// `const x = value`.
+    Expr(Expression),
+    /// `@embed('path') const x Type`: the value is the file's contents, read
+    /// by the compiler.
+    Embed(Embed),
+}
+
+/// The file an `@embed` const names, as written, and the attribute naming it
+/// (where a diagnostic about the file points).
+#[derive(Debug, Clone)]
+pub struct Embed {
+    pub path: StringLiteral,
     pub span: Span,
 }
 

@@ -33,6 +33,11 @@ newtype_index!(
     pub struct ConstId("c")
 );
 
+/// The most bytes one `String` or `Binary` constant may hold: what the VM can
+/// put in one heap cell, less its header and length words. The VM asserts its
+/// own limit is this one, so a constant the compiler accepts always loads.
+pub const MAX_CONST_BYTES: usize = ((1 << 28) - 2) * 8;
+
 /// A constant the IR names by [`ConstId`]: a literal's value, or one the
 /// elaborator needs with no literal behind it (a pattern's length, a segment's
 /// width).
@@ -571,6 +576,44 @@ impl CoreExpr {
                     for (pat, arm) in arms {
                         if let CorePat::Ctor { variant, .. } = pat {
                             f(*variant);
+                        }
+                        work.push(arm);
+                    }
+                }
+                CoreExpr::If { then, els, .. } => {
+                    work.push(then);
+                    work.push(els);
+                }
+            }
+        }
+    }
+
+    /// Calls `f` for each constant this expression loads or matches against,
+    /// once per mention, in no set order.
+    pub fn for_each_const(&self, mut f: impl FnMut(ConstId)) {
+        let mut work = vec![self];
+        while let Some(e) = work.pop() {
+            match e {
+                CoreExpr::Let { rhs, body, .. } => {
+                    if let Atom::Const(c) = rhs {
+                        f(*c);
+                    }
+                    work.push(body);
+                }
+                CoreExpr::Tail(Atom::Const(c)) => f(*c),
+                CoreExpr::Tail(_) | CoreExpr::Goto(_) => {}
+                CoreExpr::LetJoin { join, body, .. }
+                | CoreExpr::LetCont {
+                    cont: join, body, ..
+                } => {
+                    work.push(join);
+                    work.push(body);
+                }
+                CoreExpr::Drop { body, .. } => work.push(body),
+                CoreExpr::Match { arms, .. } => {
+                    for (pat, arm) in arms {
+                        if let CorePat::Lit(c) = pat {
+                            f(*c);
                         }
                         work.push(arm);
                     }

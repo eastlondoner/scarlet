@@ -631,7 +631,7 @@ impl Parser {
             }
             Kind::Keyword(Keyword::Const) => {
                 let doc = self.extract_doc_comment();
-                let decl = self.parse_const_binding(doc)?;
+                let decl = self.parse_const_binding(doc, Vec::new())?;
                 return Ok(ast::Node::Statement(Box::new(
                     ast::Statement::Declaration {
                         decl: Box::new(decl),
@@ -1725,7 +1725,7 @@ impl Parser {
             // Arity is enforced here, once: everything downstream assumes
             // `FnBody::Vm` carries exactly the op key.
             let op = match vm_attr.args.as_slice() {
-                [op] => op.clone(),
+                [ast::AttrArg::Ident(op)] => op.clone(),
                 _ => {
                     return Err(
                         "@vm takes exactly one argument: the VM op key, e.g. @vm(add)".to_string(),
@@ -2007,23 +2007,60 @@ impl Parser {
         })
     }
 
-    fn parse_const_binding(&mut self, doc: Option<String>) -> PResult<ast::Declaration> {
+    fn parse_const_binding(
+        &mut self,
+        doc: Option<String>,
+        attributes: Vec<ast::Attribute>,
+    ) -> PResult<ast::Declaration> {
         let span = self.current_span();
         self.eat(Kind::Keyword(Keyword::Const))?;
 
         let identifier = self.eat_identifier("Expected const name")?;
 
+        // Same line only: an `@embed` const ends at its type, and a `fn` or
+        // `(` opening the next line would otherwise be read as one.
         let mut typ: Option<ast::TypeIdentifier> = None;
-        if self.is_type_start() {
+        if self.is_type_start() && self.current_span().start_line == identifier.span.start_line {
             typ = Some(self.parse_type_identifier()?);
         }
 
-        self.eat(Kind::PuncEquals)?;
-
-        let init = self.parse_expression()?;
+        // Decided here, once, like a `@vm` fn's missing body: everything
+        // downstream reads `ConstInit`, never the attribute list again.
+        let mut embeds = attributes.iter().filter(|a| a.name.name == "embed");
+        let init = match (embeds.next(), embeds.next()) {
+            (Some(_), Some(_)) => {
+                return Err("`@embed` may appear only once on a const".to_string());
+            }
+            (Some(attr), None) => {
+                let path = match attr.args.as_slice() {
+                    [ast::AttrArg::Str(path)] => path.clone(),
+                    _ => {
+                        return Err(
+                            "@embed takes exactly one argument: the file's path as a string, e.g. @embed('shaders/world.metal')"
+                                .to_string(),
+                        );
+                    }
+                };
+                if self.kind() == Kind::PuncEquals {
+                    return Err(
+                        "An @embed const takes its value from the file, so it cannot also have `= value`"
+                            .to_string(),
+                    );
+                }
+                ast::ConstInit::Embed(ast::Embed {
+                    path,
+                    span: attr.span,
+                })
+            }
+            (None, _) => {
+                self.eat(Kind::PuncEquals)?;
+                ast::ConstInit::Expr(self.parse_expression()?)
+            }
+        };
 
         Ok(ast::Declaration::Const(ast::ConstBinding {
             doc,
+            attributes,
             identifier,
             typ,
             init,
@@ -2263,12 +2300,7 @@ impl Parser {
         match self.kind() {
             Kind::Keyword(Keyword::Fn) => self.parse_function_declaration(doc, attrs),
             Kind::Keyword(Keyword::Type) => self.parse_type_declaration(doc, attrs, opaque),
-            Kind::Keyword(Keyword::Const) => {
-                if !attrs.is_empty() {
-                    return Err("Attributes are not allowed on `const` declarations".to_string());
-                }
-                self.parse_const_binding(doc)
-            }
+            Kind::Keyword(Keyword::Const) => self.parse_const_binding(doc, attrs),
             other => Err(format!(
                 "Expected `fn`, `type`, or `const` after {preceded_by}, got '{other}'"
             )),
@@ -2290,7 +2322,7 @@ impl Parser {
         let mut args = Vec::new();
         if self.kind() == Kind::PuncOpenParen {
             args = self.parse_comma_list(Kind::PuncOpenParen, Kind::PuncCloseParen, |p| {
-                p.eat_identifier("Expected attribute argument")
+                p.parse_attribute_arg()
             })?;
         }
         Ok(ast::Attribute {
@@ -2298,6 +2330,35 @@ impl Parser {
             args,
             span: self.span_from(start),
         })
+    }
+
+    fn parse_attribute_arg(&mut self) -> PResult<ast::AttrArg> {
+        match self.kind() {
+            Kind::LiteralString(_) => {
+                let span = self.current_span();
+                let value = self.eat_string("Expected attribute argument")?;
+                Ok(ast::AttrArg::Str(ast::StringLiteral { value, span }))
+            }
+            Kind::InterpStringStart => {
+                // Consumed whole and reported here, so the declaration after
+                // it still parses and the refusal is the only error. It stands
+                // in as an empty path, which a check refuses before touching
+                // any file; nothing compiles past a parse error anyway.
+                let expr = self.parse_interpolated_string()?;
+                let span = expr.span();
+                self.error_at(
+                    span,
+                    "Attribute arguments are plain strings: interpolation is not allowed here",
+                );
+                Ok(ast::AttrArg::Str(ast::StringLiteral {
+                    value: String::new(),
+                    span,
+                }))
+            }
+            _ => Ok(ast::AttrArg::Ident(
+                self.eat_identifier("Expected attribute argument")?,
+            )),
+        }
     }
 
     fn parse_import_declaration(&mut self) -> PResult<ast::Statement> {
@@ -3121,11 +3182,8 @@ mod tests {
             "pub opaque fn f() Nil { Nil }",
             "`opaque` may only be applied to `type`",
         );
-        // Attributes are not allowed on `const`.
-        assert_has_error(
-            "@vm(x)\nconst PI = 3",
-            "Attributes are not allowed on `const`",
-        );
+        // `@vm` on a const parses: the compiler refuses it, by name.
+        assert_no_errors("@vm(x)\nconst PI = 3");
         assert_has_error("pub x = 1", "after `pub`");
         // The message must not mention a `pub` the user never wrote.
         assert_has_error(
@@ -3133,6 +3191,83 @@ mod tests {
             "Expected `fn`, `type`, or `const` after attributes",
         );
         assert_has_error("import .foo", "Expected `/` after relative import segment");
+    }
+
+    /// The embedded const, as the parser makes it: its value is
+    /// `ConstInit::Embed`, carrying the path as written and the attribute's
+    /// span, and the attribute itself stays on the const for the formatter.
+    fn embedded_const(src: &str) -> ast::ConstBinding {
+        let r = assert_no_errors(src);
+        match r.ast.body.first().expect("a declaration") {
+            ast::Node::Statement(s) => match s.as_ref() {
+                ast::Statement::Declaration { decl, .. } => match decl.as_ref() {
+                    ast::Declaration::Const(c) => c.clone(),
+                    other => panic!("expected a const, got {other:?}"),
+                },
+                other => panic!("expected a declaration, got {other:?}"),
+            },
+            other => panic!("expected a statement, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_embed_const_has_no_initializer() {
+        let c = embedded_const("@embed('shaders/world.metal')\npub const world String\n");
+        let ast::ConstInit::Embed(e) = &c.init else {
+            panic!("expected ConstInit::Embed, got {:?}", c.init)
+        };
+        assert_eq!(e.path.value, "shaders/world.metal");
+        assert_eq!(e.span, c.attributes[0].span);
+        assert!(c.typ.is_some());
+        assert!(matches!(
+            c.attributes[0].args(),
+            [ast::AttrArg::Str(s)] if s.value == "shaders/world.metal"
+        ));
+    }
+
+    /// A const's type is on its name's line, so the next declaration is
+    /// never read as a missing type.
+    #[test]
+    fn an_embed_const_without_a_type_ends_at_its_name() {
+        let r = assert_no_errors("@embed('a.txt')\nconst a\nfn f() Int { 1 }\n");
+        assert_eq!(r.ast.body.len(), 2);
+        let c = embedded_const("@embed('a.txt')\nconst a\n");
+        assert!(c.typ.is_none());
+    }
+
+    #[test]
+    fn embed_parse_errors_each_say_what_is_wrong() {
+        assert_has_error(
+            "@embed('a.txt')\nconst a String = 'x'",
+            "An @embed const takes its value from the file, so it cannot also have `= value`",
+        );
+        assert_has_error(
+            "@embed\nconst a String",
+            "@embed takes exactly one argument: the file's path as a string",
+        );
+        assert_has_error(
+            "@embed(a)\nconst a String",
+            "@embed takes exactly one argument: the file's path as a string",
+        );
+        assert_has_error(
+            "@embed('a', 'b')\nconst a String",
+            "@embed takes exactly one argument: the file's path as a string",
+        );
+        assert_has_error(
+            "@embed('a')\n@embed('b')\nconst a String",
+            "`@embed` may appear only once on a const",
+        );
+        assert_has_error(
+            "@embed('${dir}/a.txt')\nconst a String",
+            "Attribute arguments are plain strings: interpolation is not allowed here",
+        );
+        // A string is an argument `@vm` does not take.
+        assert_has_error(
+            "@vm('add')\nfn f(a Int) Int",
+            "@vm takes exactly one argument: the VM op key",
+        );
+        // Without `@embed`, a const still needs its value.
+        assert_has_error("const a String\n", "Expected");
     }
 
     #[test]

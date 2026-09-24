@@ -2,7 +2,9 @@
 //! write responses back. All server state lives on `Workspace`, so tests build
 //! one directly and never touch stdin/stdout.
 
+use std::collections::BTreeSet;
 use std::io::{self, BufRead, BufReader, Read as _, Write};
+use std::path::PathBuf;
 
 use serde_json::{Value as Json, json};
 
@@ -13,7 +15,7 @@ mod xrefs;
 
 pub use workspace::Workspace;
 
-use wire::{WatchedChange, doc_uri, folder_paths, rename_error_code, uri_to_path};
+use wire::{WatchedChange, doc_uri, embed_watchers, folder_paths, rename_error_code, uri_to_path};
 
 /// Outcome of one framed stdin read: a message body, or the client closed the
 /// pipe.
@@ -25,12 +27,29 @@ enum Incoming {
 pub struct LspServer {
     ws: Workspace,
     reader: BufReader<io::Stdin>,
+    /// The embedded-file watch, once the client has said `initialized` (a
+    /// registration before that is refused).
+    embed_watch: Option<EmbedWatch>,
+    /// Whether the client takes a `RelativePattern` watcher, read from
+    /// `initialize`.
+    relative_patterns: bool,
 }
+
+/// The files `@embed` consts read, as last registered with the client.
+struct EmbedWatch {
+    registered: BTreeSet<PathBuf>,
+}
+
+/// The registration id of the embedded-file watch, which is replaced whole
+/// whenever the set of files changes.
+const EMBED_WATCH_ID: &str = "scarlet/embeddedFiles";
 
 pub fn new_server() -> LspServer {
     LspServer {
         ws: Workspace::new(),
         reader: BufReader::new(io::stdin()),
+        embed_watch: None,
+        relative_patterns: false,
     }
 }
 
@@ -143,7 +162,51 @@ impl LspServer {
                 }
             }
         }
+        // Any message can analyse a document, and so change what it embeds.
+        self.sync_embed_watch();
         ControlFlow::Continue(())
+    }
+
+    /// Keep the client watching exactly the files `@embed` consts read: a
+    /// `.metal` file is no `**/*.scrl`, and an edit to one outside the editor
+    /// has to recompile what embeds it. Replaced whole (unregister, register)
+    /// when the set changes; nothing is sent when it has not.
+    fn sync_embed_watch(&mut self) {
+        let Some(watch) = &self.embed_watch else {
+            return;
+        };
+        let now = self.ws.embedded_files();
+        if now == watch.registered {
+            return;
+        }
+        if !watch.registered.is_empty() {
+            self.send_request(
+                json!("scarlet/unwatchEmbedded"),
+                "client/unregisterCapability",
+                json!({
+                    "unregisterations": [{
+                        "id": EMBED_WATCH_ID,
+                        "method": "workspace/didChangeWatchedFiles",
+                    }]
+                }),
+            );
+        }
+        if !now.is_empty() {
+            self.send_request(
+                json!("scarlet/watchEmbedded"),
+                "client/registerCapability",
+                json!({
+                    "registrations": [{
+                        "id": EMBED_WATCH_ID,
+                        "method": "workspace/didChangeWatchedFiles",
+                        "registerOptions": {
+                            "watchers": embed_watchers(&now, self.relative_patterns),
+                        }
+                    }]
+                }),
+            );
+        }
+        self.embed_watch = Some(EmbedWatch { registered: now });
     }
 
     fn send_response(&self, id: &Json, result: Json) {
@@ -217,6 +280,10 @@ impl LspServer {
     }
 
     fn handle_initialize(&mut self, id: &Json, params: &Json) {
+        self.relative_patterns = params
+            .pointer("/capabilities/workspace/didChangeWatchedFiles/relativePatternSupport")
+            .and_then(Json::as_bool)
+            .unwrap_or(false);
         // Prefer `workspaceFolders`, fall back to legacy `rootUri`. A client
         // opening a loose file sends neither; that file gets the empty root.
         let folders = params.get("workspaceFolders");
@@ -250,7 +317,10 @@ impl LspServer {
         );
     }
 
-    fn handle_initialized(&self) {
+    fn handle_initialized(&mut self) {
+        self.embed_watch = Some(EmbedWatch {
+            registered: BTreeSet::new(),
+        });
         // didChangeWatchedFiles has no static registration in the LSP spec, so
         // ask for the .scrl watch dynamically. External edits (git checkout,
         // formatter) must invalidate the incremental session.

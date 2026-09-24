@@ -43,6 +43,7 @@ use petgraph::stable_graph::{NodeIndex, StableGraph};
 
 use super::compiler::{Compiler, ToplevelDecl};
 use crate::ast;
+use crate::module::embed::{self, EmbedAs, EmbedPathError, ReadError};
 use crate::module::{self, ExportedType, ExportedValue, ModuleInterface};
 use crate::reference::{DefId, DefinitionKind};
 use crate::span::Span;
@@ -50,7 +51,7 @@ use crate::type_def::TypeId;
 use crate::typed_ir::GlobalSlot;
 use crate::types::{
     AddedTypeVar, AnnotationContext, ArenaSlice, DefinitionLocation, EntityKind, Hydrator, Scheme,
-    StrId, Ty, TypeBody, TypeInfo, TypeParam, ValueKind, Variant, VariantField, pool,
+    StrId, Ty, TypeBody, TypeInfo, TypeNode, TypeParam, ValueKind, Variant, VariantField, pool,
 };
 use scarlet_types::intrinsic::Intrinsic;
 
@@ -297,6 +298,11 @@ impl Compiler {
                                 }
                             }
                             ast::Declaration::Const(cb) => {
+                                self.validate_attributes(
+                                    &cb.attributes,
+                                    in_stdlib,
+                                    AttrTarget::Const,
+                                );
                                 if !check_duplicate(self, &mut seen_values, &cb.identifier) {
                                     self.warn_shadowed_qualifier(&cb.identifier);
                                     decls.push(Decl::Const {
@@ -488,6 +494,8 @@ impl Compiler {
                     node: decls[idx].node(),
                     name: name_id,
                     slot: prepared[idx].slot(),
+                    // Filled by `check_embed` below, for an `@embed` const.
+                    embed: None,
                 });
                 match &prepared[idx] {
                     Prepared::Fn {
@@ -539,19 +547,31 @@ impl Compiler {
                         // captures nothing (sibling refs are `PushGlobal`).
                         inferred.push((idx, fn_ty));
                     }
-                    Prepared::Const { cb, is_pub, dl, .. } => {
+                    Prepared::Const {
+                        cb,
+                        is_pub,
+                        dl,
+                        slot,
+                    } => {
                         let name = &cb.identifier.name;
                         self.emit_def(*dl, name, cb.doc.clone(), *is_pub, DefinitionKind::Constant);
                         let owner = self.owner_defid(cb.identifier.span, EntityKind::Constant);
                         let final_ty = self.with_owner(owner, |c| {
                             let mut h = Hydrator::new(AnnotationContext::Signature);
                             let annot_ty = cb.typ.as_ref().map(|t| c.hydrate(&mut h, t));
-                            let init_ty = c.compile_expr_with_hint(&cb.init, annot_ty);
-                            if let Some(a) = annot_ty {
-                                c.engine.unify_at(a, init_ty, cb.identifier.span);
-                                a
-                            } else {
-                                init_ty
+                            match &cb.init {
+                                ast::ConstInit::Expr(init) => {
+                                    let init_ty = c.compile_expr_with_hint(init, annot_ty);
+                                    if let Some(a) = annot_ty {
+                                        c.engine.unify_at(a, init_ty, cb.identifier.span);
+                                        a
+                                    } else {
+                                        init_ty
+                                    }
+                                }
+                                ast::ConstInit::Embed(embed) => {
+                                    c.check_embed(embed, annot_ty, *slot)
+                                }
                             }
                         });
                         self.env.store_doc_opt(name, &cb.doc);
@@ -973,6 +993,7 @@ impl Compiler {
 enum AttrTarget {
     Fn,
     Type,
+    Const,
 }
 
 impl Compiler {
@@ -993,7 +1014,7 @@ impl Compiler {
                         AttrTarget::Fn => {}
                         // Named, not negated: a new attribute target must
                         // decide whether '@vm' is legal on it.
-                        AttrTarget::Type => {
+                        AttrTarget::Type | AttrTarget::Const => {
                             self.error("'@vm' may only be used on functions".to_string(), a.span);
                         }
                     }
@@ -1008,7 +1029,7 @@ impl Compiler {
                     }
                     match on {
                         AttrTarget::Type => {}
-                        AttrTarget::Fn => {
+                        AttrTarget::Fn | AttrTarget::Const => {
                             self.error(
                                 "'@exhaustive' may only be used on types".to_string(),
                                 a.span,
@@ -1016,11 +1037,114 @@ impl Compiler {
                         }
                     }
                 }
+                // Its argument and its const's shape are the parser's
+                // (`ConstInit::Embed`); the file is `check_embed`'s.
+                "embed" => match on {
+                    AttrTarget::Const => {}
+                    AttrTarget::Fn | AttrTarget::Type => {
+                        self.error(
+                            "'@embed' may only be used on `const` declarations".to_string(),
+                            a.span,
+                        );
+                    }
+                },
                 other => {
                     self.error(format!("Unknown attribute '@{other}'"), a.span);
                 }
             }
         }
+    }
+}
+
+impl Compiler {
+    /// Check an `@embed` const and read its file, once: the decoded value is
+    /// stored on the const's own [`ToplevelDecl`] (the record `slot` names),
+    /// which is where elaboration pools it from.
+    ///
+    /// Returns the const's type: its annotation, or a fresh variable when it
+    /// has none, so the one error is the only one.
+    fn check_embed(&mut self, embed: &ast::Embed, annot: Option<Ty>, slot: GlobalSlot) -> Ty {
+        let written = embed.path.value.as_str();
+        let Some(annot) = annot else {
+            self.error(
+                "An @embed const must declare its type: `String` for text or `Binary` for bytes"
+                    .to_string(),
+                embed.span,
+            );
+            return self.engine.fresh_var();
+        };
+        if module::is_stdlib(&self.current_module) {
+            self.error(
+                "'@embed' is not allowed in the standard library, which is compiled into \
+                 Scarlet and has no directory to read a file from"
+                    .to_string(),
+                embed.span,
+            );
+            return annot;
+        }
+        let root = self.engine.find(annot);
+        let kind = match self.engine.node(root) {
+            TypeNode::Con { id, .. } if self.prelude.string().is(id) => EmbedAs::String,
+            TypeNode::Con { id, .. } if self.prelude.binary().is(id) => EmbedAs::Binary,
+            _ => {
+                let ty = self.engine.type_to_str(annot);
+                self.error(
+                    format!("An @embed const is a `String` or a `Binary`, not `{ty}`"),
+                    embed.span,
+                );
+                return annot;
+            }
+        };
+        let path = match embed::resolve_path(self.base_dir.as_deref(), written) {
+            Ok(p) => p,
+            Err(e) => {
+                let msg = match e {
+                    EmbedPathError::NoDirectory => format!(
+                        "@embed needs a file on disk: this source has no directory to find '{written}' in"
+                    ),
+                    EmbedPathError::Empty => {
+                        "@embed needs a file's path, not an empty string".to_string()
+                    }
+                    EmbedPathError::Absolute => format!(
+                        "@embed takes a path relative to this module's directory, not an absolute one: '{written}'"
+                    ),
+                    EmbedPathError::Unresolvable => {
+                        format!("Cannot embed '{written}': the path has no absolute form")
+                    }
+                };
+                self.error(msg, embed.span);
+                return annot;
+            }
+        };
+        let embed::Read { file, value } =
+            embed::read(path, kind, scarlet_ir::core_ir::MAX_CONST_BYTES);
+        match value {
+            Ok(v) => match self.toplevel_decls.iter_mut().find(|d| d.slot == slot) {
+                Some(decl) => decl.embed = Some(v),
+                // Pass 5 pushes the decl before checking it.
+                None => debug_assert!(false, "@embed const has no ToplevelDecl"),
+            },
+            Err(e) => {
+                let msg = match e {
+                    ReadError::Io(_) => format!(
+                        "Cannot embed '{written}': cannot read {}: {e}",
+                        file.path().display()
+                    ),
+                    ReadError::NotUtf8 { .. } => {
+                        format!("Cannot embed '{written}' as a `String`: {e}")
+                    }
+                    ReadError::TooLarge { .. } => format!("Cannot embed '{written}': {e}"),
+                };
+                self.error(msg, embed.span);
+            }
+        }
+        // A dependency whatever the read found: a missing file that appears,
+        // or a bad one that is fixed, recompiles the module. One record per
+        // resolved path, however many consts or spellings name it.
+        if !self.embedded_files.iter().any(|f| f.path() == file.path()) {
+            self.embedded_files.push(file);
+        }
+        annot
     }
 }
 
@@ -1159,9 +1283,11 @@ fn build_call_graph_sccs(decls: &[Decl<'_>]) -> Vec<Vec<usize>> {
                 }
                 walker.expr(body);
             }
-            Decl::Const { cb, .. } => {
-                walker.expr(&cb.init);
-            }
+            Decl::Const { cb, .. } => match &cb.init {
+                ast::ConstInit::Expr(init) => walker.expr(init),
+                // Its value is a file: it names no declaration.
+                ast::ConstInit::Embed(_) => {}
+            },
         }
     }
 
@@ -1358,7 +1484,9 @@ impl<'a, 'g> RefWalker<'a, 'g> {
                 }
                 ast::Statement::Declaration { decl, .. } => match decl.as_ref() {
                     ast::Declaration::Const(cb) => {
-                        self.expr(&cb.init);
+                        if let ast::ConstInit::Expr(init) = &cb.init {
+                            self.expr(init);
+                        }
                         self.define(&cb.identifier.name);
                     }
                     ast::Declaration::Function(fd) => {

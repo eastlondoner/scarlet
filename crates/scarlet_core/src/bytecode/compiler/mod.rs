@@ -61,6 +61,7 @@ use crate::typed_ir::{
 };
 use smallvec::SmallVec;
 
+use crate::module::embed::{Embedded, EmbeddedFile};
 use crate::module::{
     self, CachedModule, ModuleInterface, ModuleKey, ModuleOrigin, ModulePath, ModuleSource,
     ModuleTable, ResolveError, source_hash,
@@ -304,7 +305,7 @@ pub(super) struct LocalSlot {
 /// dependency order) and which entry-frame slot the check walk already gave it
 /// (so `TypedBind::global` pins the `StoreLocal` that the `PushGlobal`s already
 /// emitted into fn bodies address). Nothing maps the *name* back to a slot.
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 pub(super) struct ToplevelDecl {
     /// Index of the declaration's node in the module block's `body`.
     pub(super) node: usize,
@@ -314,6 +315,10 @@ pub(super) struct ToplevelDecl {
     pub(super) name: StrId,
     /// The entry-frame slot Pass 3 allocated for the declaration.
     pub(super) slot: GlobalSlot,
+    /// An `@embed` const's value, as the check pass read and decoded it.
+    /// Elaboration pools it from here and never reads the file again, so the
+    /// value it emits is the one that passed the check.
+    pub(super) embed: Option<Embedded>,
 }
 
 /// Compiler state snapshotted on entry to a nested function body and restored
@@ -349,6 +354,7 @@ struct ModuleFrame {
     imported_qualifiers: HashMap<String, ModuleKey>,
     base_dir: Option<PathBuf>,
     module_refs: ModuleReferences,
+    embedded_files: Vec<EmbeddedFile>,
     /// Whether this frame scoped the module's namespace (env module frame +
     /// `locals_frame_marks`). Recorded at enter so a `retain_namespaces`
     /// toggle can never unbalance the pop.
@@ -572,6 +578,10 @@ pub struct Compiler {
     /// `/private/var/.../lib`.
     module_display: HashMap<ModuleKey, String>,
     pub(super) base_dir: Option<PathBuf>,
+    /// The files the current module's `@embed` consts read, one per resolved
+    /// path. Swapped per module frame; a module's list moves onto its
+    /// `ModuleOrigin::File` when it is cached.
+    pub(super) embedded_files: Vec<EmbeddedFile>,
     /// When set, `scarlet/...` imports resolve to `.scrl` files under this directory
     /// (the in-repo `src/std`) instead of the embedded snapshot, so a session
     /// editing the stdlib compiles it like any other on-disk module tree.
@@ -988,6 +998,8 @@ struct CompiledBody {
     /// reserved and recorded inside `compile_module_body`, so its start is
     /// deliberately not threaded back out here.
     refs: ModuleReferences,
+    /// The files its `@embed` consts read, for its `ModuleOrigin::File`.
+    embeds: Vec<EmbeddedFile>,
 }
 
 /// Everything one compile can be asked to do differently. Combinations are
@@ -1100,6 +1112,7 @@ pub(crate) fn new_compiler(base_dir: Option<&Path>, check_only: bool) -> Compile
         defid_module_memo: HashMap::new(),
         imported_qualifiers: HashMap::new(),
         base_dir: base_dir.map(|p| p.to_path_buf()),
+        embedded_files: Vec::new(),
         stdlib_source_root: None,
         prelude: PreludeBindings::default(),
         reserved: BTreeSet::new(),
@@ -2652,6 +2665,7 @@ impl Compiler {
                 source_hash: hash,
                 stat: None,
                 path,
+                embeds: body.embeds,
                 refs,
             },
             None => ModuleOrigin::Embedded { refs },
@@ -2757,14 +2771,15 @@ impl Compiler {
             imported_qualifiers: std::mem::take(&mut self.imported_qualifiers),
             base_dir: std::mem::replace(&mut self.base_dir, base_dir),
             module_refs: std::mem::replace(&mut self.module_refs, ModuleReferences::new(mid)),
+            embedded_files: std::mem::take(&mut self.embedded_files),
             scoped,
         }
     }
 
     /// Restore the snapshotted per-module state and return the just-compiled
-    /// module's collected references (the `module_refs` value that was live
-    /// between enter and leave).
-    fn leave_module_frame(&mut self, old: ModuleFrame) -> ModuleReferences {
+    /// module's collected references and embedded files (the values that were
+    /// live between enter and leave).
+    fn leave_module_frame(&mut self, old: ModuleFrame) -> (ModuleReferences, Vec<EmbeddedFile>) {
         let ModuleFrame {
             module,
             module_key,
@@ -2772,6 +2787,7 @@ impl Compiler {
             imported_qualifiers,
             base_dir,
             module_refs,
+            embedded_files,
             scoped,
         } = old;
         if scoped {
@@ -2808,7 +2824,10 @@ impl Compiler {
         self.module_path_slice = module_path_slice;
         self.imported_qualifiers = imported_qualifiers;
         self.base_dir = base_dir;
-        std::mem::replace(&mut self.module_refs, module_refs)
+        (
+            std::mem::replace(&mut self.module_refs, module_refs),
+            std::mem::replace(&mut self.embedded_files, embedded_files),
+        )
     }
 
     fn compile_module_body(
@@ -2862,7 +2881,7 @@ impl Compiler {
         let used = self.env.next_type_id().0 - base.0;
         reservation.note_usage(&mut self.module_table, used);
 
-        let refs = self.leave_module_frame(old);
+        let (refs, embeds) = self.leave_module_frame(old);
         // Stamp provenance on every diagnostic this module's compile produced.
         // Dependencies compiled inside our range have already stamped theirs,
         // so only still-unstamped (entry-relative) ones become ours.
@@ -2876,6 +2895,7 @@ impl Compiler {
                 iface,
                 watermark,
                 refs,
+                embeds,
             },
             imports,
         )

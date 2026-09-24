@@ -11,14 +11,17 @@ use crate::type_def::TypeId;
 use crate::typed_ir::GlobalSlot;
 use crate::types::{Scheme, TypeInfo};
 
+pub(crate) mod embed;
 mod stdlib;
+
+use embed::EmbeddedFile;
 
 // Module identity lives in `scarlet_syntax::module_path` because a `Diagnostic`
 // carries the key of the module it points into. Re-exported here, where
 // resolution mints the keys.
 pub use scarlet_syntax::module_path::{
     ModuleKey, ModulePath, ResolveError, file_module_path, is_resolved_file, is_stdlib,
-    main_module, scarlet_prelude,
+    lexical_absolute, main_module, scarlet_prelude,
 };
 
 /// Every module the embedded stdlib holds, sorted by the path an import names
@@ -210,6 +213,9 @@ pub enum ModuleOrigin {
         stat: Option<FileStat>,
         /// Resolved on-disk path.
         path: PathBuf,
+        /// Every file the module's `@embed` consts read, by resolved path. A
+        /// change to one is a change to the module.
+        embeds: Vec<EmbeddedFile>,
         refs: Rc<ModuleReferences>,
     },
 }
@@ -239,6 +245,14 @@ impl CachedModule {
         match &self.origin {
             ModuleOrigin::File { path, .. } => Some(path),
             _ => None,
+        }
+    }
+
+    /// The files this module's `@embed` consts read.
+    pub(crate) fn embeds(&self) -> &[EmbeddedFile] {
+        match &self.origin {
+            ModuleOrigin::File { embeds, .. } => embeds,
+            ModuleOrigin::Embedded { .. } => &[],
         }
     }
 
@@ -345,13 +359,18 @@ impl ModuleTable {
             .filter(|(_, cm)| matches!(cm.origin, ModuleOrigin::File { .. }))
     }
 
-    /// Has cached module `key`'s source changed since its interface was built?
+    /// Has cached module `key`'s source, or a file one of its `@embed` consts
+    /// read, changed since its interface was built?
     ///
     /// Runs per LSP keystroke for every cached user module, so the unchanged
     /// case is stat-gated: an unmoved `(mtime, len)` skips the read and hash.
     /// An edit that preserves both is missed here and covered instead by the
     /// LSP's `didChangeWatchedFiles` -> `invalidate_path`.
     pub(crate) fn source_changed(&mut self, key: &ModuleKey) -> bool {
+        self.own_source_changed(key) || self.embeds_changed(key)
+    }
+
+    fn own_source_changed(&mut self, key: &ModuleKey) -> bool {
         let (path, expected_hash, cached_stat) = match self.loaded.get(key).map(|cm| &cm.origin) {
             Some(ModuleOrigin::File {
                 path,
@@ -386,6 +405,38 @@ impl ModuleTable {
                 true // file vanished — invalidate
             }
         }
+    }
+
+    /// [`Self::source_changed`] for the module's embedded files. Their bytes are
+    /// read from disk, never an overlay: an overlay is an open `.scrl` buffer.
+    fn embeds_changed(&mut self, key: &ModuleKey) -> bool {
+        let Some(cm) = self.loaded.get_mut(key) else {
+            return false;
+        };
+        let ModuleOrigin::File { embeds, .. } = &mut cm.origin else {
+            return false;
+        };
+        for e in embeds.iter_mut() {
+            let stat = file_stat(&e.path);
+            if stat.is_some() && e.stat == stat {
+                continue;
+            }
+            let hash = std::fs::read(&e.path).ok().map(|b| bytes_hash(&b));
+            if hash != e.hash {
+                return true;
+            }
+            e.stat = stat;
+        }
+        false
+    }
+
+    /// Every cached module with an `@embed` const that read `path`.
+    pub(crate) fn embedders_of(&self, path: &Path) -> Vec<ModuleKey> {
+        self.loaded
+            .iter()
+            .filter(|(_, cm)| cm.embeds().iter().any(|e| e.path() == path))
+            .map(|(k, _)| k.clone())
+            .collect()
     }
 
     /// Update the stat gate recorded on `key`'s `ModuleOrigin::File`.
@@ -533,12 +584,17 @@ fn file_stat(path: &Path) -> Option<FileStat> {
 /// editors do, where a same-second edit can preserve both time and length;
 /// an in-place write preserving all three in the same instant falls to the
 /// LSP's `didChangeWatchedFiles` -> `invalidate_path` backstop.
-type FileStat = (std::time::SystemTime, u64, u64);
+pub(crate) type FileStat = (std::time::SystemTime, u64, u64);
 
 /// FNV-1a 64-bit hash over source bytes for cheap change-detection.
 pub(crate) fn source_hash(s: &str) -> u64 {
+    bytes_hash(s.as_bytes())
+}
+
+/// [`source_hash`] over any bytes: an embedded file need not be text.
+pub(crate) fn bytes_hash(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
-    for b in s.bytes() {
+    for &b in bytes {
         h = (h ^ b as u64).wrapping_mul(0x100000001b3);
     }
     h
@@ -871,6 +927,7 @@ mod tests {
                 source_hash: 0,
                 stat: None,
                 path: PathBuf::from(format!("/{name}.scrl")),
+                embeds: Vec::new(),
                 refs: Rc::new(ModuleReferences::new(crate::reference::ModuleId(0))),
             },
             watermark,
@@ -945,6 +1002,7 @@ mod tests {
                 source_hash: source_hash(body),
                 stat: None,
                 path: path.clone(),
+                embeds: Vec::new(),
                 refs: Rc::new(ModuleReferences::new(crate::reference::ModuleId(0))),
             },
             watermark: Watermark::default(),
@@ -957,6 +1015,68 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         assert!(t.source_changed(&m), "a vanished file invalidates");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A module is stale when a file it embedded changes, appears or goes,
+    /// even though its own source is untouched.
+    #[test]
+    fn source_changed_sees_embedded_files() {
+        let mut t = ModuleTable::new();
+        let dir = unique_dir("embedchanged");
+        let path = dir.join("m.scrl");
+        let body = "x = 1\n";
+        std::fs::write(&path, body).unwrap();
+        let shader = dir.join("world.metal");
+        std::fs::write(&shader, "kernel").unwrap();
+        let later = dir.join("later.txt");
+        let embeds = vec![
+            EmbeddedFile {
+                path: shader.clone(),
+                hash: Some(bytes_hash(b"kernel")),
+                stat: None,
+            },
+            EmbeddedFile {
+                path: later.clone(),
+                hash: None,
+                stat: None,
+            },
+        ];
+        let cm = CachedModule {
+            iface: ModuleInterface::new(vec!["m".to_string()]),
+            origin: ModuleOrigin::File {
+                source_hash: source_hash(body),
+                stat: None,
+                path: path.clone(),
+                embeds,
+                refs: Rc::new(ModuleReferences::new(crate::reference::ModuleId(0))),
+            },
+            watermark: Watermark::default(),
+            dependents: HashSet::new(),
+        };
+        let m = ModuleKey::of(&vec!["m".to_string()]);
+        t.insert_cached(m.clone(), cm);
+        assert!(!t.source_changed(&m), "nothing moved");
+        assert_eq!(t.embedders_of(&shader), vec![m.clone()]);
+        assert_eq!(t.embedders_of(&later), vec![m.clone()]);
+        assert!(
+            t.embedders_of(&path).is_empty(),
+            "its own source is not an embed"
+        );
+
+        std::fs::write(&shader, "kernel2").unwrap();
+        assert!(t.source_changed(&m), "an edited embedded file");
+        std::fs::write(&shader, "kernel").unwrap();
+        assert!(!t.source_changed(&m), "the same bytes again");
+
+        std::fs::write(&later, "now here").unwrap();
+        assert!(
+            t.source_changed(&m),
+            "a missing embedded file that appeared"
+        );
+        std::fs::remove_file(&later).unwrap();
+        std::fs::remove_file(&shader).unwrap();
+        assert!(t.source_changed(&m), "an embedded file that vanished");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

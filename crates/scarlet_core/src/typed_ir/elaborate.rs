@@ -116,6 +116,10 @@ pub trait ElabCtx: PreludeTys {
     fn int_const(&mut self, i: i64) -> ConstId;
     /// Pool a `Binary` constant with the given raw bytes and bit length.
     fn binary_const(&mut self, bytes: Vec<u8>, bit_len: u64) -> ConstId;
+    /// The type and pooled value of the `@embed` const declared at the
+    /// entry-frame `slot`, as the check pass read it. `None` when the check
+    /// read nothing for it, which a clean module never has.
+    fn embedded(&mut self, slot: GlobalSlot) -> Option<(Ty, ConstId)>;
 
     /// Resolve a call/value name to `(instantiated_ty, denotation)`, or `None`
     /// when unbound.
@@ -1398,7 +1402,19 @@ impl<'a, C: ElabCtx> Elab<'a, C> {
                     // A `const` gets its own bind even when its init is a bare
                     // identifier: fn bodies address it by its own entry-frame
                     // slot, distinct from whatever it aliases.
-                    let init = self.expr(&cb.init);
+                    let init = match &cb.init {
+                        ast::ConstInit::Expr(e) => self.expr(e),
+                        // The check walk entered no expression here; the value
+                        // is the one it read, found by the decl's own slot.
+                        ast::ConstInit::Embed(e) => {
+                            let Some((ty, value)) = global.and_then(|g| self.ctx.embedded(g))
+                            else {
+                                elaborator_bug("@embed const with no value read", e.span)
+                            };
+                            let ty = self.resolve(ty);
+                            TypedExpr::Const { ty, value }
+                        }
+                    };
                     let sid = self.ctx.intern(&cb.identifier.name);
                     let bind = self.decl_bind(sid, init.ty(), global);
                     self.bind_name(sid, bind.id);

@@ -476,7 +476,10 @@ fn walk_decl<'a>(
     matches: &mut Vec<&'a ast::MatchExpression>,
 ) {
     match decl {
-        ast::Declaration::Const(c) => walk_expr(&c.init, types, matches),
+        ast::Declaration::Const(c) => match &c.init {
+            ast::ConstInit::Expr(e) => walk_expr(e, types, matches),
+            ast::ConstInit::Embed(_) => {}
+        },
         ast::Declaration::Function(f) => match &f.body {
             ast::FnBody::Block(body) => walk_expr(body, types, matches),
             ast::FnBody::Vm(_) => {}

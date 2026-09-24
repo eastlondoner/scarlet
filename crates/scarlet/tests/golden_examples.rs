@@ -188,6 +188,8 @@ suite! {
         // Named tco.scrl: scarlet/internal.scrl's `stack_depth` doc points at it.
         tco,
         errors,
+        // Reads examples/embed/ at compile time.
+        embed,
         // Stdlib surface.
         collections,
         strings,
