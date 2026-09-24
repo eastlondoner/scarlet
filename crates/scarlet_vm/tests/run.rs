@@ -240,6 +240,61 @@ fn a_cell_something_else_holds_is_not_overwritten() {
     );
 }
 
+/// `binary.concat` makes one cell, however many parts it joins. The Scarlet
+/// fold over `append` it replaced made 2,038 here: a binary per part, each
+/// copying everything before it. A change that makes more fails this; one
+/// that makes fewer lowers the number.
+#[test]
+fn concat_of_a_thousand_parts_makes_one_cell() {
+    prints(
+        "import scarlet/array\n\
+         import scarlet/binary\n\
+         import scarlet/internal\n\
+         pub fn main() {\n\
+         \tparts = array.map(0..1000, fn(i) <<i:16>>)\n\
+         \tmade = internal.cells_made()\n\
+         \tjoined = binary.concat(parts)\n\
+         \tprintln(internal.cells_made() - made)\n\
+         \tprintln(binary.byte_size(joined))\n\
+         }\n",
+        "1\n2000\n",
+    );
+}
+
+/// The builders' cells, exactly: `from_floats32` writes 16 floats, a
+/// uniform block's worth, straight into one binary; `repeat` and `from_bytes`
+/// make the binary and the `Ok` around it; `to_floats32` makes an array of
+/// 16 (a leaf and its root) and its `Ok`.
+#[test]
+fn the_binary_builders_make_the_cells_they_return_and_no_others() {
+    prints(
+        "import scarlet/array\n\
+         import scarlet/binary\n\
+         import scarlet/float\n\
+         import scarlet/internal\n\
+         pub fn main() {\n\
+         \txs = array.map(0..16, fn(i) float.from_int(i))\n\
+         \tmade = internal.cells_made()\n\
+         \tpacked = binary.from_floats32(xs, binary.Little)\n\
+         \tprintln(internal.cells_made() - made)\n\
+         \tunit = <<1, 2>>\n\
+         \tmade2 = internal.cells_made()\n\
+         \trepeated = binary.repeat(unit, 4096)\n\
+         \tprintln(internal.cells_made() - made2)\n\
+         \tbytes = [1, 2, 3, 4]\n\
+         \tmade3 = internal.cells_made()\n\
+         \tfrom = binary.from_bytes(bytes)\n\
+         \tprintln(internal.cells_made() - made3)\n\
+         \tmade4 = internal.cells_made()\n\
+         \tunpacked = binary.to_floats32(packed, binary.Little)\n\
+         \tprintln(internal.cells_made() - made4)\n\
+         \tprintln(binary.byte_size(packed))\n\
+         \tprintln(repeated == repeated && from == from && unpacked == Ok(xs))\n\
+         }\n",
+        "1\n2\n2\n3\n64\nTrue\n",
+    );
+}
+
 /// Frames live on the VM's own stack, not Rust's, so a deep recursion that is
 /// not a tail call just uses memory: nothing overflows.
 #[test]

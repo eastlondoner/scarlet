@@ -49,8 +49,8 @@ use super::session::{RawRef, Watermark};
 use super::{PreludeBindings, TypeRef};
 use crate::ast;
 use crate::core_ir::{
-    Abi, Const, ConstId, CoreFn, FuncIdx, HttpTypes, IoErrors, JsonTypes, LoweredFn, Program,
-    Radix, TypeNames, VariantNames, VariantRef,
+    Abi, Const, ConstId, CoreFn, Endian, FuncIdx, HttpTypes, IoErrors, JsonTypes, LoweredFn,
+    Program, Radix, TypeNames, VariantNames, VariantRef,
 };
 use crate::diagnostic::{Diagnostic, DiagnosticCode, has_errors};
 use crate::tivec::{Idx, TiVec};
@@ -1371,6 +1371,7 @@ impl Compiler {
             ok: self.prelude.ok().into(),
             err: self.prelude.err().into(),
             radix: self.radix(),
+            endian: self.endian(),
             io: self.io_errors(),
             json: self.json_types(),
             http: self.http_types(),
@@ -1396,6 +1397,15 @@ impl Compiler {
         Some(Radix {
             dec: variant("Dec")?,
             hex: variant("Hex")?,
+        })
+    }
+
+    /// `scarlet/binary.Endian`'s constructors, by name, as [`Self::radix`].
+    fn endian(&self) -> Option<Endian> {
+        let variant = self.stdlib_variants(&["scarlet", "binary"], "Endian")?;
+        Some(Endian {
+            big: variant("Big")?,
+            little: variant("Little")?,
         })
     }
 

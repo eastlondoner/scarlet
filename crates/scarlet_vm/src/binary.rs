@@ -16,6 +16,8 @@
 //! [`Bits`] is either, as "these bits of this owner". Everything that reads a
 //! binary reads it through [`Bits`], so it does not matter which one it is.
 
+use std::borrow::Cow;
+
 use num_bigint::{BigInt, Sign};
 
 use crate::heap::{Cell, Full, Heap, Kind};
@@ -66,26 +68,72 @@ pub(crate) fn bits(heap: &Heap, cell: Cell) -> Option<Bits> {
     }
 }
 
-/// A new owner holding the first `len` bits of `bytes`. The bits past `len`
-/// in the last byte are cleared.
+/// A new owner holding the first `len` bits of `bytes`, read as zeros past
+/// its end. The bits past `len` in the last byte are cleared.
 pub(crate) fn make(heap: &mut Heap, bytes: &[u8], len: u64) -> Result<Cell, Full> {
-    let n = len.div_ceil(8) as usize;
-    let mut buf: Vec<u8> = bytes.iter().copied().take(n).collect();
-    buf.resize(n, 0);
-    let pad = n as u64 * 8 - len;
-    if let Some(last) = buf.last_mut() {
-        *last &= 0xFFu8 << pad;
+    fill(heap, len, |out| {
+        let n = out.len().min(bytes.len());
+        let (copied, rest) = out.split_at_mut(n);
+        copied.copy_from_slice(bytes.get(..n).unwrap_or(&[]));
+        rest.fill(0);
+        Ok::<(), Full>(())
+    })?
+}
+
+/// Whether an owner's bytes lie in its words in order, so they can be read
+/// and filled as a slice of its own memory. Its words hold its bytes first
+/// byte lowest, which is their order in memory on a little-endian host. On a
+/// big-endian one, [`byte_view`] and [`fill`] go through a copy.
+const BYTES_IN_PLACE: bool = cfg!(target_endian = "little");
+
+/// A new owner of `len` bits, whose bytes `write` puts straight into the
+/// cell ([`BYTES_IN_PLACE`]): it is handed exactly `len.div_ceil(8)` bytes
+/// and must fill them all. The bits past `len` in the last byte are cleared
+/// after. When `write` fails the cell is freed, and its error is the answer.
+pub(crate) fn fill<E>(
+    heap: &mut Heap,
+    len: u64,
+    write: impl FnOnce(&mut [u8]) -> Result<(), E>,
+) -> Result<Result<Cell, E>, Full> {
+    let n = usize::try_from(len.div_ceil(8)).map_err(|_| Full)?;
+    let cell = heap.make_uninit(Kind::Binary, 1 + n.div_ceil(8))?;
+    let data = heap.data_mut(cell);
+    let [head, words @ ..] = data else {
+        heap.release(cell);
+        return Err(Full);
+    };
+    *head = len;
+    // A reused cell holds what it last held: the bytes past `n` in the last
+    // word must read as zeros, like any other bits past the end.
+    if let Some(last) = words.last_mut() {
+        *last = 0;
     }
-    let mut data = Vec::with_capacity(1 + n.div_ceil(8));
-    data.push(len);
-    for chunk in buf.chunks(8) {
-        let mut word = [0u8; 8];
-        for (w, b) in word.iter_mut().zip(chunk) {
-            *w = *b;
+    let wrote = if BYTES_IN_PLACE {
+        let bytes: &mut [u8] = bytemuck::cast_slice_mut(words);
+        write(bytes.get_mut(..n).unwrap_or(&mut []))
+    } else {
+        let mut bytes = vec![0u8; n];
+        let wrote = write(&mut bytes);
+        for (w, chunk) in words.iter_mut().zip(bytes.chunks(8)) {
+            let mut word = [0u8; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            *w = u64::from_le_bytes(word);
         }
-        data.push(u64::from_le_bytes(word));
+        wrote
+    };
+    if let Err(e) = wrote {
+        heap.release(cell);
+        return Ok(Err(e));
     }
-    heap.make(Kind::Binary, &data)
+    let pad = n as u64 * 8 - len;
+    if pad > 0
+        && let Some(w) = words.get_mut((n - 1) / 8)
+    {
+        let shift = (n - 1) % 8 * 8;
+        let last = (*w >> shift) as u8 & (0xFFu8 << pad);
+        *w = *w & !(0xFF << shift) | u64::from(last) << shift;
+    }
+    Ok(Ok(cell))
 }
 
 /// Bits `from .. from + len` of `b`, sharing its owner. The caller has
@@ -190,6 +238,32 @@ pub(crate) fn bytes_are(heap: &Heap, b: Bits, from: u64, text: &[u8]) -> bool {
         .all(|(&t, k)| byte(heap, b, k * 8) == t)
 }
 
+/// `b`'s bytes, read in place when they can be and copied when not. `b` must
+/// be whole bytes; a last byte that is not whole is padded with zero bits, as
+/// [`bytes`] does.
+///
+/// In place is a whole-byte binary starting on a byte of its owner, on a
+/// little-endian host, where the owner's words hold its bytes in order in
+/// memory. That is every binary a program builds whole, and every slice of
+/// one at a byte, so handing one to the OS or a GPU copies it once, there.
+pub(crate) fn byte_view(heap: &Heap, b: Bits) -> Cow<'_, [u8]> {
+    match in_place(heap, b) {
+        Some(bytes) => Cow::Borrowed(bytes),
+        None => Cow::Owned(bytes(heap, b)),
+    }
+}
+
+fn in_place(heap: &Heap, b: Bits) -> Option<&[u8]> {
+    if !BYTES_IN_PLACE || !b.len.is_multiple_of(8) || !b.at.is_multiple_of(8) {
+        return None;
+    }
+    let words = heap.data(b.owner).get(1..)?;
+    let all: &[u8] = bytemuck::cast_slice(words);
+    let from = usize::try_from(b.at / 8).ok()?;
+    let n = usize::try_from(b.len / 8).ok()?;
+    all.get(from..from.checked_add(n)?)
+}
+
 /// `b` as whole bytes, the last one padded with zero bits.
 pub(crate) fn bytes(heap: &Heap, b: Bits) -> Vec<u8> {
     (0..b.len.div_ceil(8))
@@ -229,32 +303,198 @@ pub(crate) fn has_at(heap: &Heap, b: Bits, at: u64, prefix: Bits) -> bool {
     equal(heap, window, prefix)
 }
 
-/// All of `parts`, one after another, as a new owner.
+/// All of `parts`, one after another, as a new owner: one cell, each of its
+/// bytes written once. A part that lands on a byte of the result and starts
+/// on a byte of its own owner is copied a run of whole bytes at a time,
+/// straight from its owner's cell into the new one ([`Heap::copy_bytes`]).
+/// Any other goes 8 bits at a time, shifted into place.
 pub(crate) fn join(heap: &mut Heap, parts: &[Bits]) -> Result<Cell, Full> {
-    let len: u64 = parts.iter().map(|p| p.len).sum();
-    let mut out = vec![0u8; len.div_ceil(8) as usize];
-    let mut at = 0u64;
-    for p in parts {
-        for k in 0..p.len.div_ceil(8) {
-            let chunk = byte(heap, *p, k * 8);
-            let n = (p.len - k * 8).min(8);
-            put(&mut out, at + k * 8, chunk, n);
-        }
-        at += p.len;
-    }
-    make(heap, &out, len)
+    let len = parts
+        .iter()
+        .try_fold(0u64, |total, p| total.checked_add(p.len))
+        .filter(|&len| len <= MAX_BITS)
+        .ok_or(Full)?;
+    join_as(heap, len, parts.iter().copied())
 }
 
-/// Write the top `n` bits of `chunk` into `out` from bit `at`.
-fn put(out: &mut [u8], at: u64, chunk: u8, n: u64) {
-    for j in 0..n {
-        if chunk & (0x80 >> j) != 0 {
-            let p = at + j;
-            if let Some(b) = out.get_mut((p / 8) as usize) {
-                *b |= 0x80 >> (p % 8);
-            }
+/// [`join`] of `parts`, which are `len` bits between them.
+fn join_as(heap: &mut Heap, len: u64, parts: impl Iterator<Item = Bits>) -> Result<Cell, Full> {
+    let n = usize::try_from(len.div_ceil(8)).map_err(|_| Full)?;
+    let cell = heap.make_uninit(Kind::Binary, 1 + n.div_ceil(8))?;
+    if let [head, words @ ..] = heap.data_mut(cell) {
+        *head = len;
+        // A reused cell holds what it last held: the bytes past `n` in the
+        // last word must read as zeros, like any other bits past the end.
+        if let Some(last) = words.last_mut() {
+            *last = 0;
         }
     }
+    let mut out = Joined {
+        cell,
+        at: 0,
+        carry: 0,
+        run: Vec::new(),
+    };
+    for p in parts {
+        let mut from = 0;
+        if BYTES_IN_PLACE && out.at.is_multiple_of(8) && p.at.is_multiple_of(8) {
+            out.flush(heap);
+            let whole = p.len / 8;
+            if copy_whole(heap, p, cell, out.at / 8, whole) {
+                out.at += whole * 8;
+                from = whole;
+            }
+        }
+        for k in from..p.len.div_ceil(8) {
+            let chunk = byte(heap, p, k * 8);
+            out.push(heap, chunk, (p.len - k * 8).min(8));
+        }
+    }
+    out.flush(heap);
+    if !out.at.is_multiple_of(8) {
+        let last = [out.carry];
+        write(heap, cell, out.at / 8, &last);
+    }
+    Ok(cell)
+}
+
+/// Copy the first `n` bytes of `p`, which starts on a byte of its owner,
+/// into the owner `cell` from its byte `at`. `false`, copying nothing, when
+/// they do not fit.
+fn copy_whole(heap: &mut Heap, p: Bits, cell: Cell, at: u64, n: u64) -> bool {
+    // An owner's bytes follow the word holding its length.
+    let (Ok(from), Ok(to), Ok(n)) = (
+        usize::try_from(8 + p.at / 8),
+        usize::try_from(8 + at),
+        usize::try_from(n),
+    ) else {
+        return false;
+    };
+    heap.copy_bytes(p.owner, from, cell, to, n)
+}
+
+/// A binary [`join`] is writing, `at` bits in. `carry` holds the top `at % 8`
+/// bits of the byte not yet whole, and `run` the whole bytes before it that
+/// are not in the cell yet.
+struct Joined {
+    cell: Cell,
+    at: u64,
+    carry: u8,
+    run: Vec<u8>,
+}
+
+impl Joined {
+    /// The most bytes `run` holds before they go to the cell.
+    const RUN: usize = 4096;
+
+    /// Add the top `n` bits of `chunk`, the rest of which are zero.
+    fn push(&mut self, heap: &mut Heap, chunk: u8, n: u64) {
+        let s = (self.at % 8) as u32;
+        let v = self.carry | (chunk >> s);
+        if u64::from(s) + n >= 8 {
+            self.run.push(v);
+            // What did not fit, moved to the top: `chunk`'s low `s` bits.
+            self.carry = chunk.checked_shl(8 - s).unwrap_or(0);
+        } else {
+            self.carry = v;
+        }
+        self.at += n;
+        if self.run.len() >= Self::RUN {
+            self.flush(heap);
+        }
+    }
+
+    /// Put `run` in the cell, where it ends at the byte `carry` is part of.
+    fn flush(&mut self, heap: &mut Heap) {
+        if self.run.is_empty() {
+            return;
+        }
+        let end = self.at / 8;
+        write(heap, self.cell, end - self.run.len() as u64, &self.run);
+        self.run.clear();
+    }
+}
+
+/// Write `bytes` into the owner `cell` from its byte `at`. The caller has
+/// made the cell long enough.
+fn write(heap: &mut Heap, cell: Cell, at: u64, bytes: &[u8]) {
+    let Some(words) = heap.data_mut(cell).get_mut(1..) else {
+        return;
+    };
+    if BYTES_IN_PLACE {
+        let all: &mut [u8] = bytemuck::cast_slice_mut(words);
+        let into = usize::try_from(at)
+            .ok()
+            .and_then(|at| all.get_mut(at..at.checked_add(bytes.len())?));
+        if let Some(into) = into {
+            into.copy_from_slice(bytes);
+        }
+        return;
+    }
+    for (i, &b) in (at..).zip(bytes) {
+        if let Some(w) = words.get_mut((i / 8) as usize) {
+            let shift = i % 8 * 8;
+            *w = *w & !(0xFF << shift) | u64::from(b) << shift;
+        }
+    }
+}
+
+/// `b`, `n` times over, as a new owner, or `Err(Full)` when that is longer
+/// than a binary can be. A whole-byte `b` is copied into the cell `n` times;
+/// any other is [`join`]ed, since each copy then starts at another bit.
+pub(crate) fn repeat(heap: &mut Heap, b: Bits, n: u64) -> Result<Cell, Full> {
+    let len = b
+        .len
+        .checked_mul(n)
+        .filter(|&len| len <= MAX_BITS)
+        .ok_or(Full)?;
+    if len == 0 {
+        return make(heap, &[], 0);
+    }
+    if !b.len.is_multiple_of(8) {
+        let n = usize::try_from(n).map_err(|_| Full)?;
+        return join_as(heap, len, std::iter::repeat_n(b, n));
+    }
+    let one = byte_view(heap, b).into_owned();
+    fill(heap, len, |out| {
+        for copy in out.chunks_exact_mut(one.len()) {
+            copy.copy_from_slice(&one);
+        }
+        Ok::<(), Full>(())
+    })?
+}
+
+/// A byte order, as `scarlet/binary.Endian` names one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Endian {
+    Big,
+    Little,
+}
+
+/// A Float as an f32. One past the largest f32 stops there, keeping its
+/// sign, since `as f32` would make it an infinity; anything else rounds to
+/// the nearest f32, subnormals and -0.0 included. A Float is never a NaN
+/// (`docs/semantics.md`, "Floats"), so no f32 made here is one either.
+pub(crate) fn narrow(x: f64) -> f32 {
+    x.clamp(f64::from(f32::MIN), f64::from(f32::MAX)) as f32
+}
+
+/// `x`'s 4 bytes, in `endian`'s order.
+pub(crate) fn f32_bytes(x: f32, endian: Endian) -> [u8; 4] {
+    match endian {
+        Endian::Big => x.to_be_bytes(),
+        Endian::Little => x.to_le_bytes(),
+    }
+}
+
+/// The f32 `bytes` spell in `endian`'s order, or `None` for an infinity or a
+/// NaN, which no Float can hold.
+pub(crate) fn read_f32(bytes: [u8; 4], endian: Endian) -> Option<f32> {
+    let x = match endian {
+        Endian::Big => f32::from_be_bytes(bytes),
+        Endian::Little => f32::from_le_bytes(bytes),
+    };
+    x.is_finite().then_some(x)
 }
 
 /// The low `width` bits of `n`, most significant first. A negative `n` is
@@ -337,6 +577,7 @@ pub(crate) fn text(heap: &Heap, b: Bits) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::value::View;
 
     fn owner(heap: &mut Heap, bytes: &[u8], len: u64) -> Bits {
         let cell = make(heap, bytes, len).expect("room");
@@ -397,6 +638,247 @@ mod tests {
         assert_eq!(bytes(&heap, j), vec![0b1011_1111, 0b1111_1010]);
     }
 
+    /// A small, seeded generator, so a failure names the case that made it.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            // xorshift64*
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// `join` as it was before its fast path: every part 8 bits at a time,
+    /// each bit set on its own.
+    fn join_bit_by_bit(heap: &Heap, parts: &[Bits]) -> (Vec<u8>, u64) {
+        let len: u64 = parts.iter().map(|p| p.len).sum();
+        let mut out = vec![0u8; len.div_ceil(8) as usize];
+        let mut at = 0u64;
+        for p in parts {
+            for k in 0..p.len.div_ceil(8) {
+                let chunk = byte(heap, *p, k * 8);
+                for j in 0..(p.len - k * 8).min(8) {
+                    if chunk & (0x80 >> j) != 0 {
+                        let q = at + k * 8 + j;
+                        out[(q / 8) as usize] |= 0x80 >> (q % 8);
+                    }
+                }
+            }
+            at += p.len;
+        }
+        (out, len)
+    }
+
+    /// Random parts of every shape a join meets: owners whole or ending
+    /// mid-byte, empty ones, and slices starting on a byte and off one. The
+    /// result is the same bits the bit-by-bit join gives, in a cell that may
+    /// have been another binary's.
+    #[test]
+    fn join_gives_the_bits_the_bit_by_bit_join_did() {
+        let mut rng = Rng(0x5CA7_1E7B_1A71_0001);
+        let mut heap = Heap::default();
+        for round in 0..2_000 {
+            let mut parts = Vec::new();
+            let mut held = Vec::new();
+            for _ in 0..rng.below(12) {
+                let len = match rng.below(4) {
+                    0 => rng.below(8),
+                    1 => rng.below(40) * 8,
+                    _ => rng.below(300),
+                };
+                let bytes: Vec<u8> = (0..len.div_ceil(8)).map(|_| rng.next() as u8).collect();
+                let cell = make(&mut heap, &bytes, len).expect("room");
+                held.push(cell);
+                let b = bits(&heap, cell).expect("a binary");
+                let p = if len > 0 && rng.below(2) == 0 {
+                    let from = rng.below(len);
+                    let take = rng.below(len - from + 1);
+                    let cut = slice(&mut heap, b, from, take).expect("room");
+                    held.push(cut);
+                    bits(&heap, cut).expect("a slice")
+                } else {
+                    b
+                };
+                parts.push(p);
+            }
+            let (want, len) = join_bit_by_bit(&heap, &parts);
+            let joined = join(&mut heap, &parts).expect("room");
+            let got = bits(&heap, joined).expect("a binary");
+            assert_eq!(got.len, len, "round {round}");
+            assert_eq!(bytes(&heap, got), want, "round {round}");
+            // Every bit past the end reads as zero, in every word the cell has.
+            let words = &heap.data(joined)[1..];
+            let all: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            assert!(all[want.len()..].iter().all(|&b| b == 0), "round {round}");
+            // Dirty the cells a later round's join will reuse.
+            held.push(joined);
+            for cell in held {
+                heap.release(cell);
+            }
+        }
+        assert_eq!(heap.live(), 0);
+    }
+
+    /// Parts that each land on a byte and start on one are copied cell to
+    /// cell, every byte once; a part off a byte is not, and the parts after
+    /// it no longer land on a byte.
+    #[test]
+    fn a_join_on_whole_bytes_copies_each_byte_once() {
+        let mut heap = Heap::default();
+        let data: Vec<u8> = (0..=255).collect();
+        let part = owner(&mut heap, &data, 256 * 8);
+        let parts = vec![part; 1_000];
+        let before = heap.copied();
+        let joined = join(&mut heap, &parts).expect("room");
+        let joined = bits(&heap, joined).expect("a binary");
+        let expected = if BYTES_IN_PLACE { 256_000 } else { 0 };
+        assert_eq!(heap.copied() - before, expected);
+        assert_eq!(bytes(&heap, joined), data.repeat(1_000));
+
+        let odd = owner(&mut heap, &[0b1010_0000], 3);
+        let before = heap.copied();
+        let joined = join(&mut heap, &[part, odd, part]).expect("room");
+        let joined = bits(&heap, joined).expect("a binary");
+        let expected = if BYTES_IN_PLACE { 256 } else { 0 };
+        assert_eq!(heap.copied() - before, expected);
+        assert_eq!(joined.len, 256 * 8 * 2 + 3);
+    }
+
+    /// A part off a byte longer than the bytes [`Joined`] holds before
+    /// writing them goes to the cell in several runs, each where it belongs.
+    #[test]
+    fn a_long_join_off_a_byte_writes_every_run_in_place() {
+        let mut heap = Heap::default();
+        let data: Vec<u8> = (0..10_000u32).map(|i| (i * 7 + i / 256) as u8).collect();
+        let long = owner(&mut heap, &data, 10_000 * 8);
+        let odd = owner(&mut heap, &[0b1010_0000], 3);
+        let off = slice(&mut heap, long, 5, 9_000 * 8).expect("room");
+        let off = bits(&heap, off).expect("a slice");
+        let parts = [odd, long, odd, off, long];
+        let (want, len) = join_bit_by_bit(&heap, &parts);
+        let joined = join(&mut heap, &parts).expect("room");
+        let got = bits(&heap, joined).expect("a binary");
+        assert_eq!(got.len, len);
+        assert_eq!(bytes(&heap, got), want);
+    }
+
+    #[test]
+    fn repeat_gives_n_copies_of_bytes_or_bits() {
+        let mut heap = Heap::default();
+        let b = owner(&mut heap, &[1, 2], 16);
+        for (n, want) in [(0, "<<>>"), (1, "<<1, 2>>"), (3, "<<1, 2, 1, 2, 1, 2>>")] {
+            let r = repeat(&mut heap, b, n).expect("room");
+            assert_eq!(text(&heap, bits(&heap, r).expect("a binary")), want);
+        }
+        // 101 three times: 1011 0110 1.
+        let b = owner(&mut heap, &[0b1010_0000], 3);
+        let r = repeat(&mut heap, b, 3).expect("room");
+        assert_eq!(
+            text(&heap, bits(&heap, r).expect("a binary")),
+            "<<182, 1:size(1)>>"
+        );
+        let empty = owner(&mut heap, &[], 0);
+        let r = repeat(&mut heap, empty, u64::MAX).expect("room");
+        assert_eq!(bits(&heap, r).expect("a binary").len, 0);
+        assert_eq!(repeat(&mut heap, b, u64::MAX), Err(Full));
+        assert_eq!(repeat(&mut heap, b, MAX_BITS / 3 + 1), Err(Full));
+    }
+
+    /// Whatever 64 bits a Float is made from, its f32 is finite. A Float is
+    /// made only through `Value::float`, which never holds a NaN; the bits
+    /// that are not a NaN, infinities among them, are checked as they are.
+    #[test]
+    fn no_packed_f32_is_infinite_or_nan() {
+        let mut rng = Rng(0xF10A_7320_0000_0002);
+        let edges = [
+            f64::MAX,
+            f64::MIN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::from(f32::MAX),
+            f64::from(f32::MIN),
+            // Half an ulp past f32::MAX: `as f32` rounds this to infinity.
+            f64::from(f32::MAX) + 2f64.powi(103),
+            -(f64::from(f32::MAX) + 2f64.powi(103)),
+            f64::MIN_POSITIVE,
+            -0.0,
+        ];
+        let random = (0..1_000_000).map(|_| f64::from_bits(rng.next()));
+        for x in edges.into_iter().chain(random) {
+            let View::Float(float) = Value::float(x).view() else {
+                panic!("{x} is not a Float");
+            };
+            assert!(narrow(float).is_finite(), "{x:e} as a Float");
+            if !x.is_nan() {
+                assert!(narrow(x).is_finite(), "{x:e}");
+            }
+        }
+        assert_eq!(narrow(f64::MAX), f32::MAX);
+        assert_eq!(narrow(f64::MIN), f32::MIN);
+        assert_eq!(narrow(f64::from(f32::MAX) + 2f64.powi(103)), f32::MAX);
+    }
+
+    /// Every class of finite f32 — zeros of both signs, subnormals, normals
+    /// up to the largest — is the same f32 after going to a Float and back,
+    /// and after being written and read in either byte order.
+    #[test]
+    fn every_finite_f32_packs_and_unpacks_as_itself() {
+        let mut rng = Rng(0xF10A_7320_0000_0003);
+        let classes = [
+            0.0,
+            f32::from_bits(1),
+            f32::from_bits(0x007F_FFFF),
+            f32::MIN_POSITIVE,
+            1.0,
+            f32::MAX,
+        ];
+        let signed = classes.into_iter().flat_map(|x| [x, -x]);
+        let random = (0..1_000_000)
+            .map(|_| f32::from_bits(rng.next() as u32))
+            .filter(|x| x.is_finite());
+        for x in signed.chain(random) {
+            assert_eq!(narrow(f64::from(x)).to_bits(), x.to_bits(), "{x:e}");
+            for endian in [Endian::Big, Endian::Little] {
+                let back = read_f32(f32_bytes(x, endian), endian).expect("finite");
+                assert_eq!(back.to_bits(), x.to_bits(), "{x:e} {endian:?}");
+            }
+        }
+        assert_eq!(f32_bytes(1.0, Endian::Little), [0, 0, 128, 63]);
+        assert_eq!(f32_bytes(1.0, Endian::Big), [63, 128, 0, 0]);
+    }
+
+    /// Four bytes that spell an infinity or a NaN, of any sign or payload,
+    /// are no f32 a Float can hold.
+    #[test]
+    fn an_infinity_or_a_nan_reads_as_none() {
+        let not_finite = [
+            0x7F80_0000u32,
+            0xFF80_0000,
+            0x7FC0_0000,
+            0xFFC0_0000,
+            0x7F80_0001,
+            0x7FBF_FFFF,
+            0x7FFF_FFFF,
+            0xFFFF_FFFF,
+        ];
+        for bits in not_finite {
+            for endian in [Endian::Big, Endian::Little] {
+                let bytes = match endian {
+                    Endian::Big => bits.to_be_bytes(),
+                    Endian::Little => bits.to_le_bytes(),
+                };
+                assert_eq!(read_f32(bytes, endian), None, "{bits:#x} {endian:?}");
+            }
+        }
+    }
+
     #[test]
     fn utf8_reads_one_code_point_or_none() {
         let mut heap = Heap::default();
@@ -405,5 +887,89 @@ mod tests {
         assert_eq!(read_utf8(&heap, b, 16), Some(('!' as u32, 8)));
         assert_eq!(read_utf8(&heap, b, 8), None);
         assert_eq!(read_utf8(&heap, b, 24), None);
+    }
+
+    /// A binary made whole, and a slice of one at a byte, are read in place
+    /// on a little-endian host: what goes to a file or a GPU is not copied on
+    /// the way. Anything else is a copy of the same bytes.
+    #[test]
+    fn whole_bytes_on_a_byte_are_read_in_place() {
+        let mut heap = Heap::default();
+        let data: Vec<u8> = (0..20).collect();
+        let b = owner(&mut heap, &data, 160);
+        let at_a_byte = slice(&mut heap, b, 24, 80).expect("room");
+        let at_a_byte = bits(&heap, at_a_byte).expect("a slice");
+        let at_a_bit = slice(&mut heap, b, 3, 80).expect("room");
+        let at_a_bit = bits(&heap, at_a_bit).expect("a slice");
+        let part = owner(&mut heap, &data, 157);
+        let little = cfg!(target_endian = "little");
+        for (b, in_place) in [
+            (b, little),
+            (at_a_byte, little),
+            (at_a_bit, false),
+            (part, false),
+        ] {
+            let view = byte_view(&heap, b);
+            assert_eq!(
+                matches!(view, Cow::Borrowed(_)),
+                in_place,
+                "{}",
+                text(&heap, b)
+            );
+            assert_eq!(*view, bytes(&heap, b)[..], "{}", text(&heap, b));
+        }
+        assert_eq!(*byte_view(&heap, at_a_byte), data[3..13]);
+    }
+
+    /// A cell a binary reuses may hold another's bytes. A new one reads as
+    /// its own bytes and zeros after, however long, in every word.
+    #[test]
+    fn a_binary_in_a_reused_cell_holds_only_its_own_bytes() {
+        let mut heap = Heap::default();
+        for n in 1..=24 {
+            let dirty = make(&mut heap, &[0xFF; 24], 24 * 8).expect("room");
+            let words = heap.data(dirty).len();
+            heap.release(dirty);
+            let data: Vec<u8> = (1..=n).collect();
+            let cell = make(&mut heap, &data, u64::from(n) * 8).expect("room");
+            let b = bits(&heap, cell).expect("a binary");
+            assert_eq!(bytes(&heap, b), data);
+            let d = heap.data(cell);
+            let want: Vec<u8> = data
+                .iter()
+                .copied()
+                .chain(std::iter::repeat(0))
+                .take((d.len() - 1) * 8)
+                .collect();
+            let got: Vec<u8> = d[1..].iter().flat_map(|w| w.to_le_bytes()).collect();
+            assert_eq!(
+                got,
+                want,
+                "{n} bytes, in a cell of {} words once {words}",
+                d.len()
+            );
+            heap.release(cell);
+        }
+        assert_eq!(heap.live(), 0);
+    }
+
+    /// A fill that fails frees the cell it was writing, and gives the error.
+    #[test]
+    fn a_failed_fill_frees_its_cell() {
+        let mut heap = Heap::default();
+        let made = fill(&mut heap, 64, |out| {
+            out.fill(7);
+            Err::<(), &str>("refused")
+        });
+        assert_eq!(made.expect("room").err(), Some("refused"));
+        assert_eq!(heap.live(), 0);
+        let made = fill(&mut heap, 12, |out| {
+            assert_eq!(out.len(), 2);
+            out.copy_from_slice(&[0xAB, 0xFF]);
+            Ok::<(), &str>(())
+        });
+        let cell = made.expect("room").expect("filled");
+        let b = bits(&heap, cell).expect("a binary");
+        assert_eq!(text(&heap, b), "<<171, 15:size(4)>>");
     }
 }

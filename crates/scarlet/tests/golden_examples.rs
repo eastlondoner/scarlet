@@ -318,6 +318,12 @@ suite! {
         // checks (length, two draws differ, not a uniform fill). Not a
         // quality test, and not the JIT — see native_backend.rs.
         crypto,
+        // scarlet/binary's builders: `concat` against the Scarlet fold it
+        // replaced on seeded random mixes of bit-level and byte-level parts,
+        // `repeat` and `from_bytes` at their edges, and the IEEE bytes of
+        // `from_floats32` and `to_floats32`: the clamp at the largest f32,
+        // -0.0, a subnormal, and every infinity or NaN refused.
+        binary_builders,
     ],
 
     // No golden, because there is no fixed output: `http_server` ends in an
@@ -337,6 +343,7 @@ suite! {
     // Perf infrastructure driven from outside this file (scripts/bench*.sh, and
     // `vm_exec::bench_typed_output_is_pinned`), plus the scratch pair.
     untested: [
+        "bench_binary.scrl",
         "bench_heavy.scrl",
         "bench_list_1x.scrl",
         "bench_list_2x.scrl",

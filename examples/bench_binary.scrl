@@ -1,0 +1,46 @@
+// Building binaries in bulk, timed from inside the program: `binary.concat`
+// of 1 MiB in 4,096 parts, and a 256 x 256 x 128 volume of 16-bit block
+// states built a column at a time from `repeat` and `concat`, as a static
+// world's terrain is. scripts/bench_binary.sh runs it and keeps the best of
+// several runs.
+
+import scarlet/array
+import scarlet/binary
+import scarlet/time
+
+// Run `f` `n` times, and give the byte size of the last binary it made, so the
+// work cannot be skipped.
+fn times(n Int, f fn() Binary, size Int) Int {
+	if n <= 0 {
+		size
+	} else {
+		times(n - 1, f, binary.byte_size(f()))
+	}
+}
+
+// Microseconds each of `n` runs of `f` took, on average, and the byte size
+// of what the last one made.
+fn per_run_us(name String, n Int, f fn() Binary) {
+	start = time.monotonic()
+	size = times(n, f, 0)
+	us = time.since_ms(time.monotonic(), start) * 1000 / n
+	println('${name} ${us} us ${size} bytes')
+}
+
+// Stone to a height that varies with `i`, then 4 of dirt, 1 of grass, and air
+// to the top: 128 blocks of 2 bytes. No count here is negative, so no
+// `repeat` is an `Err`.
+fn column(i Int) Binary {
+	h = 56 + i % 8
+	stone = binary.repeat(<<0, 1>>, h) or <<>>
+	dirt = binary.repeat(<<0, 3>>, 4) or <<>>
+	air = binary.repeat(<<0, 0>>, 128 - h - 5) or <<>>
+	binary.concat([stone, dirt, <<0, 2>>, air])
+}
+
+pub fn main() {
+	part = array.fold(0..256, <<>>, fn(acc, i) <<acc:binary, i:8>>)
+	parts = array.map(0..4096, fn(_i) part)
+	per_run_us('concat_4096x256', 200, fn() binary.concat(parts))
+	per_run_us('volume_256x256x128', 5, fn() binary.concat(array.map(0..65536, column)))
+}

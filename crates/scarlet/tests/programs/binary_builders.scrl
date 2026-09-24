@@ -1,0 +1,160 @@
+// scarlet/binary's builders: `concat`, `repeat`, `from_bytes`, and packing
+// Floats as 32-bit IEEE floats with `from_floats32` and `to_floats32`.
+//
+// `concat` is a built-in that joins every part in one pass. It must give
+// exactly the bits the Scarlet fold over `append` it replaced gave, bit-level
+// parts included, so the random mixes below compare the two, and compare both
+// with the bits read back one at a time by a pattern, which shares no code
+// with either join.
+//
+// The float bytes are the IEEE 754 encodings, written out rather than
+// computed here: 1.0 is 0x3F800000, the largest f32 is 0x7F7FFFFF, -0.0 is
+// 0x80000000, and 1.0e-40 is the subnormal 0x000116C2.
+
+import scarlet/array
+import scarlet/binary
+
+fn ok(b Bool) String {
+	if b { 'PASS' } else { 'FAIL' }
+}
+
+// The old `binary.concat`, as it was written in Scarlet.
+fn fold_concat(parts Array(Binary)) Binary {
+	array.fold(parts, <<>>, fn(acc, p) binary.append(acc, p))
+}
+
+// `b`'s bits, one Int each, read by a pattern.
+fn bits_of(b Binary, acc Array(Int)) Array(Int) {
+	match b {
+		<<x:1, rest:binary>> -> bits_of(rest, [..acc, x])
+		_ -> acc
+	}
+}
+
+// The next state of a linear congruential generator (the C standard's
+// constants), so every run makes the same parts.
+fn next(seed Int) Int {
+	{ seed * 1103515245 + 12345 } % 2147483648
+}
+
+// Part `seed` picks: an empty binary, one of 1 to 7 bits, one of whole bytes,
+// or a slice of one starting off a byte.
+fn part(seed Int) Binary {
+	a = next(seed)
+	b = next(a)
+	c = next(b)
+	match a % 4 {
+		0 -> <<>>
+		1 -> <<b:size(1 + c % 7)>>
+		2 -> binary.repeat(<<b:8, c:8>>, 1 + c % 5) or <<>>
+		_ -> binary.slice_bits(<<b:32, c:32>>, 1 + c % 7, c % 50) or <<>>
+	}
+}
+
+// Round `n` of the random mixes: up to 9 parts.
+fn parts(n Int) Array(Binary) {
+	count = next(n * 7919) % 10
+	array.map(0..count, fn(i) part(n * 1000 + i))
+}
+
+fn same_as_the_fold(rounds Int) Bool {
+	array.all(0..rounds, fn(n) {
+		ps = parts(n)
+		joined = binary.concat(ps)
+		joined == fold_concat(ps) &&
+			bits_of(joined, []) == array.fold(ps, [], fn(acc, p) array.concat(acc, bits_of(p, [])))
+	})
+}
+
+fn floats(r Result(Array(Float), Nil)) String {
+	match r {
+		Ok(xs) -> '${xs}'
+		Err(Nil) -> 'Err(Nil)'
+	}
+}
+
+pub fn main() {
+	// --- from_bytes ------------------------------------------------------------
+	println('from_bytes [1, 2, 255]: ${binary.from_bytes([1, 2, 255])}')
+	println('from_bytes [256]: ${binary.from_bytes([256])}')
+	println('from_bytes [-1]: ${binary.from_bytes([-1])}')
+	println('from_bytes []: ${binary.from_bytes([])}')
+	println('from_bytes [0, 256, 1]: ${binary.from_bytes([0, 256, 1])}')
+	println('from_bytes 253..256: ${binary.from_bytes(253..256)}')
+	println('from_bytes 254..257: ${binary.from_bytes(254..257)}')
+	println('from_bytes -1..2: ${binary.from_bytes(-1..2)}')
+
+	// --- repeat ----------------------------------------------------------------
+	println('repeat 3: ${binary.repeat(<<1, 2>>, 3)}')
+	println('repeat 0: ${binary.repeat(<<1, 2>>, 0)}')
+	println('repeat -1: ${binary.repeat(<<1, 2>>, -1)}')
+	println('repeat bits: ${binary.repeat(<<5:3>>, 3)}')
+	println('repeat empty: ${binary.repeat(<<>>, 1000000)}')
+
+	// --- concat ----------------------------------------------------------------
+	println('concat []: ${binary.concat([])}')
+	println('concat empties: ${binary.concat([<<>>, <<>>])}')
+	println('concat mixed: ${binary.concat([<<1, 2>>, <<3:4>>, <<>>, <<255>>, <<1:1>>])}')
+	println('concat == fold, 500 random mixes: ${ok(same_as_the_fold(500))}')
+
+	// --- from_floats32 ---------------------------------------------------------
+	println('1.0 little: ${binary.from_floats32([1.0], binary.Little)}')
+	println('1.0 big: ${binary.from_floats32([1.0], binary.Big)}')
+	max = binary.from_floats32([340282346638528859811704183484516925440.0], binary.Little)
+	println('largest f32: ${max}')
+	println(
+		'1.0e39 stops at the largest f32: ${ok(
+			binary.from_floats32([1000000000000000000000000000000000000000.0], binary.Little) == max,
+		)}',
+	)
+	println(
+		'-1.0e39: ${binary.from_floats32(
+			[-1000000000000000000000000000000000000000.0],
+			binary.Little,
+		)}',
+	)
+	println(
+		'half an ulp past it stops there too: ${ok(
+			binary.from_floats32([340282356779733661637539395458142568448.0], binary.Little) == max,
+		)}',
+	)
+	println('-0.0: ${binary.from_floats32([-0.0], binary.Little)}')
+	println(
+		'1.0e-40, a subnormal: ${binary.from_floats32(
+			[0.0000000000000000000000000000000000000001],
+			binary.Little,
+		)}',
+	)
+	println('none: ${binary.from_floats32([], binary.Big)}')
+
+	// --- to_floats32 -----------------------------------------------------------
+	xs = [1.5, -2.25, 0.0, -0.0, 1024.0, 0.1, 0.0000000000000000000000000000000000000001]
+	println(
+		'round trip little: ${floats(
+			binary.to_floats32(binary.from_floats32(xs, binary.Little), binary.Little),
+		)}',
+	)
+	println(
+		'round trip big: ${floats(
+			binary.to_floats32(binary.from_floats32(xs, binary.Big), binary.Big),
+		)}',
+	)
+	packed = binary.from_floats32(xs, binary.Little)
+	back = match binary.to_floats32(packed, binary.Little) {
+		Ok(ys) -> binary.from_floats32(ys, binary.Little) == packed
+		Err(Nil) -> False
+	}
+	println('bytes survive a round trip: ${ok(back)}')
+	println('read in the other order: ${floats(binary.to_floats32(<<0, 0, 128, 63>>, binary.Big))}')
+	println('5 bytes: ${floats(binary.to_floats32(<<1, 2, 3, 4, 5>>, binary.Little))}')
+	println('31 bits: ${floats(binary.to_floats32(<<1, 2, 3, 4:7>>, binary.Little))}')
+	println('empty: ${floats(binary.to_floats32(<<>>, binary.Little))}')
+	println('+infinity: ${floats(binary.to_floats32(<<127, 128, 0, 0>>, binary.Big))}')
+	println('-infinity: ${floats(binary.to_floats32(<<0, 0, 128, 255>>, binary.Little))}')
+	println('a NaN: ${floats(binary.to_floats32(<<0, 0, 192, 127>>, binary.Little))}')
+	println(
+		'a NaN after a float: ${floats(
+			binary.to_floats32(<<0, 0, 128, 63, 255, 255, 255, 255>>, binary.Little),
+		)}',
+	)
+}
