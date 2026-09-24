@@ -10,6 +10,9 @@ pub fn message(stop: &Stop) -> Option<String> {
         Stop::OutputClosed => None,
         Stop::NotBuiltYet(what) => Some(format!("cannot run: the new VM does not run {what} yet")),
         Stop::HeapFull => Some("the program ran out of heap".into()),
+        Stop::PlatformFault(what) => Some(format!(
+            "internal error: the platform failed: {what}. This is a bug in the Scarlet runtime, not in the program"
+        )),
         Stop::BadProgram(what) => Some(format!(
             "internal error: {what}. This is a bug in the compiler, not in the program"
         )),

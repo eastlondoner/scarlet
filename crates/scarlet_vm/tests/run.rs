@@ -1436,3 +1436,15 @@ fn a_float_pattern_matches_as_equality_does() {
         "zero\nzero\none and a half\none and a half\nother\n",
     );
 }
+
+/// With no GPU, as off macOS, the first call says so, as a value.
+#[test]
+fn with_no_gpu_metal_is_unsupported() {
+    prints(
+        "import scarlet/metal\n\
+         pub fn main() {\n\
+         \tprintln(metal.device())\n\
+         }\n",
+        "Err(Unsupported)\n",
+    );
+}

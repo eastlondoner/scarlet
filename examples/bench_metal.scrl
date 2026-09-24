@@ -1,0 +1,80 @@
+// Metal buffers at a few sizes: making one from a binary, reading one back
+// into a binary, and both. scripts/bench_metal.sh runs it and turns the times
+// into a cost per call. Each line is `op size calls ms`; each op makes enough
+// calls to take a good part of a second, since the clock counts whole ms.
+import scarlet/crypto
+import scarlet/metal
+import scarlet/time
+
+fn make(device metal.Device, bytes Binary, n Int) Int {
+	if n == 0 {
+		0
+	} else {
+		match metal.buffer(device, bytes) {
+			Ok(_) -> make(device, bytes, n - 1)
+			Err(_) -> -1
+		}
+	}
+}
+
+fn read(buffer metal.Buffer, n Int) Int {
+	if n == 0 {
+		0
+	} else {
+		match metal.read(buffer) {
+			Ok(_) -> read(buffer, n - 1)
+			Err(_) -> -1
+		}
+	}
+}
+
+fn round_trip(device metal.Device, bytes Binary, n Int) Int {
+	if n == 0 {
+		0
+	} else {
+		match metal.buffer(device, bytes) {
+			Ok(buffer) -> match metal.read(buffer) {
+				Ok(_) -> round_trip(device, bytes, n - 1)
+				Err(_) -> -1
+			}
+			Err(_) -> -1
+		}
+	}
+}
+
+fn timed(op String, size Int, n Int, run fn() Int) Nil {
+	start = time.monotonic()
+	failed = run()
+	ms = time.since_ms(time.monotonic(), start)
+	if failed == 0 {
+		println('${op} ${size} ${n} ${ms}')
+	} else {
+		println('${op} ${size} failed')
+	}
+}
+
+fn size(device metal.Device, size Int, makes Int, reads Int) Nil {
+	match crypto.random_bytes(size) {
+		Ok(bytes) -> {
+			timed('buffer', size, makes, fn() make(device, bytes, makes))
+			match metal.buffer(device, bytes) {
+				Ok(buffer) -> timed('read', size, reads, fn() read(buffer, reads))
+				Err(e) -> println(e)
+			}
+			timed('round_trip', size, makes, fn() round_trip(device, bytes, makes))
+		}
+		Err(Nil) -> println('no random bytes')
+	}
+}
+
+pub fn main() {
+	match metal.device() {
+		Ok(device) -> {
+			size(device, 64, 20000, 400000)
+			size(device, 4096, 20000, 400000)
+			size(device, 1048576, 2000, 5000)
+			size(device, 67108864, 30, 60)
+		}
+		Err(e) -> println(e)
+	}
+}

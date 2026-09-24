@@ -1,0 +1,14 @@
+// Bytes into GPU memory and back out through Metal. On a Mac it prints
+// `Ok(<<1, 2, 3, 4>>)`; anywhere else, `Err(Unsupported)`.
+import scarlet/metal
+import scarlet/result
+
+fn round_trip(bytes Binary) Result(Binary, metal.MetalError) {
+	device <- result.then(metal.device())
+	buffer <- result.then(metal.buffer(device, bytes))
+	metal.read(buffer)
+}
+
+pub fn main() {
+	println(round_trip(<<1, 2, 3, 4>>))
+}

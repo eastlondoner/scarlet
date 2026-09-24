@@ -1,0 +1,56 @@
+/**
+ * Metal, Apple's GPU API, on macOS.
+ *
+ * A `Device` and a `Buffer` are handles: values that name something the
+ * runtime holds outside the program. Only the runtime makes one, `==` is true
+ * only for the same handle, and what it names is freed when the last value
+ * naming it goes. Every request is checked before Metal sees it, so one Metal
+ * would refuse, or stop the whole OS process on, is an `Err` instead. Off
+ * macOS `device` is `Err(Unsupported)`, so there is nothing to call the rest
+ * with. See docs/metal-design.md.
+ */
+
+// A GPU. Two calls to `device` give two handles, even to one GPU.
+pub type Device
+
+// Memory the CPU and the GPU share, holding a fixed number of bytes.
+pub type Buffer
+
+// Why a Metal call failed.
+pub type MetalError {
+	// This machine has no Metal: the program is running off macOS.
+	Unsupported
+	// macOS with no GPU Metal can use, as in some virtual machines.
+	NoDevice
+	// A buffer was asked to hold no bytes. Metal has no empty buffer.
+	EmptyBuffer
+	// A buffer was given a binary that is not whole bytes.
+	UnalignedBinary
+	// A buffer was asked to hold more bytes than the device's largest, which
+	// holds `max_bytes`.
+	TooLarge(max_bytes Int)
+	// Metal found no memory for a buffer.
+	OutOfMemory
+}
+
+// The system's default GPU.
+@vm(metal__device)
+pub fn device() Result(Device, MetalError)
+
+// The GPU's name, like `Apple M1 Max`. It differs from machine to machine.
+@vm(metal__name)
+pub fn name(device Device) String
+
+// A new buffer on `device` holding a copy of `bytes`.
+@vm(metal__buffer)
+pub fn buffer(device Device, bytes Binary) Result(Buffer, MetalError)
+
+// A copy of what `buffer` holds now. It always succeeds today; it is a
+// `Result` because reading a buffer the GPU is still writing will be an
+// error.
+@vm(metal__read)
+pub fn read(buffer Buffer) Result(Binary, MetalError)
+
+// How many bytes `buffer` holds.
+@vm(metal__byte_size)
+pub fn byte_size(buffer Buffer) Int

@@ -85,6 +85,12 @@ The old compiler accepted any spread whose base had the same type, and the old V
 
 **Built:** any value can be a key, and a key is found by any value `==` to it: `0..3` finds `[0, 1, 2]`, and a map finds an equal map built in another order.
 
+## Handles and the GPU
+
+**Built: a handle equals only itself.** A `metal.Device` or a `metal.Buffer` names something the runtime holds outside the program, and only the runtime makes one. `==` and a map key compare which handle it is, never what it names, so two calls to `metal.device()` give two handles that are not `==`, even to one GPU. It prints as its type and a number, like `<metal.Buffer #2>`, counting up through the run and never reused. What it names is freed when the last value naming it goes, and every one is freed when the run ends, however it ends.
+
+**Built: GPU misuse is a value.** Metal accepts some wrong requests in silence and, under its validation layer, stops the whole OS process on others. The runtime checks every request before Metal sees it, and one Metal would refuse is an `Err` of `metal.MetalError` naming what was wrong: an empty buffer, a binary that is not whole bytes, or a buffer past the device's largest, carrying that size. Off macOS, `metal.device()` is `Err(Unsupported)`. An Objective-C exception that gets past the checks is caught, and stops the run as a bug in the runtime rather than aborting the process (`docs/metal-design.md`, "The rule, applied to the GPU").
+
 ## Memory
 
 **Decided: reference counting, with Perceus.** There is no tracing garbage collector.

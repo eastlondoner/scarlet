@@ -24,6 +24,8 @@ mod binary;
 mod code;
 mod eq;
 mod exec;
+#[cfg(any(test, feature = "fake"))]
+pub mod fake;
 mod float;
 mod hash;
 mod heap;
@@ -31,6 +33,7 @@ mod host;
 mod http;
 mod json;
 mod map;
+pub mod platform;
 mod show;
 mod value;
 
@@ -55,6 +58,11 @@ pub enum Stop {
     /// like a `match` having an arm for every value. Only a compiler bug
     /// gives one, so this says what, rather than guessing on.
     BadProgram(String),
+    /// The platform failed in a way the runtime should have prevented, like
+    /// Metal raising an Objective-C exception over a request the runtime did
+    /// not check first. A bug in the runtime, not the program, so this says
+    /// what rather than guessing on.
+    PlatformFault(String),
 }
 
 /// Run `program` in `host`'s world, writing what it prints to `out`.

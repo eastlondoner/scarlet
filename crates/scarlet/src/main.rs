@@ -460,7 +460,7 @@ fn cmd_run(args: RunArgs) {
     let argv = std::iter::once(args.entrypoint.clone())
         .chain(args.args)
         .collect();
-    let host = scarlet_vm::Host::of_this_process(argv);
+    let host = scarlet::host(argv);
     let mut out = io::BufWriter::new(io::stdout().lock());
     let outcome = scarlet_vm::run(&program, &host, &mut out);
     // Flushed before any message, so the program's own output comes first. A

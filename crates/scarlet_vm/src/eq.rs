@@ -5,7 +5,8 @@
 //! string, Bool or `Nil`; the same constructor with equal fields; tuples or
 //! arrays with equal elements, in order; the same function over equal
 //! captures; maps with the same keys, each bound to equal values. A range is
-//! an array of its Ints, so `0..3 == [0, 1, 2]`.
+//! an array of its Ints, so `0..3 == [0, 1, 2]`. A handle, like a
+//! `metal.Buffer`, equals only itself.
 //!
 //! The walk is a list of pairs still to compare rather than recursion, so two
 //! lists a million long compare without overflowing the stack. It stops at the
@@ -89,6 +90,7 @@ fn cells(heap: &Heap, x: Cell, y: Cell, todo: &mut Vec<(Value, Value)>) -> bool 
                 && queue(todo, captures(heap, x), captures(heap, y))
         }
         Kind::Tuple => queue(todo, heap.elements(x).collect(), heap.elements(y).collect()),
+        Kind::Handle => heap.handle_of(x).is_some() && heap.handle_of(x) == heap.handle_of(y),
         Kind::Map | Kind::MapNode | Kind::MapCollision => match map::equal_parts(heap, x, y) {
             Some(pairs) => {
                 todo.extend(pairs.into_iter().rev());

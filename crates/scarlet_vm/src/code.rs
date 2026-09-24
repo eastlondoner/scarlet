@@ -1187,6 +1187,9 @@ fn built(i: Intrinsic, argc: usize) -> bool {
         | Intrinsic::InternalStackDepth
         | Intrinsic::InternalCellsMade
         | Intrinsic::InternalCellsReused
+        | Intrinsic::InternalLiveHandles
+        | Intrinsic::InternalBytesStaged
+        | Intrinsic::MetalDevice
         | Intrinsic::TimeMonotonic
         | Intrinsic::TimeEpochMs
         | Intrinsic::OsArgv
@@ -1208,6 +1211,8 @@ fn built(i: Intrinsic, argc: usize) -> bool {
         | Intrinsic::JsonBool
         | Intrinsic::JsonEncode => 1,
         Intrinsic::JsonField | Intrinsic::JsonIndex => 2,
+        Intrinsic::MetalName | Intrinsic::MetalRead | Intrinsic::MetalByteSize => 1,
+        Intrinsic::MetalBuffer => 2,
         Intrinsic::HttpFraming | Intrinsic::HttpHeadersValid => 1,
         Intrinsic::HttpParseHead
         | Intrinsic::HttpParseResponseHead

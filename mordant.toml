@@ -17,3 +17,26 @@ never = ["std::process::exit", "std::process::abort"]
 [[mordant.forbidden-reach]]
 from = "Scanner::scan_all"
 never = ["core::panicking::panic_fmt", "core::panicking::panic", "core::panicking::panic_explicit", "Option::unwrap", "Option::expect", "Result::unwrap", "Result::expect"]
+
+# Metal's platform (`crates/scarlet_metal/src/metal.rs`) must not panic: a
+# panic there would unwind out of a VM built-in, where the rule is that failure
+# is a value (`docs/semantics.md`). One rule per `Platform` method. A trait
+# method's path has no type in it once mordant strips the `<Metal as
+# Platform>` segment, so each is spelled with its crate. The walk sees only
+# calls in this crate, so a finding is a real path, and silence proves what the
+# walk can see.
+[[mordant.forbidden-reach]]
+from = "scarlet_metal::::device"
+never = ["core::panicking::panic_fmt", "core::panicking::panic", "core::panicking::panic_explicit", "core::panicking::panic_display", "core::panicking::panic_bounds_check", "panic_const_add_overflow", "panic_const_sub_overflow", "panic_const_mul_overflow", "panic_const_div_by_zero", "panic_const_rem_by_zero", "Option::unwrap", "Option::expect", "Result::unwrap", "Result::expect"]
+
+[[mordant.forbidden-reach]]
+from = "scarlet_metal::::buffer"
+never = ["core::panicking::panic_fmt", "core::panicking::panic", "core::panicking::panic_explicit", "core::panicking::panic_display", "core::panicking::panic_bounds_check", "panic_const_add_overflow", "panic_const_sub_overflow", "panic_const_mul_overflow", "panic_const_div_by_zero", "panic_const_rem_by_zero", "Option::unwrap", "Option::expect", "Result::unwrap", "Result::expect"]
+
+[[mordant.forbidden-reach]]
+from = "scarlet_metal::::read"
+never = ["core::panicking::panic_fmt", "core::panicking::panic", "core::panicking::panic_explicit", "core::panicking::panic_display", "core::panicking::panic_bounds_check", "panic_const_add_overflow", "panic_const_sub_overflow", "panic_const_mul_overflow", "panic_const_div_by_zero", "panic_const_rem_by_zero", "Option::unwrap", "Option::expect", "Result::unwrap", "Result::expect"]
+
+[[mordant.forbidden-reach]]
+from = "scarlet_metal::::release"
+never = ["core::panicking::panic_fmt", "core::panicking::panic", "core::panicking::panic_explicit", "core::panicking::panic_display", "core::panicking::panic_bounds_check", "panic_const_add_overflow", "panic_const_sub_overflow", "panic_const_mul_overflow", "panic_const_div_by_zero", "panic_const_rem_by_zero", "Option::unwrap", "Option::expect", "Result::unwrap", "Result::expect"]

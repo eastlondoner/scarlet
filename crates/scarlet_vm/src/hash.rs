@@ -43,6 +43,8 @@ enum Tag {
     Map,
     /// Keys whose whole hashes are equal, in a map.
     Collision,
+    /// A handle: it equals only itself.
+    Handle,
 }
 
 /// `v`'s hash.
@@ -107,6 +109,13 @@ fn cell(heap: &Heap, cell: Cell, s: &mut Sip<1, 3>, todo: &mut Vec<Value>) {
             s.bytes(&text);
         }
         Kind::BigInt => big(s, heap.data(cell)),
+        // Its id and its kind, the two words of its cell.
+        Kind::Handle => {
+            s.tag(Tag::Handle);
+            for w in heap.data(cell) {
+                s.word(*w);
+            }
+        }
         Kind::Ctor => {
             s.tag(Tag::Ctor);
             let v = heap.variant(cell);

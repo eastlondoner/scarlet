@@ -1,0 +1,33 @@
+[package]
+name = "scarlet_metal"
+version = "0.1.0"
+edition = "2024"
+
+# The one crate in the workspace allowed `unsafe`: `scarlet_vm`'s `Platform`
+# over Metal (docs/metal-design.md). Off macOS it is a stub with no platform,
+# and depends on nothing but the trait.
+[dependencies]
+scarlet_vm = { path = "../scarlet_vm" }
+
+# Apple's Metal headers, generated. `exception` is `objc2::exception::catch`,
+# which turns an Objective-C exception into an error value instead of an
+# abort of the whole OS process.
+[target.'cfg(target_os = "macos")'.dependencies]
+# `dlopen`, so Metal loads when a program first asks for a device rather
+# than with every process (`metal.rs`).
+libc = "0.2"
+objc2 = { version = "0.6", features = ["exception"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString"] }
+objc2-metal = { version = "0.3", default-features = false, features = [
+    "std",
+    "MTLAllocation",
+    "MTLBuffer",
+    "MTLDevice",
+    "MTLResource",
+] }
+
+# The suite (`src/suite.rs`) runs Scarlet programs against Metal and against
+# `scarlet_vm`'s fake GPU, so it compiles them, and needs the fake.
+[dev-dependencies]
+scarlet_core = { path = "../scarlet_core" }
+scarlet_vm = { path = "../scarlet_vm", features = ["fake"] }

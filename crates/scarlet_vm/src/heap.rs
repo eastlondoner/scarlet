@@ -20,11 +20,13 @@
 //! as plain data.
 
 use std::collections::HashMap;
+use std::num::NonZeroU64;
 
 use num_bigint::{BigInt, Sign};
 use scarlet_ir::TypeId;
 use scarlet_ir::core_ir::{FuncIdx, VariantRef};
 
+use crate::platform::{Handle, Id};
 use crate::value::Value;
 
 /// Words in the first chunk: 2 KB.
@@ -99,7 +101,17 @@ pub(crate) enum Kind {
     Map = 12,
     MapNode = 13,
     MapCollision = 14,
+    /// Something a [`crate::platform::Platform`] holds for the program, like
+    /// a Metal buffer: a word holding its [`Id`], then one saying which kind
+    /// of object it is. It holds no references. When it is freed, the
+    /// [`Handle`] is kept for the machine, which tells the platform
+    /// ([`Heap::freed_handles`]).
+    Handle = 15,
 }
+
+/// A handle cell's second word: which kind of object it names.
+const DEVICE: u64 = 1;
+const BUFFER: u64 = 2;
 
 /// A heap that has run out of the cells a [`Cell`] can name. It is a limit of
 /// the machine, not a bug in the program.
@@ -134,6 +146,10 @@ pub(crate) struct Heap {
     /// The cells a [`Heap::release`] still has to give a reference up for.
     /// Kept between calls so a release does not allocate.
     dying: Vec<Cell>,
+    /// The handles whose cells were freed since the machine last took them.
+    /// A release is a loop over plain data and cannot call out to a platform,
+    /// so it leaves them here.
+    freed_handles: Vec<Handle>,
 }
 
 impl Heap {
@@ -228,6 +244,11 @@ impl Heap {
                     dying.push(held);
                 }
             }
+            if kind_bits(h) == Kind::Handle as u64
+                && let Some(handle) = self.handle_of(cell)
+            {
+                self.freed_handles.push(handle);
+            }
             self.free_cell(cell, h);
         }
         self.dying = dying;
@@ -243,9 +264,12 @@ impl Heap {
     /// constructor is what carries reuse down a chain — a callee sees its
     /// argument as the last reference only because its caller gave up its own
     /// first.
+    ///
+    /// A handle is never kept: no constructor can take its cell, and keeping
+    /// it would keep what the platform holds for it past its last use.
     pub(crate) fn hollow(&mut self, cell: Cell) -> bool {
         let h = self.word(cell, 0);
-        if count(h) != 1 {
+        if count(h) != 1 || kind_bits(h) == Kind::Handle as u64 {
             return false;
         }
         for i in held(kind_bits(h), size(h)) {
@@ -299,6 +323,7 @@ impl Heap {
             12 => Some(Kind::Map),
             13 => Some(Kind::MapNode),
             14 => Some(Kind::MapCollision),
+            15 => Some(Kind::Handle),
             _ => None,
         }
     }
@@ -447,6 +472,58 @@ impl Heap {
             Some(Some(c)) => c.words.get(start..start + n).unwrap_or(&[]),
             _ => &[],
         }
+    }
+
+    /// A new cell of `kind` with `words` words after its header, for the
+    /// caller to fill through [`Self::data_mut`]. What they hold before then
+    /// is whatever the cell last held.
+    pub(crate) fn make_uninit(&mut self, kind: Kind, words: usize) -> Result<Cell, Full> {
+        self.alloc(kind, words)
+    }
+
+    /// The words of `cell` after its header, to write. Empty for a cell the
+    /// heap does not have.
+    pub(crate) fn data_mut(&mut self, cell: Cell) -> &mut [u64] {
+        let n = size(self.word(cell, 0)).saturating_sub(1);
+        let start = cell.word as usize + 1;
+        match self.chunks.get_mut(cell.chunk as usize) {
+            Some(Some(c)) => c.words.get_mut(start..start + n).unwrap_or(&mut []),
+            _ => &mut [],
+        }
+    }
+
+    /// A new handle cell naming `handle`, an object a platform holds.
+    pub(crate) fn handle(&mut self, handle: Handle) -> Result<Cell, Full> {
+        let words = match handle {
+            Handle::Device(id) => [id.raw(), DEVICE],
+            Handle::Buffer(id) => [id.raw(), BUFFER],
+        };
+        self.make(Kind::Handle, &words)
+    }
+
+    /// What a handle cell names, or `None` for any other cell.
+    pub(crate) fn handle_of(&self, cell: Cell) -> Option<Handle> {
+        if self.kind(cell) != Some(Kind::Handle) {
+            return None;
+        }
+        let id = NonZeroU64::new(self.word(cell, 1))?;
+        match self.word(cell, 2) {
+            DEVICE => Some(Handle::Device(Id::new(id))),
+            BUFFER => Some(Handle::Buffer(Id::new(id))),
+            _ => None,
+        }
+    }
+
+    /// The handles whose cells were freed since the last call, for the
+    /// machine to release. Leaves the list empty, keeping its room.
+    pub(crate) fn freed_handles(&mut self) -> std::vec::Drain<'_, Handle> {
+        self.freed_handles.drain(..)
+    }
+
+    /// Whether a handle cell was freed since [`Self::freed_handles`] was last
+    /// called.
+    pub(crate) fn has_freed_handles(&self) -> bool {
+        !self.freed_handles.is_empty()
     }
 
     /// A new tuple cell holding `elements`. Each element's reference passes

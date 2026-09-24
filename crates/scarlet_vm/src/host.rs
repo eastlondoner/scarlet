@@ -1,8 +1,11 @@
 //! What a program sees of the world outside it: its arguments, its
-//! environment and its clock. The driver makes one and hands it to
+//! environment, its clock and its GPU. The driver makes one and hands it to
 //! [`crate::run`], so a test can hand in a world of its own.
 
+use std::sync::Arc;
 use std::time::Instant;
+
+use crate::platform::Platform;
 
 /// The world a run sees.
 pub struct Host {
@@ -14,6 +17,9 @@ pub struct Host {
     env: Vec<(String, String)>,
     /// What `time.monotonic` counts from.
     started: Instant,
+    /// What `scarlet/metal` reaches. With none, the machine has no GPU the
+    /// run can use, and `metal.device` says so.
+    platform: Option<Arc<dyn Platform>>,
 }
 
 impl Host {
@@ -22,6 +28,15 @@ impl Host {
             argv,
             env,
             started: Instant::now(),
+            platform: None,
+        }
+    }
+
+    /// This world, with `platform` as its GPU instead of none.
+    pub fn with_platform(self, platform: Arc<dyn Platform>) -> Host {
+        Host {
+            platform: Some(platform),
+            ..self
         }
     }
 
@@ -39,6 +54,10 @@ impl Host {
 
     pub(crate) fn env(&self) -> &[(String, String)] {
         &self.env
+    }
+
+    pub(crate) fn platform(&self) -> Option<&dyn Platform> {
+        self.platform.as_deref()
     }
 
     /// Milliseconds since the run began, on a clock that only goes forward.
