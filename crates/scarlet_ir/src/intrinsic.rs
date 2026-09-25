@@ -35,6 +35,7 @@ intrinsics! {
     InternalStackDepth = "internal__stack_depth",
     InternalCellsMade = "internal__cells_made",
     InternalCellsReused = "internal__cells_reused",
+    InternalCellsLive = "internal__cells_live",
     InternalLiveSubjects = "internal__live_subjects",
     InternalBlockingThreads = "internal__blocking_threads",
     IoReadFile = "io__read_file",

@@ -90,7 +90,14 @@ pub(crate) enum Instr {
         dst: Reg,
         n: i64,
     },
+    /// `src`'s value, sharing it: both registers hold a reference.
     Move {
+        dst: Reg,
+        src: Reg,
+    },
+    /// `src`'s value, moved: its reference passes to `dst`, and `src` is left
+    /// empty.
+    Take {
         dst: Reg,
         src: Reg,
     },
@@ -396,6 +403,7 @@ impl Instr {
             | Instr::Bits { .. }
             | Instr::BigInt { .. }
             | Instr::Move { .. }
+            | Instr::Take { .. }
             | Instr::GetGlobal { .. }
             | Instr::SetGlobal { .. }
             | Instr::Int { .. }
@@ -594,11 +602,6 @@ struct Loader<'c> {
 
 impl<'c> Loader<'c> {
     fn new(consts: &'c [Const], f: &CoreFn, this: Option<FuncIdx>) -> Self {
-        let mut top = 0;
-        for p in &f.params {
-            top = top.max(p.id.0 + 1);
-        }
-        top = top.max(highest_local(&f.body));
         Loader {
             consts,
             this,
@@ -606,7 +609,7 @@ impl<'c> Loader<'c> {
             instrs: Vec::new(),
             labels: Vec::new(),
             conts: HashMap::new(),
-            next: top,
+            next: f.locals_end(),
         }
     }
 
@@ -841,6 +844,10 @@ impl<'c> Loader<'c> {
     fn atom(&mut self, dst: Reg, atom: &Atom) -> Result<(), String> {
         let instr = match atom {
             Atom::Local(src) => Instr::Move {
+                dst,
+                src: Reg::of(*src),
+            },
+            Atom::Move(src) => Instr::Take {
                 dst,
                 src: Reg::of(*src),
             },
@@ -1187,6 +1194,7 @@ fn built(i: Intrinsic, argc: usize) -> bool {
         | Intrinsic::InternalStackDepth
         | Intrinsic::InternalCellsMade
         | Intrinsic::InternalCellsReused
+        | Intrinsic::InternalCellsLive
         | Intrinsic::TimeMonotonic
         | Intrinsic::TimeEpochMs
         | Intrinsic::OsArgv
@@ -1257,7 +1265,6 @@ fn built(i: Intrinsic, argc: usize) -> bool {
     argc == arity
 }
 
-/// One past the highest local `e` binds or reads.
 /// A call followed by the `Drop` of one of its own arguments hands the callee
 /// the reference the register holds, rather than adding one and giving it up
 /// after the call returns. The callee then sees a value nothing else holds,
@@ -1352,49 +1359,4 @@ fn reused_locals(e: &CoreExpr) -> BTreeSet<LocalId> {
         }
     }
     out
-}
-
-fn highest_local(e: &CoreExpr) -> u32 {
-    let mut top = 0;
-    let mut note = |l: LocalId| top = top.max(l.0 + 1);
-    let mut stack = vec![e];
-    while let Some(e) = stack.pop() {
-        match e {
-            CoreExpr::Let { bind, rhs, body } => {
-                note(bind.id);
-                rhs.for_each_operand(&mut note);
-                stack.push(body);
-            }
-            CoreExpr::LetJoin { bind, join, body } => {
-                note(bind.id);
-                stack.push(join);
-                stack.push(body);
-            }
-            CoreExpr::LetCont { cont, body, .. } => {
-                stack.push(cont);
-                stack.push(body);
-            }
-            CoreExpr::Drop { local, body, .. } => {
-                note(*local);
-                stack.push(body);
-            }
-            CoreExpr::Match { scrut, arms, .. } => {
-                note(*scrut);
-                for (pat, arm) in arms {
-                    pat.binds().for_each(|b| note(b.id));
-                    stack.push(arm);
-                }
-            }
-            CoreExpr::If {
-                cond, then, els, ..
-            } => {
-                note(*cond);
-                stack.push(then);
-                stack.push(els);
-            }
-            CoreExpr::Tail(atom) => atom.for_each_operand(&mut note),
-            CoreExpr::Goto(_) => {}
-        }
-    }
-    top
 }

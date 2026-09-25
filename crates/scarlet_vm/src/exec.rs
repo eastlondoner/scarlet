@@ -147,6 +147,10 @@ impl<'c, 'h, 'o> Machine<'c, 'h, 'o> {
                     let v = self.share(self.get(base, *src));
                     self.set(base, *dst, v);
                 }
+                Instr::Take { dst, src } => {
+                    let v = self.take(base, *src);
+                    self.set(base, *dst, v);
+                }
                 Instr::GetGlobal { dst, slot } => {
                     let v = self
                         .globals
@@ -484,6 +488,10 @@ impl<'c, 'h, 'o> Machine<'c, 'h, 'o> {
                         }
                         Intrinsic::InternalCellsReused => {
                             let n = self.heap.reused();
+                            bigint::value(&mut self.heap, n.into()).map_err(full)?
+                        }
+                        Intrinsic::InternalCellsLive => {
+                            let n = self.heap.live();
                             bigint::value(&mut self.heap, n.into()).map_err(full)?
                         }
                         _ => self.builtin(*intrinsic, base, args)?,

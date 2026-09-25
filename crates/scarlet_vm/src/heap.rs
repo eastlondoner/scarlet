@@ -486,7 +486,6 @@ impl Heap {
     }
 
     /// Cells not yet freed.
-    #[cfg(test)]
     pub(crate) fn live(&self) -> usize {
         self.live
     }

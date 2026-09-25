@@ -401,7 +401,12 @@ pub enum Load {
 /// the enclosing `Let` spine.
 #[derive(Debug, Clone)]
 pub enum Atom {
+    /// A read of the local that adds a reference: the local keeps its own.
     Local(LocalId),
+    /// The local's last use, handing its reference over rather than adding
+    /// one: nothing reads or drops the local after this. Only `perceus` makes
+    /// one, for a join's value (see [`CoreExpr::LetJoin`]).
+    Move(LocalId),
     Const(ConstId),
     Load(Load),
     Nil,
@@ -445,7 +450,7 @@ impl Atom {
     /// it names a slot to overwrite, not a value pushed on the stack.
     fn operands(&self) -> impl Iterator<Item = LocalId> + '_ {
         let (pushed, trailing): (&[LocalId], Option<LocalId>) = match self {
-            Atom::Local(x) => (&[], Some(*x)),
+            Atom::Local(x) | Atom::Move(x) => (&[], Some(*x)),
             Atom::Const(_) | Atom::Load(_) | Atom::Nil | Atom::Bool(_) => (&[], None),
             Atom::Ctor { fields, .. } => (fields, None),
             Atom::PrimOp { args, .. } | Atom::Intrinsic { args, .. } => (args, None),
@@ -478,7 +483,7 @@ pub enum CorePat {
 
 impl CorePat {
     /// The locals this pattern introduces, in binding order.
-    pub fn binds(&self) -> std::slice::Iter<'_, CoreBind> {
+    fn binds(&self) -> std::slice::Iter<'_, CoreBind> {
         match self {
             CorePat::Wild | CorePat::Lit(_) => <&[CoreBind]>::default().iter(),
             CorePat::Bind(b) => std::slice::from_ref(b).iter(),
@@ -497,9 +502,15 @@ pub enum CoreExpr {
         body: Box<CoreExpr>,
     },
     /// `let bind = <join>; body` where `join` is a control-flow tree in operand
-    /// position. Every `Tail` inside `join` is a value, not a return. Kept
-    /// distinct from `Let` so `rhs: Atom` stays operand-only, which Perceus's
-    /// linear scan depends on.
+    /// position. Every `Tail` inside `join` is a value, not a return: it is
+    /// written to `bind`, and `body` runs next. Kept distinct from `Let` so
+    /// `rhs: Atom` stays operand-only, which Perceus's linear scan depends on.
+    ///
+    /// Nothing runs between a `Tail` in `join` and `body`, so a local bound in
+    /// `join` cannot be dropped after the `Tail` reads it. Perceus instead
+    /// hands such a local's reference to `bind` with [`Atom::Move`], binding
+    /// the `Tail`'s value to a fresh local first when the value is not the
+    /// local itself.
     LetJoin {
         bind: CoreBind,
         join: Box<CoreExpr>,
@@ -619,6 +630,59 @@ pub struct CoreFn {
     pub ret_ty: RTy,
 }
 
+impl CoreFn {
+    /// One past the highest local the function binds or reads: the first id
+    /// a pass may mint without colliding, and how many registers a backend
+    /// that gives each local its own needs.
+    pub fn locals_end(&self) -> u32 {
+        let mut top = 0;
+        let mut note = |l: LocalId| top = top.max(l.0 + 1);
+        for p in &self.params {
+            note(p.id);
+        }
+        let mut stack = vec![&self.body];
+        while let Some(e) = stack.pop() {
+            match e {
+                CoreExpr::Let { bind, rhs, body } => {
+                    note(bind.id);
+                    rhs.for_each_operand(&mut note);
+                    stack.push(body);
+                }
+                CoreExpr::LetJoin { bind, join, body } => {
+                    note(bind.id);
+                    stack.push(join);
+                    stack.push(body);
+                }
+                CoreExpr::LetCont { cont, body, .. } => {
+                    stack.push(cont);
+                    stack.push(body);
+                }
+                CoreExpr::Drop { local, body, .. } => {
+                    note(*local);
+                    stack.push(body);
+                }
+                CoreExpr::Match { scrut, arms, .. } => {
+                    note(*scrut);
+                    for (pat, arm) in arms {
+                        pat.binds().for_each(|b| note(b.id));
+                        stack.push(arm);
+                    }
+                }
+                CoreExpr::If {
+                    cond, then, els, ..
+                } => {
+                    note(*cond);
+                    stack.push(then);
+                    stack.push(els);
+                }
+                CoreExpr::Tail(atom) => atom.for_each_operand(&mut note),
+                CoreExpr::Goto(_) => {}
+            }
+        }
+        top
+    }
+}
+
 /// One body ready for a backend: its core IR after Perceus, and the pool its
 /// `RTy`s index. The pool is shared, because one elaboration lowers a body
 /// together with the eta wrappers it minted.
@@ -724,6 +788,7 @@ impl fmt::Display for Atom {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Atom::Local(l) => write!(f, "{l}"),
+            Atom::Move(l) => write!(f, "move {l}"),
             Atom::Const(c) => write!(f, "{c}"),
             Atom::Load(Load::Global(g)) => write!(f, "global{}", g.0),
             Atom::Load(Load::Capture(c)) => write!(f, "capture{}", c.0),
@@ -931,6 +996,7 @@ mod tests {
     #[test]
     fn atom_forms() {
         assert_eq!(Atom::Local(LocalId(3)).to_string(), "%3");
+        assert_eq!(Atom::Move(LocalId(3)).to_string(), "move %3");
         assert_eq!(Atom::Const(ConstId(7)).to_string(), "c7");
         assert_eq!(
             Atom::prim(PrimOp::IntAdd, vec![LocalId(0), LocalId(1)]).to_string(),
