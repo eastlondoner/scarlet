@@ -16,6 +16,8 @@
 //! [`Bits`] is either, as "these bits of this owner". Everything that reads a
 //! binary reads it through [`Bits`], so it does not matter which one it is.
 
+use std::borrow::Cow;
+
 use num_bigint::{BigInt, Sign};
 
 use crate::heap::{Cell, Full, Heap, Kind};
@@ -62,30 +64,77 @@ pub(crate) fn bits(heap: &Heap, cell: Cell) -> Option<Bits> {
         | Kind::Range
         | Kind::Map
         | Kind::MapNode
-        | Kind::MapCollision => None,
+        | Kind::MapCollision
+        | Kind::Handle => None,
     }
 }
 
-/// A new owner holding the first `len` bits of `bytes`. The bits past `len`
-/// in the last byte are cleared.
+/// A new owner holding the first `len` bits of `bytes`, read as zeros past
+/// its end. The bits past `len` in the last byte are cleared.
 pub(crate) fn make(heap: &mut Heap, bytes: &[u8], len: u64) -> Result<Cell, Full> {
-    let n = len.div_ceil(8) as usize;
-    let mut buf: Vec<u8> = bytes.iter().copied().take(n).collect();
-    buf.resize(n, 0);
-    let pad = n as u64 * 8 - len;
-    if let Some(last) = buf.last_mut() {
-        *last &= 0xFFu8 << pad;
+    fill(heap, len, |out| {
+        let n = out.len().min(bytes.len());
+        let (copied, rest) = out.split_at_mut(n);
+        copied.copy_from_slice(bytes.get(..n).unwrap_or(&[]));
+        rest.fill(0);
+        Ok::<(), Full>(())
+    })?
+}
+
+/// Whether an owner's bytes lie in its words in order, so they can be read
+/// and filled as a slice of its own memory. Its words hold its bytes first
+/// byte lowest, which is their order in memory on a little-endian host. On a
+/// big-endian one, [`byte_view`] and [`fill`] go through a copy.
+pub(crate) const BYTES_IN_PLACE: bool = cfg!(target_endian = "little");
+
+/// A new owner of `len` bits, whose bytes `write` puts straight into the
+/// cell ([`BYTES_IN_PLACE`]): it is handed exactly `len.div_ceil(8)` bytes
+/// and must fill them all. The bits past `len` in the last byte are cleared
+/// after. When `write` fails the cell is freed, and its error is the answer.
+pub(crate) fn fill<E>(
+    heap: &mut Heap,
+    len: u64,
+    write: impl FnOnce(&mut [u8]) -> Result<(), E>,
+) -> Result<Result<Cell, E>, Full> {
+    let n = usize::try_from(len.div_ceil(8)).map_err(|_| Full)?;
+    let cell = heap.binary_uninit(1 + n.div_ceil(8))?;
+    let data = heap.data_mut(cell);
+    let [head, words @ ..] = data else {
+        heap.release(cell);
+        return Err(Full);
+    };
+    *head = len;
+    // A reused cell holds what it last held: the bytes past `n` in the last
+    // word must read as zeros, like any other bits past the end.
+    if let Some(last) = words.last_mut() {
+        *last = 0;
     }
-    let mut data = Vec::with_capacity(1 + n.div_ceil(8));
-    data.push(len);
-    for chunk in buf.chunks(8) {
-        let mut word = [0u8; 8];
-        for (w, b) in word.iter_mut().zip(chunk) {
-            *w = *b;
+    let wrote = if BYTES_IN_PLACE {
+        let bytes: &mut [u8] = bytemuck::cast_slice_mut(words);
+        write(bytes.get_mut(..n).unwrap_or(&mut []))
+    } else {
+        let mut bytes = vec![0u8; n];
+        let wrote = write(&mut bytes);
+        for (w, chunk) in words.iter_mut().zip(bytes.chunks(8)) {
+            let mut word = [0u8; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            *w = u64::from_le_bytes(word);
         }
-        data.push(u64::from_le_bytes(word));
+        wrote
+    };
+    if let Err(e) = wrote {
+        heap.release(cell);
+        return Ok(Err(e));
     }
-    heap.make(Kind::Binary, &data)
+    let pad = n as u64 * 8 - len;
+    if pad > 0
+        && let Some(w) = words.get_mut((n - 1) / 8)
+    {
+        let shift = (n - 1) % 8 * 8;
+        let last = (*w >> shift) as u8 & (0xFFu8 << pad);
+        *w = *w & !(0xFF << shift) | u64::from(last) << shift;
+    }
+    Ok(Ok(cell))
 }
 
 /// Bits `from .. from + len` of `b`, sharing its owner. The caller has
@@ -188,6 +237,32 @@ pub(crate) fn bytes_are(heap: &Heap, b: Bits, from: u64, text: &[u8]) -> bool {
         .iter()
         .zip(from..)
         .all(|(&t, k)| byte(heap, b, k * 8) == t)
+}
+
+/// `b`'s bytes, read in place when they can be and copied when not. `b` must
+/// be whole bytes; a last byte that is not whole is padded with zero bits, as
+/// [`bytes`] does.
+///
+/// In place is a whole-byte binary starting on a byte of its owner, on a
+/// little-endian host, where the owner's words hold its bytes in order in
+/// memory. That is every binary a program builds whole, and every slice of
+/// one at a byte, so handing one to the OS or a GPU copies it once, there.
+pub(crate) fn byte_view(heap: &Heap, b: Bits) -> Cow<'_, [u8]> {
+    match in_place(heap, b) {
+        Some(bytes) => Cow::Borrowed(bytes),
+        None => Cow::Owned(bytes(heap, b)),
+    }
+}
+
+fn in_place(heap: &Heap, b: Bits) -> Option<&[u8]> {
+    if !BYTES_IN_PLACE || !b.len.is_multiple_of(8) || !b.at.is_multiple_of(8) {
+        return None;
+    }
+    let words = heap.data(b.owner).get(1..)?;
+    let all: &[u8] = bytemuck::cast_slice(words);
+    let from = usize::try_from(b.at / 8).ok()?;
+    let n = usize::try_from(b.len / 8).ok()?;
+    all.get(from..from.checked_add(n)?)
 }
 
 /// `b` as whole bytes, the last one padded with zero bits.
@@ -405,5 +480,89 @@ mod tests {
         assert_eq!(read_utf8(&heap, b, 16), Some(('!' as u32, 8)));
         assert_eq!(read_utf8(&heap, b, 8), None);
         assert_eq!(read_utf8(&heap, b, 24), None);
+    }
+
+    /// A binary made whole, and a slice of one at a byte, are read in place
+    /// on a little-endian host: what goes to a file or a GPU is not copied on
+    /// the way. Anything else is a copy of the same bytes.
+    #[test]
+    fn whole_bytes_on_a_byte_are_read_in_place() {
+        let mut heap = Heap::default();
+        let data: Vec<u8> = (0..20).collect();
+        let b = owner(&mut heap, &data, 160);
+        let at_a_byte = slice(&mut heap, b, 24, 80).expect("room");
+        let at_a_byte = bits(&heap, at_a_byte).expect("a slice");
+        let at_a_bit = slice(&mut heap, b, 3, 80).expect("room");
+        let at_a_bit = bits(&heap, at_a_bit).expect("a slice");
+        let part = owner(&mut heap, &data, 157);
+        let little = cfg!(target_endian = "little");
+        for (b, in_place) in [
+            (b, little),
+            (at_a_byte, little),
+            (at_a_bit, false),
+            (part, false),
+        ] {
+            let view = byte_view(&heap, b);
+            assert_eq!(
+                matches!(view, Cow::Borrowed(_)),
+                in_place,
+                "{}",
+                text(&heap, b)
+            );
+            assert_eq!(*view, bytes(&heap, b)[..], "{}", text(&heap, b));
+        }
+        assert_eq!(*byte_view(&heap, at_a_byte), data[3..13]);
+    }
+
+    /// A cell a binary reuses may hold another's bytes. A new one reads as
+    /// its own bytes and zeros after, however long, in every word.
+    #[test]
+    fn a_binary_in_a_reused_cell_holds_only_its_own_bytes() {
+        let mut heap = Heap::default();
+        for n in 1..=24 {
+            let dirty = make(&mut heap, &[0xFF; 24], 24 * 8).expect("room");
+            let words = heap.data(dirty).len();
+            heap.release(dirty);
+            let data: Vec<u8> = (1..=n).collect();
+            let cell = make(&mut heap, &data, u64::from(n) * 8).expect("room");
+            let b = bits(&heap, cell).expect("a binary");
+            assert_eq!(bytes(&heap, b), data);
+            let d = heap.data(cell);
+            let want: Vec<u8> = data
+                .iter()
+                .copied()
+                .chain(std::iter::repeat(0))
+                .take((d.len() - 1) * 8)
+                .collect();
+            let got: Vec<u8> = d[1..].iter().flat_map(|w| w.to_le_bytes()).collect();
+            assert_eq!(
+                got,
+                want,
+                "{n} bytes, in a cell of {} words once {words}",
+                d.len()
+            );
+            heap.release(cell);
+        }
+        assert_eq!(heap.live(), 0);
+    }
+
+    /// A fill that fails frees the cell it was writing, and gives the error.
+    #[test]
+    fn a_failed_fill_frees_its_cell() {
+        let mut heap = Heap::default();
+        let made = fill(&mut heap, 64, |out| {
+            out.fill(7);
+            Err::<(), &str>("refused")
+        });
+        assert_eq!(made.expect("room").err(), Some("refused"));
+        assert_eq!(heap.live(), 0);
+        let made = fill(&mut heap, 12, |out| {
+            assert_eq!(out.len(), 2);
+            out.copy_from_slice(&[0xAB, 0xFF]);
+            Ok::<(), &str>(())
+        });
+        let cell = made.expect("room").expect("filled");
+        let b = bits(&heap, cell).expect("a binary");
+        assert_eq!(text(&heap, b), "<<171, 15:size(4)>>");
     }
 }

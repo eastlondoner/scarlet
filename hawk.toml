@@ -1,0 +1,47 @@
+# hawk, the dead-code gate in `.github/workflows/ci.yml`. The two binaries are
+# what hawk took as production on its own before this file existed; listing
+# them keeps that, since a `hawk.toml` makes this list the whole of it.
+[[production]]
+package = "scarlet"
+bin = "scarlet"
+reason = "the shipped compiler, VM, REPL and language server"
+
+[[production]]
+package = "xtask"
+bin = "xtask"
+reason = "the workspace's developer tasks"
+
+# An implementation of `scarlet_vm::platform::Platform` reads these, and the
+# only one the binary ships is Metal's (`crates/scarlet_metal`), compiled on
+# macOS alone. Everywhere else only the fake in tests uses them.
+[[override]]
+lint = "hawk::unnecessary_public"
+crate = "scarlet_vm"
+item = "platform::DeviceInfo::new"
+level = "expect"
+target = "cfg(not(target_os = \"macos\"))"
+reason = "made by an implementation of Platform, which ships only on macOS"
+
+[[override]]
+lint = "hawk::unnecessary_public"
+crate = "scarlet_vm"
+item = "platform::BufferBytes::<'a>::device"
+level = "expect"
+target = "cfg(not(target_os = \"macos\"))"
+reason = "read by an implementation of Platform, which ships only on macOS"
+
+[[override]]
+lint = "hawk::unnecessary_public"
+crate = "scarlet_vm"
+item = "platform::ReadInto::<'a>::copy_from"
+level = "expect"
+target = "cfg(not(target_os = \"macos\"))"
+reason = "read by an implementation of Platform, which ships only on macOS"
+
+[[override]]
+lint = "hawk::unnecessary_public"
+crate = "scarlet_vm"
+item = "platform::Fault::new"
+level = "expect"
+target = "cfg(not(target_os = \"macos\"))"
+reason = "made by an implementation of Platform, which ships only on macOS"

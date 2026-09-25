@@ -332,6 +332,9 @@ suite! {
         // A single-room chat: SSE responses served out of per-connection
         // mailboxes, tabs rejoining a restarted worker. Serves for ever.
         chat,
+        // A buffer round trip through Metal. What it prints depends on the
+        // machine having Metal, so tests/vm_metal.rs runs it, per platform.
+        metal,
     ],
 
     // Perf infrastructure driven from outside this file (scripts/bench*.sh, and
@@ -342,6 +345,7 @@ suite! {
         "bench_list_2x.scrl",
         "bench_list_4x.scrl",
         "bench_map.scrl",
+        "bench_metal.scrl",
         "bench_service.scrl",
         "bench_typed.scrl",
         "a.scrl",

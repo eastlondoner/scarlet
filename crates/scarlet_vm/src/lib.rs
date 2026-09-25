@@ -24,6 +24,8 @@ mod binary;
 mod code;
 mod eq;
 mod exec;
+#[cfg(any(test, feature = "fake"))]
+pub mod fake;
 mod float;
 mod hash;
 mod heap;
@@ -31,6 +33,7 @@ mod host;
 mod http;
 mod json;
 mod map;
+pub mod platform;
 mod show;
 mod value;
 
@@ -51,10 +54,18 @@ pub enum Stop {
     /// The program's heap grew past what the VM can address. A limit of the
     /// machine, like running out of memory, not a bug in the program.
     HeapFull,
+    /// The GPU has given out every id it can name an object by, 2^64 - 1 of
+    /// them across every run on it. A limit of the machine, like `HeapFull`.
+    OutOfIds,
     /// The program broke a promise the compiler makes about every program,
     /// like a `match` having an arm for every value. Only a compiler bug
     /// gives one, so this says what, rather than guessing on.
     BadProgram(String),
+    /// The platform failed in a way the runtime should have prevented, like
+    /// Metal raising an Objective-C exception over a request the runtime did
+    /// not check first. A bug in the runtime, not the program, so this says
+    /// what rather than guessing on.
+    PlatformFault(String),
 }
 
 /// Run `program` in `host`'s world, writing what it prints to `out`.

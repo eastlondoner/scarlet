@@ -155,6 +155,8 @@ pub struct Abi {
     pub json: Option<JsonTypes>,
     /// `scarlet/http/h1`'s types, when the program loads that module.
     pub http: Option<HttpTypes>,
+    /// `scarlet/metal`'s types, when the program loads that module.
+    pub metal: Option<MetalTypes>,
 }
 
 /// The constructors of `scarlet/binary.Radix`.
@@ -293,6 +295,32 @@ impl JsonTypes {
     }
 }
 
+/// The constructors of `scarlet/metal` the VM builds: `MetalError`'s, each
+/// what a Metal call that failed says went wrong.
+#[derive(Debug, Clone, Copy)]
+pub struct MetalTypes {
+    pub unsupported: VariantRef,
+    pub no_device: VariantRef,
+    pub empty_buffer: VariantRef,
+    pub unaligned_binary: VariantRef,
+    pub out_of_memory: VariantRef,
+    /// The one that holds something: the device's largest buffer, in bytes.
+    pub too_large: VariantRef,
+}
+
+impl MetalTypes {
+    fn variants(&self) -> [VariantRef; 6] {
+        [
+            self.unsupported,
+            self.no_device,
+            self.empty_buffer,
+            self.unaligned_binary,
+            self.out_of_memory,
+            self.too_large,
+        ]
+    }
+}
+
 impl IoErrors {
     fn variants(&self) -> [VariantRef; 12] {
         [
@@ -327,6 +355,9 @@ impl Abi {
         }
         if let Some(http) = self.http {
             all.extend(http.variants());
+        }
+        if let Some(metal) = self.metal {
+            all.extend(metal.variants());
         }
         all
     }

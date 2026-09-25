@@ -25,6 +25,7 @@ use crate::Stop;
 use crate::array::{self, Seq};
 use crate::code::Code;
 use crate::heap::{Cell, Heap, Kind};
+use crate::platform::Handle;
 use crate::value::{Value, View};
 
 /// Every type's names, by its id: [`scarlet_ir::core_ir::Program::types`].
@@ -106,6 +107,16 @@ fn value<'t>(
                 }
             },
             Some(Kind::Map) => map(heap, cell, todo),
+            // A handle shows as its type and id, `<metal.Buffer #3>`: what it
+            // names lives outside the program, which cannot look inside.
+            Some(Kind::Handle) => {
+                let (name, id) = match heap.handle_of(cell) {
+                    Some(Handle::Device(id)) => ("metal.Device", id.raw()),
+                    Some(Handle::Buffer(id)) => ("metal.Buffer", id.raw()),
+                    None => return Err(Stop::BadProgram("a handle cell of no kind".into())),
+                };
+                out.extend_from_slice(format!("<{name} #{id}>").as_bytes());
+            }
             Some(Kind::ArrayLeaf | Kind::ArrayBranch | Kind::MapNode | Kind::MapCollision) => {
                 return Err(Stop::BadProgram(
                     "a piece of an array's or a map's tree held as a value".into(),
@@ -407,7 +418,7 @@ fn small(heap: &Heap, v: Value) -> bool {
         | View::Nullary(_) => true,
         View::Cell(cell) => match heap.kind(cell) {
             Some(Kind::String) => heap.string_len(cell) < SMALL_STRING,
-            Some(Kind::BigInt | Kind::Closure) => true,
+            Some(Kind::BigInt | Kind::Closure | Kind::Handle) => true,
             // Up to 8 bytes, as the old VM had it.
             Some(Kind::Binary | Kind::BinarySlice) => {
                 crate::binary::bits(heap, cell).is_some_and(|b| b.len.div_ceil(8) <= 8)

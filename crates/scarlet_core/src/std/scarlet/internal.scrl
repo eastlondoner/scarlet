@@ -14,6 +14,16 @@ pub fn cells_made() Int
 @vm(internal__cells_reused)
 pub fn cells_reused() Int
 
+// Handles this run holds, like a `metal.Buffer`: each is freed when the last
+// value naming it goes, and every one when the run ends.
+@vm(internal__live_handles)
+pub fn live_handles() Int
+
+// Bytes copied only to hand a binary to the OS or a GPU, or to take one back.
+// It stays 0 while each can read or fill the binary where it is.
+@vm(internal__bytes_staged)
+pub fn bytes_staged() Int
+
 // Mailboxes open across the program: every subject still held, plus every
 // supervised worker's address.
 @vm(internal__live_subjects)

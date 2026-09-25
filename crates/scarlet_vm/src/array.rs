@@ -102,7 +102,8 @@ pub(crate) fn seq(heap: &Heap, cell: Cell) -> Option<Seq> {
         | Kind::BinarySlice
         | Kind::Map
         | Kind::MapNode
-        | Kind::MapCollision => None,
+        | Kind::MapCollision
+        | Kind::Handle => None,
     }
 }
 
@@ -199,7 +200,8 @@ fn node(heap: &Heap, v: Value) -> Option<Node> {
         | Kind::BinarySlice
         | Kind::Map
         | Kind::MapNode
-        | Kind::MapCollision => None,
+        | Kind::MapCollision
+        | Kind::Handle => None,
     }
 }
 

@@ -5,6 +5,14 @@ use std::process::Command;
 
 fn main() {
     emit_version();
+    // Drop the load of any library nothing in the binary calls into. Metal
+    // and the Foundation it brings are opened by `scarlet_metal` when a
+    // program first asks for a device, so a run that never does skips loading
+    // them: `scarlet run examples/hello.scrl` takes 3.6 ms rather than 4.6 ms
+    // on an M1 Max (`crates/scarlet_metal/src/metal.rs`).
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        println!("cargo:rustc-link-arg-bins=-Wl,-dead_strip_dylibs");
+    }
 }
 
 /// `SCARLET_VERSION` for `scarlet --version`.

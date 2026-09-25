@@ -49,8 +49,8 @@ use super::session::{RawRef, Watermark};
 use super::{PreludeBindings, TypeRef};
 use crate::ast;
 use crate::core_ir::{
-    Abi, Const, ConstId, CoreFn, FuncIdx, HttpTypes, IoErrors, JsonTypes, LoweredFn, Program,
-    Radix, TypeNames, VariantNames, VariantRef,
+    Abi, Const, ConstId, CoreFn, FuncIdx, HttpTypes, IoErrors, JsonTypes, LoweredFn, MetalTypes,
+    Program, Radix, TypeNames, VariantNames, VariantRef,
 };
 use crate::diagnostic::{Diagnostic, DiagnosticCode, has_errors};
 use crate::tivec::{Idx, TiVec};
@@ -1374,6 +1374,7 @@ impl Compiler {
             io: self.io_errors(),
             json: self.json_types(),
             http: self.http_types(),
+            metal: self.metal_types(),
         };
         let types = self.type_names((&fns).into_iter().chain(&inits).chain([&toplevel]), &abi);
         Some(Program {
@@ -1479,6 +1480,19 @@ impl Compiler {
             chunked_done: chunk("ChunkedDone")?,
             chunked_need_more: chunk("ChunkedNeedMore")?,
             chunked_bad: chunk("ChunkedBad")?,
+        })
+    }
+
+    /// `scarlet/metal.MetalError`'s constructors, by name, as [`Self::radix`].
+    fn metal_types(&self) -> Option<MetalTypes> {
+        let error = self.stdlib_variants(&["scarlet", "metal"], "MetalError")?;
+        Some(MetalTypes {
+            unsupported: error("Unsupported")?,
+            no_device: error("NoDevice")?,
+            empty_buffer: error("EmptyBuffer")?,
+            unaligned_binary: error("UnalignedBinary")?,
+            out_of_memory: error("OutOfMemory")?,
+            too_large: error("TooLarge")?,
         })
     }
 

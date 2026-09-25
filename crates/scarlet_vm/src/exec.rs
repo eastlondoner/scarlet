@@ -10,7 +10,13 @@
 //! a reference, and overwriting a register, or leaving a frame, gives one up.
 //! Perceus's `Drop` gives one up early. This alone keeps every count right,
 //! whatever Perceus did or did not insert (`docs/vm-design.md`, "Memory").
+//!
+//! A handle, like a `metal.Buffer`, names an object a platform holds outside
+//! the heap. The machine keeps the ones this run holds, tells the platform
+//! when the last value naming one is freed, and on the way out releases every
+//! one still held, however the run ended (`exec/metal.rs`).
 
+use std::borrow::Cow;
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -34,6 +40,8 @@ use crate::json;
 use crate::map;
 use crate::show;
 use crate::value::{Value, View};
+
+mod metal;
 
 struct Frame<'c> {
     body: &'c Body,
@@ -59,6 +67,12 @@ pub(crate) struct Machine<'c, 'h, 'o> {
     /// environment cannot change while the program runs, so every call after
     /// shares this one.
     env: Option<Cell>,
+    /// The handles this run holds.
+    handles: metal::Handles,
+    /// Bytes copied only to hand a binary to the OS or a platform, or to take
+    /// one back: `internal.bytes_staged`. A copy the OS or the platform
+    /// makes is its own, and not counted.
+    staged: u64,
 }
 
 impl<'c, 'h, 'o> Machine<'c, 'h, 'o> {
@@ -71,6 +85,8 @@ impl<'c, 'h, 'o> Machine<'c, 'h, 'o> {
             globals: vec![Value::NIL; code.globals as usize],
             regs: Vec::new(),
             env: None,
+            handles: metal::Handles::default(),
+            staged: 0,
         }
     }
 
@@ -1245,12 +1261,24 @@ impl<'c, 'h, 'o> Machine<'c, 'h, 'o> {
                     let unaligned = self.io_errors()?.unaligned_binary;
                     return self.err(Value::nullary(unaligned));
                 }
-                let bytes = binary::bytes(&self.heap, data);
+                let bytes = binary::byte_view(&self.heap, data);
+                if let Cow::Owned(copy) = &bytes {
+                    self.staged += copy.len() as u64;
+                }
                 match std::fs::write(path_of(&path), bytes) {
                     Ok(()) => self.ok(Value::NIL),
                     Err(e) => self.io_error(&e, &path),
                 }
             }
+            Intrinsic::InternalLiveHandles => self.live_handles(),
+            Intrinsic::InternalBytesStaged => {
+                bigint::value(&mut self.heap, self.staged.into()).map_err(full)
+            }
+            Intrinsic::MetalDevice => self.metal_device(),
+            Intrinsic::MetalName => self.metal_name(v),
+            Intrinsic::MetalBuffer => self.metal_buffer(v, arg(self, 1)),
+            Intrinsic::MetalRead => self.metal_read(v),
+            Intrinsic::MetalByteSize => self.metal_byte_size(v),
             Intrinsic::OsArgv => {
                 let mut items = Vec::with_capacity(self.host.argv().len());
                 for a in self.host.argv() {
@@ -2196,9 +2224,15 @@ impl<'c, 'h, 'o> Machine<'c, 'h, 'o> {
         v
     }
 
+    /// Give up `v`'s reference. A handle it freed, however deep in `v`, is
+    /// released now, so a Perceus `Drop` at a handle's last use is where the
+    /// platform lets its object go.
     fn release(&mut self, v: Value) {
         if let Some(cell) = v.as_cell() {
             self.heap.release(cell);
+            if self.heap.has_freed_handles() {
+                self.release_freed();
+            }
         }
     }
 
@@ -2407,7 +2441,7 @@ mod tests {
         cells_left_after_in(&Host::new(Vec::new(), Vec::new()), src)
     }
 
-    fn cells_left_after_in(host: &Host, src: &str) -> (String, usize) {
+    pub(super) fn cells_left_after_in(host: &Host, src: &str) -> (String, usize) {
         let mut scanner = scarlet_core::scanner::new_scanner(src.to_string());
         let parsed = scarlet_core::parser::new_parser(&mut scanner).parse_program();
         let expr = scarlet_core::ast::Expression::BlockExpression(parsed.ast);
