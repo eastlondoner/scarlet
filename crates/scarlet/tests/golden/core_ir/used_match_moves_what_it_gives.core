@@ -1,0 +1,51 @@
+fn main.pick(%0:t0, %1:t1) -> :t2
+  letj %3:t3 =
+    match %0 :t3
+      | 263.0(%2) ->
+        drop %0 [ctor:1]
+        ret move %2
+      | 263.1() ->
+        drop %0 [ctor:0]
+        ret %1
+  let %4:t3 = %3
+  drop %3
+  let %5:t4 = MakeTuple(%4, %1)
+  drop %1
+  drop %4
+  letc j0 =
+    match %5 :t2
+  match %5 :t2
+    | _ ->
+      let %6:t5 = TupleField(0)(%5)
+      let %7:t6 = TupleField(1)(%5)
+      match %6 :t2
+        | 512.0(%8, %9) ->
+          drop %6 [ctor:2]
+          match %7 :t2
+            | 512.0(%10, %11) ->
+              drop %5
+              drop %7 [ctor:2]
+              ret IntAdd(%8, %10)
+            | _ ->
+              drop %7
+              goto j0
+        | _ ->
+          drop %7
+          drop %6
+          goto j0
+
+fn main.main() -> :t2
+  let %0:t7 = ctor 263.1()
+  let %1:t8 = c0
+  let %2:t8 = c1
+  let %3:t9 = ctor 512.0(%1, %2)
+  ret call fn#0(%0, %3)
+
+toplevel:
+fn main.__main__() -> :t10
+  let %0:t3@g0 = closure fn#0()
+  let %1:t11@g1 = closure fn#1()
+  ret nil
+where
+  c0 = Int(1)
+  c1 = Int(2)

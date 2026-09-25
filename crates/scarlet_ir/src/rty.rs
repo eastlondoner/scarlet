@@ -229,15 +229,21 @@ impl ResolvedPool {
         }
     }
 
-    /// Whether a value of type `t` occupies a Perceus-managed heap cell.
+    /// Whether a value of type `t` may hold a heap cell, and so needs a
+    /// Perceus `Drop` at its last use.
     ///
-    /// `Bound` answers `false`: its representation is unknown here, so the
-    /// value is handled dynamically.
+    /// A `Float` never does. An `Int` does only once it is too big for a value
+    /// word, which is rare enough that a `Drop` of every Int would cost more
+    /// than holding a big one to frame exit. A `String` always does. A `Bound`
+    /// type variable may be any of these, so it answers `true`: dropping a
+    /// value word gives up nothing, and dropping a cell frees it.
     pub fn is_heap(&self, t: RTy) -> bool {
         match self.node(t) {
-            ResolvedNode::Con { id, .. } => self.as_prim(id).is_none(),
-            ResolvedNode::Tuple { .. } | ResolvedNode::Fun { .. } => true,
-            ResolvedNode::Bound(_) => false,
+            ResolvedNode::Con { id, .. } => match self.as_prim(id) {
+                Some(Prim::Int | Prim::Float) => false,
+                Some(Prim::String) | None => true,
+            },
+            ResolvedNode::Tuple { .. } | ResolvedNode::Fun { .. } | ResolvedNode::Bound(_) => true,
         }
     }
 }
@@ -264,7 +270,7 @@ mod tests {
     }
 
     #[test]
-    fn primitives_are_not_heap() {
+    fn numbers_are_not_heap_but_strings_are() {
         let mut p = pool();
         let int = p.mk_con(TypeId(1), &[]);
         let float = p.mk_con(TypeId(2), &[]);
@@ -274,8 +280,8 @@ mod tests {
         assert_eq!(p.prim_of(string), Some(Prim::String));
         assert!(!p.is_heap(int));
         assert!(!p.is_heap(float));
-        // Strings are heap-allocated at runtime but are not Perceus cells.
-        assert!(!p.is_heap(string));
+        // A String is always a cell, so it is dropped like one.
+        assert!(p.is_heap(string));
     }
 
     #[test]
@@ -295,7 +301,8 @@ mod tests {
     fn a_bound_variable_is_polymorphic_not_missing() {
         let mut p = pool();
         let b = p.mk_bound(0);
-        assert!(!p.is_heap(b));
+        // It may be instantiated at a cell, so it is dropped like one.
+        assert!(p.is_heap(b));
         assert_eq!(p.prim_of(b), None);
         assert_eq!(p.node(b), ResolvedNode::Bound(0));
     }

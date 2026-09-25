@@ -4,9 +4,11 @@
 //!
 //!  1. Backward liveness inserts `Drop` after each heap bind's last read.
 //!     `If`/`Match` joins equalise ownership so every path releases every owned
-//!     slot exactly once (Fig. 5's Δ-rule).
+//!     slot exactly once (Fig. 5's Δ-rule). A `LetJoin` is walked through, not
+//!     around: its `Tail`s continue into the code after it, so what that code
+//!     reads is live at each of them, and each branch drops the rest itself.
 //!  2. A forward walk pairs each `Drop` token with a later same-shape `Ctor`
-//!     through a LIFO stack, forked at branches.
+//!     through a LIFO stack, forked at branches and met again after a join.
 //!  3. The reuse walk runs a second time seeded with the intersection of the
 //!     first run's back-edge token sets, so a tail-self-recursive loop can
 //!     reuse the previous iteration's cells.
@@ -21,16 +23,16 @@ use crate::typed_ir::{RTy, ResolvedPool};
 /// are resolved by construction, so no unsolved variable can reach here and
 /// make `is_heap` answer `false` by accident.
 pub(crate) fn perceus(pool: &ResolvedPool, f: CoreFn) -> CoreFn {
+    let mut cx = Perceus::new(pool, f.locals_end());
     let CoreFn {
         params,
         body,
         ret_ty,
     } = f;
-    let mut cx = Perceus::new(pool);
     for p in &params {
         cx.record_bind(p, None);
     }
-    let (body, live) = cx.drop_pass(body);
+    let (body, live) = cx.drop_pass(body, &Exit::Return);
     // Params are owned on entry; any not read by the body drop at its head so
     // the frame's release count still balances.
     let dead_params: Vec<LocalId> = params
@@ -62,8 +64,25 @@ struct Token {
     carried: bool,
 }
 
+/// Where a `Tail` in the expression being transformed sends its value.
+enum Exit {
+    /// Out of the function: a return, or a tail call. The frame's references
+    /// go with it, so a `Tail` needs no drop after it.
+    Return,
+    /// Into a `LetJoin`'s bind, after which the code after the join runs.
+    Join {
+        /// The bind's type, for a local minted to hold the value.
+        ty: RTy,
+        /// Locals the code after the join reads. Every path through the join
+        /// must still own them when it reaches a `Tail`.
+        after: Live,
+    },
+}
+
 struct Perceus<'p> {
     pool: &'p ResolvedPool,
+    /// The next local id free to mint, above every one the function uses.
+    next_local: u32,
     /// Every bind's resolved type, for the heap-shape gate on `Drop`.
     ty: BTreeMap<LocalId, RTy>,
     /// Allocation shape of a bind when its rhs proves one. Locals with no entry
@@ -75,41 +94,29 @@ struct Perceus<'p> {
     cont_live: BTreeMap<JoinId, Live>,
 }
 
-/// One `Let`/`LetJoin` peeled off the spine, awaiting its body's live set to
-/// decide which drops go between rhs and body.
-struct SpineLet {
-    bind: CoreBind,
-    rhs_live: Live,
-    rhs: SpineRhs,
-}
-
-/// One node peeled off the spine by [`Perceus::drop_pass`].
+/// One node peeled off the spine by [`Perceus::drop_pass`], awaiting its
+/// body's live set.
 enum SpineFrame {
-    Let(SpineLet),
+    /// A `Let`: the live set decides which drops go between rhs and body.
+    Let {
+        bind: CoreBind,
+        rhs_live: Live,
+        rhs: Atom,
+    },
+    /// A `LetJoin`, whose join is transformed only once the body's live set is
+    /// known, since that is what each of its `Tail`s must leave owned.
+    Join { bind: CoreBind, join: Box<CoreExpr> },
     /// A `LetCont` whose continuation was drop-processed at peel time. It is
     /// rebuilt around the body with no drops of its own: the continuation's
     /// live-ins reach the enclosing live set through the `Goto`s to it.
-    Cont {
-        id: JoinId,
-        cont: CoreExpr,
-    },
-}
-
-/// The rhs of a peeled [`SpineLet`].
-enum SpineRhs {
-    Atom(Atom),
-    /// A `LetJoin`'s rhs is a whole `CoreExpr`, treated opaquely for liveness:
-    /// `rhs_live` is `join_live(join)` and no drops are inserted inside it.
-    /// A heap temp born inside a join is therefore held to the end of the
-    /// enclosing frame and never becomes a reuse token. Still sound: the VM
-    /// clones on `PushLocal` and releases on `StoreLocal`/frame teardown.
-    Join(Box<CoreExpr>),
+    Cont { id: JoinId, cont: CoreExpr },
 }
 
 impl<'p> Perceus<'p> {
-    fn new(pool: &'p ResolvedPool) -> Self {
+    fn new(pool: &'p ResolvedPool, next_local: u32) -> Self {
         Perceus {
             pool,
+            next_local,
             ty: BTreeMap::new(),
             shape: BTreeMap::new(),
             cont_live: BTreeMap::new(),
@@ -129,38 +136,42 @@ impl<'p> Perceus<'p> {
         self.ty.get(&id).is_some_and(|&t| self.pool.is_heap(t))
     }
 
+    /// A fresh local of type `ty`, numbered above every one the function had.
+    fn mint(&mut self, ty: RTy, shape: Option<ReuseShape>) -> CoreBind {
+        let b = CoreBind::new(LocalId(self.next_local), ty);
+        self.next_local += 1;
+        self.record_bind(&b, shape);
+        b
+    }
+
     /// Transform `e`, returning `(e', live)` where `live` is the outer-scope
     /// locals `e'` reads and so the caller's responsibility. Drops are inserted
     /// for locals that go dead inside `e`. The spine is walked iteratively so a
     /// long straight-line body does not recurse on the Rust stack.
-    fn drop_pass(&mut self, mut e: CoreExpr) -> (CoreExpr, Live) {
+    fn drop_pass(&mut self, mut e: CoreExpr, exit: &Exit) -> (CoreExpr, Live) {
         let mut spine: Vec<SpineFrame> = Vec::new();
         let (mut body, mut live) = loop {
             match e {
                 CoreExpr::Let { bind, rhs, body } => {
                     let rhs_live = atom_live(&rhs);
                     self.record_bind(&bind, ctor_shape(&rhs));
-                    spine.push(SpineFrame::Let(SpineLet {
+                    spine.push(SpineFrame::Let {
                         bind,
                         rhs_live,
-                        rhs: SpineRhs::Atom(rhs),
-                    }));
+                        rhs,
+                    });
                     e = *body;
                 }
                 CoreExpr::LetJoin { bind, join, body } => {
-                    let rhs_live = join_live(&join);
                     self.record_bind(&bind, None);
-                    spine.push(SpineFrame::Let(SpineLet {
-                        bind,
-                        rhs_live,
-                        rhs: SpineRhs::Join(join),
-                    }));
+                    spine.push(SpineFrame::Join { bind, join });
                     e = *body;
                 }
                 CoreExpr::LetCont { id, cont, body } => {
                     // Transformed before the body so its live-in set is known at
-                    // every `Goto(id)` the body contains.
-                    let (cont, cont_live) = self.drop_pass(*cont);
+                    // every `Goto(id)` the body contains. A cont inside a join
+                    // ends in that join's `Tail`s, so it shares the exit.
+                    let (cont, cont_live) = self.drop_pass(*cont, exit);
                     self.cont_live.insert(id, cont_live);
                     spine.push(SpineFrame::Cont { id, cont });
                     e = *body;
@@ -169,13 +180,7 @@ impl<'p> Perceus<'p> {
                     // Strip and re-derive, so the pass is safe to rerun.
                     e = *body;
                 }
-                // A tail call gives up every reference its frame still holds
-                // once it has read its arguments, so its arguments need no
-                // `Drop` here. One here would come before the read.
-                CoreExpr::Tail(a) => {
-                    let live = atom_live(&a);
-                    break (CoreExpr::Tail(a), live);
-                }
+                CoreExpr::Tail(a) => break self.drop_tail(a, exit),
                 CoreExpr::Goto(id) => {
                     // The edge hands the cont ownership of exactly its live-in
                     // set. Treating the `Goto` as a terminal reading that set
@@ -195,12 +200,15 @@ impl<'p> Perceus<'p> {
                     els,
                     ty,
                 } => {
-                    let (then, live_t) = self.drop_pass(*then);
-                    let (els, live_e) = self.drop_pass(*els);
+                    let (then, live_t) = self.drop_pass(*then, exit);
+                    let (els, live_e) = self.drop_pass(*els, exit);
                     // Both branches must release the same set, so the branch
                     // that does not need a local drops it at entry.
                     let then = self.wrap_drops(&set_diff(&live_e, &live_t), None, then);
                     let els = self.wrap_drops(&set_diff(&live_t, &live_e), None, els);
+                    // `cond` is read here and never dropped: it is a Bool,
+                    // which the immediates pass has made a value word, so it
+                    // owns no cell on any path.
                     let mut live: Live = &live_t | &live_e;
                     live.insert(cond);
                     break (
@@ -214,49 +222,69 @@ impl<'p> Perceus<'p> {
                     );
                 }
                 CoreExpr::Match { scrut, arms, ty } => {
-                    break self.drop_match(scrut, arms, ty);
+                    break self.drop_match(scrut, arms, ty, exit);
                 }
             }
         };
         while let Some(frame) = spine.pop() {
-            let frame = match frame {
-                SpineFrame::Let(frame) => frame,
+            match frame {
+                SpineFrame::Let {
+                    bind,
+                    rhs_live,
+                    rhs,
+                } => {
+                    // Newly dead here: rhs operands whose last read is this
+                    // one, plus the bind itself if the body never reads it.
+                    // They drop between rhs and body, as early as Perceus
+                    // permits, so reuse tokens are hot.
+                    let mut dead: Vec<LocalId> = rhs_live
+                        .iter()
+                        .copied()
+                        .filter(|x| !live.contains(x))
+                        .collect();
+                    if !live.contains(&bind.id) {
+                        dead.push(bind.id);
+                    }
+                    body = self.wrap_drops(&dead, None, body);
+                    live.remove(&bind.id);
+                    live.extend(rhs_live);
+                    body = CoreExpr::Let {
+                        bind,
+                        rhs,
+                        body: Box::new(body),
+                    };
+                }
+                SpineFrame::Join { bind, join } => {
+                    // Each `Tail` in the join is followed by `body`, so what
+                    // `body` reads is live at every one of them. The join
+                    // drops everything else on its own paths, which leaves
+                    // only the bind's drop for here, when `body` never reads
+                    // it. What `body` reads passes through the join owned, so
+                    // it is in `join_live` too.
+                    let read_by_body = live.remove(&bind.id);
+                    let exit = Exit::Join {
+                        ty: bind.ty,
+                        after: live,
+                    };
+                    let (join, join_live) = self.drop_pass(*join, &exit);
+                    if !read_by_body {
+                        body = self.wrap_drops(&[bind.id], None, body);
+                    }
+                    live = join_live;
+                    body = CoreExpr::LetJoin {
+                        bind,
+                        join: Box::new(join),
+                        body: Box::new(body),
+                    };
+                }
                 SpineFrame::Cont { id, cont } => {
                     body = CoreExpr::LetCont {
                         id,
                         cont: Box::new(cont),
                         body: Box::new(body),
                     };
-                    continue;
                 }
-            };
-            // Newly dead here: rhs operands whose last read is this one, plus
-            // the bind itself if the body never reads it. They drop between rhs
-            // and body, as early as Perceus permits, so reuse tokens are hot.
-            let mut dead: Vec<LocalId> = frame
-                .rhs_live
-                .iter()
-                .copied()
-                .filter(|x| !live.contains(x))
-                .collect();
-            if !live.contains(&frame.bind.id) {
-                dead.push(frame.bind.id);
             }
-            body = self.wrap_drops(&dead, None, body);
-            live.remove(&frame.bind.id);
-            live.extend(frame.rhs_live);
-            body = match frame.rhs {
-                SpineRhs::Atom(rhs) => CoreExpr::Let {
-                    bind: frame.bind,
-                    rhs,
-                    body: Box::new(body),
-                },
-                SpineRhs::Join(join) => CoreExpr::LetJoin {
-                    bind: frame.bind,
-                    join,
-                    body: Box::new(body),
-                },
-            };
         }
         (body, live)
     }
@@ -266,6 +294,7 @@ impl<'p> Perceus<'p> {
         scrut: LocalId,
         arms: Vec<(CorePat, CoreExpr)>,
         ty: RTy,
+        exit: &Exit,
     ) -> (CoreExpr, Live) {
         struct Arm {
             pat: CorePat,
@@ -281,7 +310,7 @@ impl<'p> Perceus<'p> {
         let mut lowered: Vec<Arm> = Vec::with_capacity(arms.len());
         for (pat, body) in arms {
             let (bound, scrut_shape) = self.record_pat(&pat, scrut);
-            let (body, mut live) = self.drop_pass(body);
+            let (body, mut live) = self.drop_pass(body, exit);
             let dead_binders: Vec<LocalId> = bound
                 .iter()
                 .copied()
@@ -318,6 +347,49 @@ impl<'p> Perceus<'p> {
         let mut live = live_union;
         live.insert(scrut);
         (CoreExpr::Match { scrut, arms, ty }, live)
+    }
+
+    /// A `Tail`, with what dies at it. Returned from the function, it takes
+    /// the frame's references with it: a tail call reads its arguments before
+    /// they go, so no `Drop` of one may come before it.
+    ///
+    /// Into a join, nothing runs between the `Tail` and the code after the
+    /// join, so there is nowhere to drop a local the `Tail` reads for the
+    /// last time. Its reference is handed to the join's bind instead, with
+    /// [`Atom::Move`]: `Tail(x)` becomes `Tail(move x)`, and any other value
+    /// reading such a local is bound first,
+    /// `let t = a; drop <dying>; Tail(move t)`, so the drops follow the read
+    /// as they would after a `Let`. This is Lean's and Koka's rule that a jump
+    /// to a join point consumes its argument.
+    fn drop_tail(&mut self, a: Atom, exit: &Exit) -> (CoreExpr, Live) {
+        let reads = atom_live(&a);
+        let Exit::Join { ty, after } = exit else {
+            return (CoreExpr::Tail(a), reads);
+        };
+        let live: Live = &reads | after;
+        let dying: Vec<LocalId> = reads
+            .iter()
+            .copied()
+            .filter(|x| !after.contains(x) && self.is_heap_local(*x))
+            .collect();
+        let tail = match a {
+            _ if dying.is_empty() => CoreExpr::Tail(a),
+            Atom::Local(x) | Atom::Move(x) => CoreExpr::Tail(Atom::Move(x)),
+            a => {
+                let t = self.mint(*ty, ctor_shape(&a));
+                let value = if self.is_heap_local(t.id) {
+                    Atom::Move(t.id)
+                } else {
+                    Atom::Local(t.id)
+                };
+                CoreExpr::Let {
+                    bind: t,
+                    rhs: a,
+                    body: Box::new(self.wrap_drops(&dying, None, CoreExpr::Tail(value))),
+                }
+            }
+        };
+        (tail, live)
     }
 
     /// Register the locals a pattern binds. Returns the scrutinee's shape: a
@@ -383,11 +455,11 @@ fn reuse_pass(mut body: CoreExpr) -> CoreExpr {
     let mut walk = ReuseWalk {
         self_tails: Vec::new(),
     };
-    walk.pair(&mut body, &mut Vec::new());
+    walk.pair(&mut body, &mut Vec::new(), None);
     // Only tokens present at *every* self-tail dominate the loop head. The
     // runtime `into_reuse_addr` debug-assert on rc==1 relies on that.
     if let Some(mut seed) = walk.back_edge_seed() {
-        walk.pair(&mut body, &mut seed);
+        walk.pair(&mut body, &mut seed, None);
     }
     body
 }
@@ -409,9 +481,15 @@ impl ReuseWalk {
     }
 
     /// LIFO reuse pairing over `e`. `avail` is the stack of hollowed cells
-    /// dominating the current point; forked (cloned) at branches, cleared at
-    /// non-tail calls, snapshotted at self-tails.
-    fn pair(&mut self, mut e: &mut CoreExpr, avail: &mut Vec<Token>) {
+    /// dominating the current point; forked (cloned) at branches, snapshotted
+    /// at self-tails. `join` is `Some` inside a `LetJoin`'s join: it collects
+    /// the stack reaching each `Tail` there, the join's exits.
+    fn pair(
+        &mut self,
+        mut e: &mut CoreExpr,
+        avail: &mut Vec<Token>,
+        mut join: Option<&mut Vec<Vec<Token>>>,
+    ) {
         loop {
             match e {
                 CoreExpr::Drop { local, shape, body } => {
@@ -451,29 +529,46 @@ impl ReuseWalk {
                     avail.retain(|t| t.slot != bind.id);
                     e = body;
                 }
-                CoreExpr::LetJoin { body, .. } => {
-                    // A join may contain a `Call` on some path; clear rather
-                    // than walk into it.
-                    avail.clear();
+                CoreExpr::LetJoin {
+                    bind,
+                    join: j,
+                    body,
+                } => {
+                    // The code after the join is reached from each of its
+                    // exits, so a cell is still parked there only if it is on
+                    // every exit: one taken on some path, or parked on only
+                    // some, is not. A join no `Tail` leaves gives nothing.
+                    let mut exits: Vec<Vec<Token>> = Vec::new();
+                    self.pair(j, &mut avail.clone(), Some(&mut exits));
+                    *avail = match exits.split_first() {
+                        Some((first, rest)) => first
+                            .iter()
+                            .filter(|t| rest.iter().all(|x| x.contains(t)))
+                            .copied()
+                            .collect(),
+                        None => Vec::new(),
+                    };
+                    avail.retain(|t| t.slot != bind.id);
                     e = body;
                 }
                 CoreExpr::LetCont { cont, body, .. } => {
                     // A shared cont is entered from many `Goto` edges, and a
                     // token parked on one edge may be a live slot on another, so
                     // it starts with an empty stack. Declaring a cont executes
-                    // nothing, so the body's `avail` is untouched.
-                    self.pair(cont, &mut Vec::new());
+                    // nothing, so the body's `avail` is untouched. Its `Tail`s
+                    // are exits of the same join as the body's.
+                    self.pair(cont, &mut Vec::new(), join.as_deref_mut());
                     e = body;
                 }
                 CoreExpr::If { then, els, .. } => {
                     let mut a2 = avail.clone();
-                    self.pair(then, avail);
-                    self.pair(els, &mut a2);
+                    self.pair(then, avail, join.as_deref_mut());
+                    self.pair(els, &mut a2, join);
                     return;
                 }
                 CoreExpr::Match { arms, .. } => {
                     for (_, body) in arms {
-                        self.pair(body, &mut avail.clone());
+                        self.pair(body, &mut avail.clone(), join.as_deref_mut());
                     }
                     return;
                 }
@@ -487,16 +582,20 @@ impl ReuseWalk {
                                 *reuse = Some(avail.remove(i).slot);
                             }
                         }
+                        // In a join this is an ordinary call, not a back edge.
                         Atom::Call {
                             callee: Callee::Self_,
                             ..
-                        } => {
+                        } if join.is_none() => {
                             self.self_tails.push(avail.clone());
                         }
                         // A self-tail filter: every other atom, current or
                         // future, is by definition not a self tail call.
                         #[allow(unknown_lints, wildcard_over_own_enum)]
                         _ => {}
+                    }
+                    if let Some(exits) = join {
+                        exits.push(avail.clone());
                     }
                     return;
                 }
@@ -514,88 +613,6 @@ fn atom_live(a: &Atom) -> Live {
     a.for_each_operand(|id| {
         live.insert(id);
     });
-    live
-}
-
-/// Free locals of a `LetJoin` rhs, so `drop_pass` can treat the join as an
-/// opaque atom for liveness. Drops go around a join, never inside it.
-fn join_live(e: &CoreExpr) -> Live {
-    /// The spine is walked iteratively so recursion depth is branch nesting,
-    /// never spine length. Ids bound on this spine collect in `scope` and pop
-    /// before returning, so a sibling branch never sees them.
-    fn go(mut e: &CoreExpr, live: &mut Live, bound: &mut Live) {
-        let mut scope: Vec<LocalId> = Vec::new();
-        loop {
-            match e {
-                CoreExpr::Let { bind, rhs, body } => {
-                    for x in atom_live(rhs) {
-                        if !bound.contains(&x) {
-                            live.insert(x);
-                        }
-                    }
-                    if bound.insert(bind.id) {
-                        scope.push(bind.id);
-                    }
-                    e = body;
-                }
-                CoreExpr::LetJoin { bind, join, body } => {
-                    go(join, live, bound);
-                    if bound.insert(bind.id) {
-                        scope.push(bind.id);
-                    }
-                    e = body;
-                }
-                CoreExpr::LetCont { cont, body, .. } => {
-                    // Collected at the declaration, so a `Goto` adds nothing.
-                    go(cont, live, bound);
-                    e = body;
-                }
-                CoreExpr::Drop { body, .. } => e = body,
-                CoreExpr::Tail(a) => {
-                    for x in atom_live(a) {
-                        if !bound.contains(&x) {
-                            live.insert(x);
-                        }
-                    }
-                    break;
-                }
-                CoreExpr::Goto(_) => break,
-                CoreExpr::If {
-                    cond, then, els, ..
-                } => {
-                    if !bound.contains(cond) {
-                        live.insert(*cond);
-                    }
-                    go(then, live, bound);
-                    go(els, live, bound);
-                    break;
-                }
-                CoreExpr::Match { scrut, arms, .. } => {
-                    if !bound.contains(scrut) {
-                        live.insert(*scrut);
-                    }
-                    for (pat, body) in arms {
-                        let mut intro: Vec<LocalId> = Vec::new();
-                        for b in pat.binds() {
-                            if bound.insert(b.id) {
-                                intro.push(b.id);
-                            }
-                        }
-                        go(body, live, bound);
-                        for &b in &intro {
-                            bound.remove(&b);
-                        }
-                    }
-                    break;
-                }
-            }
-        }
-        for id in scope {
-            bound.remove(&id);
-        }
-    }
-    let mut live = Live::new();
-    go(e, &mut live, &mut Live::new());
     live
 }
 
@@ -618,7 +635,7 @@ fn unscoped_goto(id: JoinId) -> ! {
 }
 
 /// Take a module toplevel's pinned globals back out of Perceus's hands: no
-/// `Drop` releases one, and no `Ctor` reuses one's cell.
+/// `Drop` or `Atom::Move` releases one, and no `Ctor` reuses one's cell.
 ///
 /// Perceus sees only the toplevel, where a global's last read is not its last
 /// use: function bodies read it through `Load::Global` for as long as the
@@ -681,11 +698,18 @@ fn spare(mut e: &mut CoreExpr, pinned: &BTreeSet<LocalId>) {
     }
 }
 
+/// A move of a pinned global gives its reference up as a `Drop` would, so it
+/// becomes a read that shares.
 fn spare_atom(a: &mut Atom, pinned: &BTreeSet<LocalId>) {
     if let Atom::Ctor { reuse, .. } = a
         && reuse.is_some_and(|r| pinned.contains(&r))
     {
         *reuse = None;
+    }
+    if let Atom::Move(x) = *a
+        && pinned.contains(&x)
+    {
+        *a = Atom::Local(x);
     }
 }
 
@@ -1103,34 +1127,26 @@ mod tests {
         assert_eq!(count_drops(els), 1, "els drops %0 at head");
     }
 
-    /// A rigid quantified variable has unknown representation, is handled
-    /// dynamically, and emits no `Drop`. It is the only non-heap answer that is
-    /// not a primitive; a dead nominal bind still drops.
+    /// A rigid quantified variable may be instantiated at a cell, so a dead
+    /// one drops like a nominal: the `Drop` of a value word gives up nothing.
     #[test]
-    fn bound_is_not_heap_but_a_nominal_is() {
+    fn a_type_variable_drops_like_a_nominal() {
         let mut pool = pool();
         let generic = pool.mk_bound(0);
         let int = int_ty(&mut pool);
         let t = con(&mut pool, 99);
-        let f = perceus(
-            &pool,
-            func(
-                vec![bind(0, generic), bind(1, int)],
-                CoreExpr::Tail(Atom::Local(local(1))),
-                int,
-            ),
-        );
-        assert_eq!(count_drops(&f.body), 0, "rigid Bound owns no cell");
-
-        let f = perceus(
-            &pool,
-            func(
-                vec![bind(0, t), bind(1, int)],
-                CoreExpr::Tail(Atom::Local(local(1))),
-                int,
-            ),
-        );
-        assert_eq!(count_drops(&f.body), 1, "dead heap param drops at head");
+        for ty in [generic, t] {
+            let f = perceus(
+                &pool,
+                func(
+                    vec![bind(0, ty), bind(1, int)],
+                    CoreExpr::Tail(Atom::Local(local(1))),
+                    int,
+                ),
+            );
+            assert_eq!(count_drops(&f.body), 1, "dead param drops at head");
+            assert!(find_drop(&f.body, local(0)), "{}", f.body);
+        }
     }
 
     #[test]
@@ -1254,6 +1270,156 @@ mod tests {
             "%0's last use is in the cont, so it drops there:\n{}",
             f.body
         );
+    }
+
+    /// `let %9 = (match %0 { V(%1) -> f(%1) }); %9`: the arm drops the
+    /// scrutinee, and since nothing runs between its value and the code after
+    /// the join, it binds the call to a fresh local, drops `%1` after it, and
+    /// hands the fresh local over with `move`. Nothing drops after the join.
+    #[test]
+    fn a_join_arm_hands_over_the_value_that_reads_a_local_last() {
+        let mut pool = pool();
+        let t = con(&mut pool, 99);
+        let join = CoreExpr::Match {
+            scrut: local(0),
+            arms: vec![(
+                CorePat::Ctor {
+                    variant: variant(),
+                    fields: vec![bind(1, t)],
+                },
+                CoreExpr::Tail(Atom::Call {
+                    callee: Callee::Known(FuncIdx(3)),
+                    args: vec![local(1)],
+                }),
+            )],
+            ty: t,
+        };
+        let f = perceus(
+            &pool,
+            func(
+                vec![bind(0, t)],
+                CoreExpr::LetJoin {
+                    bind: bind(9, t),
+                    join: Box::new(join),
+                    body: Box::new(CoreExpr::Tail(Atom::Local(local(9)))),
+                },
+                t,
+            ),
+        );
+        let CoreExpr::LetJoin { join, body, .. } = &f.body else {
+            panic!("{}", f.body)
+        };
+        assert_eq!(count_drops(body), 0, "{}", f.body);
+        let CoreExpr::Match { arms, .. } = &**join else {
+            panic!("{}", f.body)
+        };
+        let want = "drop %0 [ctor:1]
+let %10:";
+        let arm = format!("{}", crate::core_ir::Indented(&arms[0].1, 0));
+        assert!(arm.starts_with(want), "{arm}");
+        assert!(
+            arm.ends_with("= call fn#3(%1)\ndrop %1\nret move %10\n"),
+            "{arm}"
+        );
+    }
+
+    /// An arm's value that is a local the code after the join still reads is
+    /// shared, not moved, and no arm drops it.
+    #[test]
+    fn a_join_arm_shares_a_local_the_code_after_reads() {
+        let mut pool = pool();
+        let t = con(&mut pool, 99);
+        let int = int_ty(&mut pool);
+        let f = perceus(
+            &pool,
+            func(
+                vec![bind(0, t), bind(1, int)],
+                CoreExpr::LetJoin {
+                    bind: bind(2, t),
+                    join: Box::new(CoreExpr::If {
+                        cond: local(1),
+                        then: Box::new(CoreExpr::Tail(Atom::Local(local(0)))),
+                        els: Box::new(CoreExpr::Tail(ctor(&[]))),
+                        ty: t,
+                    }),
+                    body: Box::new(CoreExpr::Tail(Atom::Call {
+                        callee: Callee::Known(FuncIdx(3)),
+                        args: vec![local(0), local(2)],
+                    })),
+                },
+                t,
+            ),
+        );
+        let CoreExpr::LetJoin { join, .. } = &f.body else {
+            panic!("{}", f.body)
+        };
+        assert_eq!(count_drops(join), 0, "{}", f.body);
+        let CoreExpr::If { then, .. } = &**join else {
+            panic!("{}", f.body)
+        };
+        assert!(
+            matches!(**then, CoreExpr::Tail(Atom::Local(l)) if l == local(0)),
+            "{}",
+            f.body
+        );
+    }
+
+    /// A cell every arm of a join parks is still parked after it, so a
+    /// constructor there takes it; one only some arms park is not.
+    #[test]
+    fn a_cell_parked_on_every_exit_of_a_join_is_reused_after_it() {
+        let mut pool = pool();
+        let t = con(&mut pool, 99);
+        let int = int_ty(&mut pool);
+        let arm = |then_parks: bool| {
+            let first = CoreExpr::Match {
+                scrut: local(0),
+                arms: vec![(
+                    CorePat::Ctor {
+                        variant: variant(),
+                        fields: vec![bind(3, int), bind(4, int)],
+                    },
+                    CoreExpr::Tail(Atom::Local(local(3))),
+                )],
+                ty: int,
+            };
+            let second = if then_parks {
+                CoreExpr::Match {
+                    scrut: local(0),
+                    arms: vec![(
+                        CorePat::Ctor {
+                            variant: variant(),
+                            fields: vec![bind(5, int), bind(6, int)],
+                        },
+                        CoreExpr::Tail(Atom::Local(local(6))),
+                    )],
+                    ty: int,
+                }
+            } else {
+                CoreExpr::Tail(Atom::Local(local(1)))
+            };
+            CoreExpr::If {
+                cond: local(1),
+                then: Box::new(first),
+                els: Box::new(second),
+                ty: int,
+            }
+        };
+        for (every, want) in [(true, Some(local(0))), (false, None)] {
+            let f = perceus(
+                &pool,
+                func(
+                    vec![bind(0, t), bind(1, int)],
+                    CoreExpr::LetJoin {
+                        bind: bind(2, int),
+                        join: Box::new(arm(every)),
+                        body: Box::new(CoreExpr::Tail(ctor(&[2, 2]))),
+                    },
+                    t,
+                ),
+            );
+            assert_eq!(ctor_reuses(&f.body), vec![want], "{}", f.body);
+        }
     }
 
     /// A token parked before the `LetCont` pairs on the fallthrough path but

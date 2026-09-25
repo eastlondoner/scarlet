@@ -565,7 +565,7 @@ mod tests {
         );
         assert!(pool.is_heap(t.int_pair), "a tuple is always a heap cell");
         assert!(!pool.is_heap(t.int));
-        assert!(!pool.is_heap(t.string));
+        assert!(pool.is_heap(t.string), "a String is always a heap cell");
 
         assert_eq!(pool.prim_of(t.int), Some(Prim::Int));
         assert_eq!(pool.prim_of(t.string), Some(Prim::String));

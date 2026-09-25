@@ -1436,3 +1436,903 @@ fn a_float_pattern_matches_as_equality_does() {
         "zero\nzero\none and a half\none and a half\nother\n",
     );
 }
+
+/// What the tests of a `match` whose value is used, rather than returned,
+/// share: a two-field constructor, which is always a cell, a function that
+/// may give one, and one that reads one. `internal.cells_live()` counts the
+/// cells held at a point, so a test pins that a value is freed by then,
+/// rather than at the end of its frame.
+const CELLS: &str = r"import scarlet/internal
+
+type Big {
+	Big(a Int, b Int)
+}
+
+fn make(n Int) Option(Big) {
+	if n > 0 then Some(Big(n, n)) else None
+}
+
+fn use(b Big) Int {
+	match b {
+		Big(a, _) -> a
+	}
+}
+
+";
+
+/// `CELLS`, then `src`.
+fn prints_cells(src: &str, want: &str) {
+    prints(&format!("{CELLS}{src}"), want);
+}
+
+/// A `match` whose value is bound rather than returned lowers to a join
+/// point, and each arm gives up the scrutinee and what it bound before the
+/// code after the join runs, rather than at the end of the frame.
+#[test]
+fn a_used_match_frees_its_value_in_each_arm() {
+    prints_cells(
+        r"fn probe(n Int) Int {
+	base = internal.cells_live()
+	r = match make(n) {
+		Some(b) -> use(b)
+		None -> 0
+	}
+	println(internal.cells_live() - base)
+	r
+}
+
+pub fn main() {
+	println(probe(4))
+	println(probe(0))
+}
+",
+        "0\n4\n0\n0\n",
+    );
+}
+
+/// A guard that fails falls through to the next arm, and every way out
+/// frees what the arms bound.
+#[test]
+fn a_used_match_frees_its_value_behind_a_guard() {
+    prints_cells(
+        r"fn probe(n Int) Int {
+	base = internal.cells_live()
+	r = match make(n) {
+		Some(b) if use(b) > 5 -> 1
+		Some(b) -> use(b) + 2
+		None -> 0
+	}
+	println(internal.cells_live() - base)
+	r
+}
+
+pub fn main() {
+	println(probe(1))
+	println(probe(9))
+	println(probe(0))
+}
+",
+        "0\n3\n0\n1\n0\n0\n",
+    );
+}
+
+/// A used match inside an arm of another is a join inside a join: the
+/// inner one frees its own value, the outer arm's `Some` goes as the arm
+/// starts, and its `b` once its last read is done.
+#[test]
+fn a_used_match_inside_another_frees_both() {
+    prints_cells(
+        r"fn probe(n Int) Int {
+	base = internal.cells_live()
+	r = match make(n) {
+		Some(b) -> {
+			inner = match make(use(b) - 1) {
+				Some(c) -> use(c)
+				None -> 10
+			}
+			println(internal.cells_live() - base)
+			inner + use(b)
+		}
+		None -> 0
+	}
+	println(internal.cells_live() - base)
+	r
+}
+
+pub fn main() {
+	println(probe(3))
+	println(probe(1))
+}
+",
+        "1\n0\n5\n1\n0\n11\n",
+    );
+}
+
+/// A loop that makes a value and matches on it every turn holds none of
+/// them once the match is done, in any turn: the count is read after the
+/// match in each, and every one is 0.
+#[test]
+fn a_used_match_in_a_loop_holds_nothing_after_it() {
+    prints_cells(
+        r"fn spin(n Int, acc Int, most Int, base Int) Int {
+	x = match make(n) {
+		Some(b) -> use(b)
+		None -> 0
+	}
+	held = internal.cells_live() - base
+	top = if held > most then held else most
+	if n <= 0 {
+		println(top)
+		acc
+	} else {
+		spin(n - 1, acc + x, top, base)
+	}
+}
+
+pub fn main() {
+	base = internal.cells_live()
+	println(spin(100, 0, 0, base))
+}
+",
+        "0\n5050\n",
+    );
+}
+
+/// A value an arm gives as the match's own survives into the code after
+/// it, even though the arm bound it: here the `Big` in `r`, and the closure
+/// in `f` with the `Big` it captured. Only the `Some` around each goes.
+#[test]
+fn a_value_a_used_match_gives_survives_it() {
+    prints_cells(
+        r"fn probe(n Int) Int {
+	base = internal.cells_live()
+	r = match make(n) {
+		Some(b) -> b
+		None -> Big(0, 0)
+	}
+	println(internal.cells_live() - base)
+	f = match make(n) {
+		Some(b) -> fn() { use(b) }
+		None -> fn() { 0 }
+	}
+	println(internal.cells_live() - base)
+	use(r) + f()
+}
+
+pub fn main() {
+	println(probe(4))
+}
+",
+        "1\n3\n8\n",
+    );
+}
+
+/// A scrutinee the code after the match still reads is not given up by
+/// the match: both of its cells are held until that last read.
+#[test]
+fn a_value_read_after_a_used_match_is_kept_until_then() {
+    prints_cells(
+        r"fn probe(n Int) Int {
+	base = internal.cells_live()
+	m = make(n)
+	r = match m {
+		Some(b) -> use(b)
+		None -> 0
+	}
+	println(internal.cells_live() - base)
+	s = match m {
+		Some(b) -> use(b)
+		None -> 0
+	}
+	println(internal.cells_live() - base)
+	r + s
+}
+
+pub fn main() {
+	println(probe(4))
+}
+",
+        "2\n0\n8\n",
+    );
+}
+
+/// Three used matches in one function: each frees its own value, so the
+/// count stays at none rather than growing by two a match.
+#[test]
+fn used_matches_in_a_row_hold_nothing_between_them() {
+    prints_cells(
+        r"fn probe() Int {
+	base = internal.cells_live()
+	x = match make(1) {
+		Some(b) -> use(b)
+		None -> 0
+	}
+	println(internal.cells_live() - base)
+	y = match make(2) {
+		Some(b) -> use(b)
+		None -> 0
+	}
+	println(internal.cells_live() - base)
+	z = match make(3) {
+		Some(b) -> use(b)
+		None -> 0
+	}
+	println(internal.cells_live() - base)
+	x + y + z
+}
+
+pub fn main() {
+	println(probe())
+}
+",
+        "0\n0\n0\n6\n",
+    );
+}
+
+/// Every kind of cell an arm can bind is freed by a used match: an array, a
+/// closure, a tuple, a binary and a string.
+#[test]
+fn a_used_match_frees_every_kind_of_cell() {
+    prints(
+        r"import scarlet/array
+import scarlet/binary
+import scarlet/internal
+import scarlet/string
+
+fn arr(n Int) Option(Array(Int)) {
+	if n > 0 then Some([n, n + 1, n + 2]) else None
+}
+
+fn clo(n Int) Option(fn() Int) {
+	if n > 0 then Some(fn() { n + 1 }) else None
+}
+
+fn tup(n Int) Option((Int, Array(Int))) {
+	if n > 0 then Some((n, [n])) else None
+}
+
+fn bin(n Int) Option(Binary) {
+	if n > 0 then Some(<<n:size(16), n:size(16)>>) else None
+}
+
+fn str(n Int) Option(String) {
+	if n > 0 then Some('n is ${n}') else None
+}
+
+fn probe() Int {
+	base = internal.cells_live()
+	a = match arr(1) {
+		Some(xs) -> array.length(xs)
+		None -> 0
+	}
+	println(internal.cells_live() - base)
+	c = match clo(1) {
+		Some(f) -> f()
+		None -> 0
+	}
+	println(internal.cells_live() - base)
+	t = match tup(1) {
+		Some((k, xs)) -> k + array.length(xs)
+		None -> 0
+	}
+	println(internal.cells_live() - base)
+	b = match bin(1) {
+		Some(bits) -> binary.byte_size(bits)
+		None -> 0
+	}
+	println(internal.cells_live() - base)
+	s = match str(1) {
+		Some(text) -> string.length(text)
+		None -> 0
+	}
+	println(internal.cells_live() - base)
+	a + c + t + b + s
+}
+
+pub fn main() {
+	println(probe())
+}
+",
+        "0\n0\n0\n0\n0\n17\n",
+    );
+}
+
+/// A value whose type is a type variable is dropped at its last use like any
+/// other: `x` is a `Big` here, and passing it to `f` for the last time hands
+/// it over, so `f` frees it and nothing holds it when `twice` looks.
+#[test]
+fn a_generic_value_is_freed_at_its_last_use() {
+    prints_cells(
+        r"fn twice(x a, f fn(a) Int, base Int) Int {
+	n = f(x)
+	println(internal.cells_live() - base)
+	n * 2
+}
+
+pub fn main() {
+	base = internal.cells_live()
+	println(twice(Big(3, 4), use, base))
+}
+",
+        "0\n6\n",
+    );
+}
+
+/// A string is a cell, and is freed at its last use rather than with its
+/// frame.
+#[test]
+fn a_string_is_freed_at_its_last_use() {
+    prints(
+        r"import scarlet/internal
+import scarlet/string
+
+fn probe(n Int) Int {
+	base = internal.cells_live()
+	s = 'n is ${n}'
+	k = string.length(s)
+	println(internal.cells_live() - base)
+	k
+}
+
+pub fn main() {
+	println(probe(12))
+}
+",
+        "0\n7\n",
+    );
+}
+
+/// Seeded random programs of used matches, each checked against a liveness
+/// oracle: after every statement, the cells held are exactly those reachable
+/// from a variable a later statement still reads. The oracle also runs the
+/// program, so a value freed too early shows up as a wrong answer or a
+/// wrong count, and one freed too late as a count too high.
+mod used_match_liveness {
+    use std::collections::{BTreeSet, HashMap};
+
+    /// Allocation happens only in the helpers, and none of them builds a
+    /// constructor after dropping one of the same width, so no cell is ever
+    /// hollowed for reuse and held: the count is exactly the cells reachable.
+    const HEADER: &str = r"import scarlet/internal
+
+type Big {
+	Big(a Int, b Int, c Int)
+}
+
+type Wrap {
+	One(x Big)
+	Two(x Big, y Big)
+	Zero
+}
+
+fn big(k Int) Big {
+	Big(k, k, k)
+}
+
+fn one(b Big) Wrap {
+	One(b)
+}
+
+fn two(a Big, b Big) Wrap {
+	Two(a, b)
+}
+
+fn zero() Wrap {
+	Zero
+}
+
+fn k_of(b Big) Int {
+	match b {
+		Big(k, _, _) -> k
+	}
+}
+
+fn w_of(w Wrap) Int {
+	match w {
+		One(b) -> k_of(b)
+		Two(a, b) -> k_of(a) + k_of(b)
+		Zero -> 0
+	}
+}
+
+fn join2(a Big, b Big) Big {
+	big(k_of(a) + k_of(b))
+}
+
+";
+
+    /// xorshift64: deterministic, seedable, no dependency.
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % n as u64) as usize
+        }
+
+        fn chance(&mut self, percent: usize) -> bool {
+            self.below(100) < percent
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Ty {
+        Big,
+        Wrap,
+    }
+
+    /// An expression of type `Big`.
+    enum Big {
+        New(i64),
+        Var(String),
+        Join(Box<Big>, Box<Big>),
+        Match(Box<Match>),
+        /// `{ temp = <inner>; join2(temp, with) }`: a used match inside an
+        /// arm, so a join inside a join.
+        Block {
+            temp: String,
+            inner: Box<Match>,
+            with: Box<Big>,
+        },
+    }
+
+    /// An expression of type `Wrap`.
+    enum Wrap {
+        Var(String),
+        One(Big),
+        Two(Big, Big),
+        Zero,
+    }
+
+    struct Match {
+        scrut: Wrap,
+        arms: Vec<Arm>,
+    }
+
+    struct Arm {
+        pat: Pat,
+        /// `if k_of(<first binder>) > n`.
+        guard: Option<i64>,
+        body: Big,
+    }
+
+    enum Pat {
+        One(Option<String>),
+        Two(Option<String>, Option<String>),
+        Zero,
+    }
+
+    enum Rhs {
+        Big(Big),
+        Wrap(Wrap),
+    }
+
+    struct Gen {
+        rng: Rng,
+        fresh: usize,
+    }
+
+    impl Gen {
+        fn name(&mut self, prefix: &str) -> String {
+            self.fresh += 1;
+            format!("{prefix}{}", self.fresh)
+        }
+
+        fn pick(&mut self, scope: &[(String, Ty)], ty: Ty) -> Option<String> {
+            let of: Vec<&String> = scope
+                .iter()
+                .filter(|(_, t)| *t == ty)
+                .map(|(n, _)| n)
+                .collect();
+            (!of.is_empty()).then(|| of[self.rng.below(of.len())].clone())
+        }
+
+        /// A `Big` that allocates at most one cell and reads at most one local.
+        fn big_atom(&mut self, scope: &[(String, Ty)]) -> Big {
+            match self.pick(scope, Ty::Big) {
+                Some(v) if self.rng.chance(60) => Big::Var(v),
+                _ => Big::New(self.rng.below(9) as i64 + 1),
+            }
+        }
+
+        fn wrap(&mut self, scope: &[(String, Ty)]) -> Wrap {
+            match self.rng.below(5) {
+                0 => match self.pick(scope, Ty::Wrap) {
+                    Some(v) => Wrap::Var(v),
+                    None => Wrap::Zero,
+                },
+                1 => Wrap::Zero,
+                2 => Wrap::One(self.big_atom(scope)),
+                _ => Wrap::Two(self.big_atom(scope), self.big_atom(scope)),
+            }
+        }
+
+        fn big(&mut self, scope: &[(String, Ty)], depth: usize) -> Big {
+            match self.rng.below(if depth == 0 { 3 } else { 5 }) {
+                0 => self.big_atom(scope),
+                1 => Big::Join(
+                    Box::new(self.big_atom(scope)),
+                    Box::new(self.big_atom(scope)),
+                ),
+                2 => match self.pick(scope, Ty::Big) {
+                    Some(v) => Big::Var(v),
+                    None => Big::New(1),
+                },
+                3 => Big::Match(Box::new(self.matches(scope, depth - 1))),
+                _ => {
+                    let inner = self.matches(scope, depth - 1);
+                    let with = self.big_atom(scope);
+                    Big::Block {
+                        temp: self.name("t"),
+                        inner: Box::new(inner),
+                        with: Box::new(with),
+                    }
+                }
+            }
+        }
+
+        /// Every constructor gets an arm, in a rotated order; a guarded one is
+        /// followed by an unguarded one for the same constructor, so the
+        /// match stays exhaustive.
+        fn matches(&mut self, scope: &[(String, Ty)], depth: usize) -> Match {
+            let scrut = self.wrap(scope);
+            let mut widths = [1, 2, 0];
+            widths.rotate_left(self.rng.below(3));
+            let mut arms = Vec::new();
+            for width in widths {
+                if width > 0 && self.rng.chance(30) {
+                    let n = self.rng.below(9) as i64;
+                    arms.push(self.arm(scope, depth, width, Some(n)));
+                }
+                arms.push(self.arm(scope, depth, width, None));
+            }
+            Match { scrut, arms }
+        }
+
+        fn arm(
+            &mut self,
+            scope: &[(String, Ty)],
+            depth: usize,
+            width: usize,
+            guard: Option<i64>,
+        ) -> Arm {
+            let names: Vec<String> = (0..width).map(|_| self.name("x")).collect();
+            let mut inner = scope.to_vec();
+            inner.extend(names.iter().map(|n| (n.clone(), Ty::Big)));
+            let body = self.big(&inner, depth);
+            let mut used = BTreeSet::new();
+            big_reads(&body, &mut used);
+            if guard.is_some() {
+                used.extend(names.first().cloned());
+            }
+            let keep = |n: &String| used.contains(n).then(|| n.clone());
+            let pat = match names.as_slice() {
+                [] => Pat::Zero,
+                [x] => Pat::One(keep(x)),
+                [x, y] => Pat::Two(keep(x), keep(y)),
+                _ => unreachable!(),
+            };
+            Arm { pat, guard, body }
+        }
+    }
+
+    fn big_reads(b: &Big, out: &mut BTreeSet<String>) {
+        match b {
+            Big::New(_) => {}
+            Big::Var(v) => {
+                out.insert(v.clone());
+            }
+            Big::Join(a, b) => {
+                big_reads(a, out);
+                big_reads(b, out);
+            }
+            Big::Match(m) => match_reads(m, out),
+            Big::Block { temp, inner, with } => {
+                match_reads(inner, out);
+                big_reads(with, out);
+                out.remove(temp);
+            }
+        }
+    }
+
+    fn wrap_reads(w: &Wrap, out: &mut BTreeSet<String>) {
+        match w {
+            Wrap::Var(v) => {
+                out.insert(v.clone());
+            }
+            Wrap::One(b) => big_reads(b, out),
+            Wrap::Two(a, b) => {
+                big_reads(a, out);
+                big_reads(b, out);
+            }
+            Wrap::Zero => {}
+        }
+    }
+
+    fn match_reads(m: &Match, out: &mut BTreeSet<String>) {
+        wrap_reads(&m.scrut, out);
+        for arm in &m.arms {
+            big_reads(&arm.body, out);
+        }
+    }
+
+    fn pad(depth: usize) -> String {
+        "\t".repeat(depth)
+    }
+
+    fn big_src(b: &Big, depth: usize) -> String {
+        match b {
+            Big::New(k) => format!("big({k})"),
+            Big::Var(v) => v.clone(),
+            Big::Join(a, b) => format!("join2({}, {})", big_src(a, depth), big_src(b, depth)),
+            Big::Match(m) => match_src(m, depth),
+            Big::Block { temp, inner, with } => format!(
+                "{{\n{p1}{temp} = {}\n{p1}join2({temp}, {})\n{p0}}}",
+                match_src(inner, depth + 1),
+                big_src(with, depth + 1),
+                p0 = pad(depth),
+                p1 = pad(depth + 1),
+            ),
+        }
+    }
+
+    fn wrap_src(w: &Wrap, depth: usize) -> String {
+        match w {
+            Wrap::Var(v) => v.clone(),
+            Wrap::One(b) => format!("one({})", big_src(b, depth)),
+            Wrap::Two(a, b) => format!("two({}, {})", big_src(a, depth), big_src(b, depth)),
+            Wrap::Zero => "zero()".into(),
+        }
+    }
+
+    fn match_src(m: &Match, depth: usize) -> String {
+        let bind = |n: &Option<String>| n.clone().unwrap_or_else(|| "_".into());
+        let mut s = format!("match {} {{\n", wrap_src(&m.scrut, depth));
+        for arm in &m.arms {
+            let (pat, first) = match &arm.pat {
+                Pat::One(x) => (format!("One({})", bind(x)), x.clone()),
+                Pat::Two(x, y) => (format!("Two({}, {})", bind(x), bind(y)), x.clone()),
+                Pat::Zero => ("Zero".into(), None),
+            };
+            let guard = match (arm.guard, first) {
+                (Some(n), Some(x)) => format!(" if k_of({x}) > {n}"),
+                _ => String::new(),
+            };
+            s.push_str(&format!(
+                "{}{pat}{guard} -> {}\n",
+                pad(depth + 1),
+                big_src(&arm.body, depth + 1)
+            ));
+        }
+        s.push_str(&format!("{}}}", pad(depth)));
+        s
+    }
+
+    /// The oracle's heap: a cell per allocation, never freed, so identity is
+    /// an index and reachability is what decides the count.
+    enum Cell {
+        Big(i64),
+        One(usize),
+        Two(usize, usize),
+    }
+
+    #[derive(Clone, Copy)]
+    enum Val {
+        Big(usize),
+        /// `None` is `Zero`, a value word.
+        Wrap(Option<usize>),
+    }
+
+    #[derive(Default)]
+    struct Oracle {
+        cells: Vec<Cell>,
+    }
+
+    impl Oracle {
+        fn alloc(&mut self, c: Cell) -> usize {
+            self.cells.push(c);
+            self.cells.len() - 1
+        }
+
+        fn k(&self, big: usize) -> i64 {
+            match self.cells[big] {
+                Cell::Big(k) => k,
+                _ => unreachable!("not a Big"),
+            }
+        }
+
+        fn big(&mut self, b: &Big, env: &HashMap<String, Val>) -> usize {
+            match b {
+                Big::New(k) => self.alloc(Cell::Big(*k)),
+                Big::Var(v) => match env[v] {
+                    Val::Big(c) => c,
+                    Val::Wrap(_) => unreachable!("{v} is a Wrap"),
+                },
+                Big::Join(a, b) => {
+                    let (a, b) = (self.big(a, env), self.big(b, env));
+                    let k = self.k(a) + self.k(b);
+                    self.alloc(Cell::Big(k))
+                }
+                Big::Match(m) => self.matches(m, env),
+                Big::Block { inner, with, .. } => {
+                    let t = self.matches(inner, env);
+                    let w = self.big(with, env);
+                    let k = self.k(t) + self.k(w);
+                    self.alloc(Cell::Big(k))
+                }
+            }
+        }
+
+        fn wrap(&mut self, w: &Wrap, env: &HashMap<String, Val>) -> Option<usize> {
+            match w {
+                Wrap::Var(v) => match env[v] {
+                    Val::Wrap(c) => c,
+                    Val::Big(_) => unreachable!("{v} is a Big"),
+                },
+                Wrap::One(b) => {
+                    let b = self.big(b, env);
+                    Some(self.alloc(Cell::One(b)))
+                }
+                Wrap::Two(a, b) => {
+                    let (a, b) = (self.big(a, env), self.big(b, env));
+                    Some(self.alloc(Cell::Two(a, b)))
+                }
+                Wrap::Zero => None,
+            }
+        }
+
+        fn matches(&mut self, m: &Match, env: &HashMap<String, Val>) -> usize {
+            let scrut = self.wrap(&m.scrut, env);
+            let fields: Vec<usize> = match scrut.map(|c| &self.cells[c]) {
+                Some(Cell::One(x)) => vec![*x],
+                Some(Cell::Two(x, y)) => vec![*x, *y],
+                Some(Cell::Big(_)) => unreachable!("a Big scrutinee"),
+                None => vec![],
+            };
+            for arm in &m.arms {
+                let names = match &arm.pat {
+                    Pat::One(x) if fields.len() == 1 => vec![x],
+                    Pat::Two(x, y) if fields.len() == 2 => vec![x, y],
+                    Pat::Zero if fields.is_empty() => vec![],
+                    _ => continue,
+                };
+                if let Some(n) = arm.guard
+                    && self.k(fields[0]) <= n
+                {
+                    continue;
+                }
+                let mut env = env.clone();
+                for (name, &cell) in names.iter().zip(&fields) {
+                    if let Some(name) = name {
+                        env.insert(name.clone(), Val::Big(cell));
+                    }
+                }
+                return self.big(&arm.body, &env);
+            }
+            unreachable!("the arms are exhaustive")
+        }
+
+        /// Cells reachable from `roots`.
+        fn reachable(&self, roots: impl Iterator<Item = Val>) -> usize {
+            let mut seen = BTreeSet::new();
+            let mut stack: Vec<usize> = roots
+                .filter_map(|v| match v {
+                    Val::Big(c) => Some(c),
+                    Val::Wrap(c) => c,
+                })
+                .collect();
+            while let Some(c) = stack.pop() {
+                if seen.insert(c) {
+                    match self.cells[c] {
+                        Cell::Big(_) => {}
+                        Cell::One(x) => stack.push(x),
+                        Cell::Two(x, y) => stack.extend([x, y]),
+                    }
+                }
+            }
+            seen.len()
+        }
+    }
+
+    /// One program and what it must print.
+    fn program(seed: u64) -> (String, String) {
+        let mut g = Gen {
+            rng: Rng(seed | 1),
+            fresh: 0,
+        };
+        let mut scope: Vec<(String, Ty)> = Vec::new();
+        let mut stmts: Vec<(String, Rhs)> = Vec::new();
+        for _ in 0..3 + g.rng.below(5) {
+            let rhs = match g.rng.below(6) {
+                0 => Rhs::Wrap(g.wrap(&scope)),
+                1 => Rhs::Big(g.big(&scope, 0)),
+                _ => Rhs::Big(Big::Match(Box::new(g.matches(&scope, 2)))),
+            };
+            let (v, ty) = match rhs {
+                Rhs::Big(_) => (g.name("v"), Ty::Big),
+                Rhs::Wrap(_) => (g.name("w"), Ty::Wrap),
+            };
+            scope.push((v.clone(), ty));
+            stmts.push((v, rhs));
+        }
+        let reads: Vec<BTreeSet<String>> = stmts
+            .iter()
+            .map(|(_, rhs)| {
+                let mut r = BTreeSet::new();
+                match rhs {
+                    Rhs::Big(b) => big_reads(b, &mut r),
+                    Rhs::Wrap(w) => wrap_reads(w, &mut r),
+                }
+                r
+            })
+            .collect();
+        // Every variable is read at least once, or the program does not
+        // compile: what no statement reads, the last line does.
+        let read_somewhere: BTreeSet<&String> = reads.iter().flatten().collect();
+        let last: Vec<&(String, Ty)> = scope
+            .iter()
+            .filter(|(v, _)| !read_somewhere.contains(v))
+            .collect();
+
+        let mut src = format!("{HEADER}pub fn main() {{\n\tbase = internal.cells_live()\n");
+        let mut want = String::new();
+        let mut oracle = Oracle::default();
+        let mut env: HashMap<String, Val> = HashMap::new();
+        for (i, (v, rhs)) in stmts.iter().enumerate() {
+            let (text, val) = match rhs {
+                Rhs::Big(b) => (big_src(b, 1), Val::Big(oracle.big(b, &env))),
+                Rhs::Wrap(w) => (wrap_src(w, 1), Val::Wrap(oracle.wrap(w, &env))),
+            };
+            src.push_str(&format!(
+                "\t{v} = {text}\n\tprintln(internal.cells_live() - base)\n"
+            ));
+            env.insert(v.clone(), val);
+            let live = env.iter().filter(|(name, _)| {
+                reads[i + 1..].iter().any(|r| r.contains(*name))
+                    || last.iter().any(|(l, _)| l == *name)
+            });
+            want.push_str(&format!("{}\n", oracle.reachable(live.map(|(_, v)| *v))));
+        }
+        let mut total = 0;
+        let mut terms = Vec::new();
+        for (v, ty) in &last {
+            match (ty, env[v]) {
+                (Ty::Big, Val::Big(c)) => {
+                    terms.push(format!("k_of({v})"));
+                    total += oracle.k(c);
+                }
+                (Ty::Wrap, Val::Wrap(c)) => {
+                    terms.push(format!("w_of({v})"));
+                    total += match c.map(|c| &oracle.cells[c]) {
+                        Some(Cell::One(x)) => oracle.k(*x),
+                        Some(Cell::Two(x, y)) => oracle.k(*x) + oracle.k(*y),
+                        _ => 0,
+                    };
+                }
+                _ => unreachable!("a variable of the wrong type"),
+            }
+        }
+        terms.push("0".into());
+        src.push_str(&format!(
+            "\tprintln({})\n\tprintln(internal.cells_live() - base)\n}}\n",
+            terms.join(" + ")
+        ));
+        want.push_str(&format!("{total}\n0\n"));
+        (src, want)
+    }
+
+    #[test]
+    fn the_cells_held_after_each_statement_are_the_ones_still_read() {
+        const SEED: u64 = 0x5eed_f00d;
+        for i in 0..300 {
+            let (src, want) = program(SEED.wrapping_add(i).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+            assert_eq!(
+                super::run(&src).as_deref(),
+                Ok(want.as_str()),
+                "program #{i}:\n{src}"
+            );
+        }
+    }
+}

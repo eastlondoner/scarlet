@@ -380,11 +380,10 @@ core_golden!(
      }\n"
 );
 
-// Perceus inserts no drops inside a join body, so `t` is held to the end of
-// `f`'s frame. Sound, but it forfeits a `Reuse` token. This snapshot pins the
-// gap; sinking drops into joins should change it.
+// Perceus drops inside a join body as anywhere else: `t` drops after its last
+// read, in the branch, rather than being held to the end of `f`'s frame.
 core_golden!(
-    join_body_defers_drop,
+    join_body_drops_at_last_use,
     "type L {\n\tCons(h Int, t L)\n\tLNil\n}\n\
      fn g(l L) Int {\n\
      \tmatch l {\n\
@@ -480,6 +479,70 @@ core_golden!(
      }\n\
      pub fn main() {\n\
      \tsmall(3)\n\
+     }\n"
+);
+
+// A match whose value is bound, not returned, is a join. Each arm drops the
+// scrutinee and what it bound once it is done with them, and the value an arm
+// gives reads `b` for the last time, so the call's result is bound first and
+// `b` dropped after it: nothing is left for the end of `f`'s frame.
+core_golden!(
+    used_match_drops_in_each_arm,
+    "type Big { Big(a Int, b Int) }\n\
+     fn make(n Int) Option(Big) {\n\
+     \tif n > 0 then Some(Big(n, n)) else None\n\
+     }\n\
+     fn use(b Big) Int {\n\
+     \tmatch b {\n\
+     \t\tBig(a, _) -> a\n\
+     \t}\n\
+     }\n\
+     fn f(n Int) Int {\n\
+     \tr = match make(n) {\n\
+     \t\tSome(b) -> use(b)\n\
+     \t\tNone -> 0\n\
+     \t}\n\
+     \tr + more(n)\n\
+     }\n\
+     fn more(n Int) Int {\n\
+     \tn * 2\n\
+     }\n\
+     pub fn main() {\n\
+     \tf(1)\n\
+     }\n"
+);
+
+// An arm's value that is a local the arm bound is handed to the join's result
+// with `move`, so neither the arm nor the frame still holds it; one read from
+// outside the join, and read again after it, is shared.
+core_golden!(
+    used_match_moves_what_it_gives,
+    "type Big { Big(a Int, b Int) }\n\
+     fn pick(o Option(Big), d Big) Int {\n\
+     \tr = match o {\n\
+     \t\tSome(b) -> b\n\
+     \t\tNone -> d\n\
+     \t}\n\
+     \tmatch (r, d) {\n\
+     \t\t(Big(a, _), Big(c, _)) -> a + c\n\
+     \t}\n\
+     }\n\
+     pub fn main() {\n\
+     \tpick(None, Big(1, 2))\n\
+     }\n"
+);
+
+// A type variable and a String may each be a cell, so both drop at their last
+// use: `x` after the call that last reads it, which the VM makes a move.
+core_golden!(
+    generic_and_string_drop_at_last_use,
+    "fn apply(x a, f fn(a) String) Int {\n\
+     \ts = f(x)\n\
+     \tn = s == 'a'\n\
+     \tif n then 1 else 0\n\
+     }\n\
+     pub fn main() {\n\
+     \tapply(1, fn(i) { '${i}' })\n\
      }\n"
 );
 

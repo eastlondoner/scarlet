@@ -250,8 +250,8 @@ mod tests {
         assert_eq!(pool.node(rb), ResolvedNode::Bound(1));
         // Stable on re-zonk: the index is memoised per variable.
         assert_eq!(z.zonk_or_opaque(&mut pool, a).0, ra);
-        // A rigid var is polymorphic, not missing: no heap cell is assumed.
-        assert!(!pool.is_heap(ra));
+        // A rigid var is polymorphic, not missing: it may be a heap cell.
+        assert!(pool.is_heap(ra));
         assert!(is_bound(pool.node(ra)));
     }
 

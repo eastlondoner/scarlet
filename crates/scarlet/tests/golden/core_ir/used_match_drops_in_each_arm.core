@@ -1,0 +1,51 @@
+fn main.make(%0:t0) -> :t1
+  let %1:t2 = c0
+  let %2:t3 = IntGt(%0, %1)
+  if %2 :t1
+    let %3:t4 = ctor 512.0(%0, %0)
+    ret ctor 263.0(%3)
+  else
+    ret ctor 263.1()
+
+fn main.use(%0:t1) -> :t5
+  match %0 :t5
+    | 512.0(%1, %2) ->
+      drop %0 [ctor:2]
+      ret %1
+
+fn main.more(%0:t5) -> :t5
+  let %1:t2 = c1
+  ret IntMul(%0, %1)
+
+fn main.f(%0:t1) -> :t5
+  letj %3:t5 =
+    let %1:t6 = call fn#0(%0)
+    match %1 :t5
+      | 263.0(%2) ->
+        drop %1 [ctor:1]
+        let %6:t5 = call fn#1(%2)
+        drop %2
+        ret %6
+      | 263.1() ->
+        drop %1 [ctor:0]
+        ret c0
+  let %4:t5 = %3
+  let %5:t7 = call fn#2(%0)
+  ret IntAdd(%4, %5)
+
+fn main.main() -> :t5
+  let %0:t2 = c2
+  ret call fn#3(%0)
+
+toplevel:
+fn main.__main__() -> :t8
+  let %0:t6@g0 = closure fn#0()
+  let %1:t9@g1 = closure fn#1()
+  let %2:t4@g2 = closure fn#2()
+  let %3:t10@g3 = closure fn#3()
+  let %4:t11@g4 = closure fn#4()
+  ret nil
+where
+  c0 = Int(0)
+  c1 = Int(2)
+  c2 = Int(1)
