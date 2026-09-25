@@ -25,7 +25,7 @@ pub mod stop;
 pub fn host(argv: Vec<String>) -> scarlet_vm::Host {
     let host = scarlet_vm::Host::of_this_process(argv);
     match scarlet_metal::platform() {
-        Some(platform) => host.with_platform(platform),
+        Some(gpu) => host.with_gpu(gpu),
         None => host,
     }
 }

@@ -97,7 +97,7 @@ pub(crate) fn fill<E>(
     write: impl FnOnce(&mut [u8]) -> Result<(), E>,
 ) -> Result<Result<Cell, E>, Full> {
     let n = usize::try_from(len.div_ceil(8)).map_err(|_| Full)?;
-    let cell = heap.make_uninit(Kind::Binary, 1 + n.div_ceil(8))?;
+    let cell = heap.binary_uninit(1 + n.div_ceil(8))?;
     let data = heap.data_mut(cell);
     let [head, words @ ..] = data else {
         heap.release(cell);

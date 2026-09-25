@@ -1,5 +1,6 @@
-//! `scarlet/metal`'s platform: `scarlet_vm`'s [`Platform`] over Apple's
-//! Metal (`docs/metal-design.md`).
+//! `scarlet/metal`'s platform: `scarlet_vm`'s
+//! [`scarlet_vm::platform::Platform`] over Apple's Metal
+//! (`docs/metal-design.md`).
 //!
 //! This is the one crate in the workspace allowed `unsafe`. Each `unsafe`
 //! block holds one operation and says why it is sound. Two lines of defence
@@ -32,21 +33,21 @@
 
 use std::sync::Arc;
 
-use scarlet_vm::platform::Platform;
+use scarlet_vm::platform::Gpu;
 
 #[cfg(target_os = "macos")]
 mod metal;
 #[cfg(test)]
 mod suite;
 
-/// This machine's GPU, for a [`scarlet_vm::Host`]: Metal on macOS, and
+/// This machine's GPU, for a [`scarlet_vm::Host`] and every run on it: Metal on macOS, and
 /// `None` anywhere else, where `metal.device` is `Err(Unsupported)`. Making
 /// one asks Metal nothing, so a program that never calls `metal.device`
 /// never loads Metal.
-pub fn platform() -> Option<Arc<dyn Platform>> {
+pub fn platform() -> Option<Arc<Gpu>> {
     #[cfg(target_os = "macos")]
     {
-        Some(Arc::new(metal::Metal::new()))
+        Some(Arc::new(Gpu::new(metal::Metal::new())))
     }
     #[cfg(not(target_os = "macos"))]
     {

@@ -265,11 +265,13 @@ impl Heap {
     /// argument as the last reference only because its caller gave up its own
     /// first.
     ///
-    /// A handle is never kept: no constructor can take its cell, and keeping
-    /// it would keep what the platform holds for it past its last use.
+    /// Only a constructor cell is kept, since only a constructor can take
+    /// one ([`Self::fits_ctor`]). Any other is left to `release`, which frees
+    /// it now: a handle kept here would keep what the platform holds for it
+    /// past its last use.
     pub(crate) fn hollow(&mut self, cell: Cell) -> bool {
         let h = self.word(cell, 0);
-        if count(h) != 1 || kind_bits(h) == Kind::Handle as u64 {
+        if count(h) != 1 || kind_bits(h) != Kind::Ctor as u64 {
             return false;
         }
         for i in held(kind_bits(h), size(h)) {
@@ -474,11 +476,12 @@ impl Heap {
         }
     }
 
-    /// A new cell of `kind` with `words` words after its header, for the
-    /// caller to fill through [`Self::data_mut`]. What they hold before then
-    /// is whatever the cell last held.
-    pub(crate) fn make_uninit(&mut self, kind: Kind, words: usize) -> Result<Cell, Full> {
-        self.alloc(kind, words)
+    /// A new binary cell with `words` words after its header, for
+    /// [`crate::binary::fill`] to fill through [`Self::data_mut`]. What they
+    /// hold before then is whatever the cell last held, which a binary reads
+    /// only as bits and a release never follows.
+    pub(crate) fn binary_uninit(&mut self, words: usize) -> Result<Cell, Full> {
+        self.alloc(Kind::Binary, words)
     }
 
     /// The words of `cell` after its header, to write. Empty for a cell the
@@ -765,6 +768,33 @@ mod tests {
         assert_eq!(heap.variant(cell), v);
         let fields: Vec<_> = heap.fields(cell).map(Value::view).collect();
         assert_eq!(fields, [one.view(), Value::NIL.view()]);
+    }
+
+    /// Only a constructor cell is kept for reuse. A handle's is freed at its
+    /// drop, and its handle handed on for the platform to release, as is any
+    /// other cell no constructor could take.
+    #[test]
+    fn only_a_constructor_cell_is_hollowed() {
+        let mut heap = Heap::default();
+        let v = VariantRef {
+            type_id: TypeId(1),
+            variant_idx: 0,
+        };
+        let ctor = heap.ctor(v, &[Value::NIL]).expect("room");
+        assert!(heap.hollow(ctor));
+        heap.release(ctor);
+        let id = Id::new(NonZeroU64::MIN);
+        let handle = heap.handle(Handle::Buffer(id)).expect("room");
+        let tuple = heap.tuple(&[Value::NIL]).expect("room");
+        for cell in [handle, tuple] {
+            assert!(!heap.hollow(cell), "{:?}", heap.kind(cell));
+            heap.release(cell);
+        }
+        assert_eq!(
+            heap.freed_handles().collect::<Vec<_>>(),
+            [Handle::Buffer(id)]
+        );
+        assert_eq!(heap.live(), 0);
     }
 
     /// A chain of cells, each holding the next, is freed by one release, and

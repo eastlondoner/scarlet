@@ -29,6 +29,7 @@ pub struct Fake {
 #[cfg_attr(not(test), allow(dead_code))]
 enum Answer {
     Meet,
+    Unsupported,
     NoDevice,
     OutOfMemory,
 }
@@ -60,6 +61,13 @@ impl Fake {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn with_max_buffer_bytes(mut self, n: u64) -> Fake {
         self.max_buffer_bytes = n;
+        self
+    }
+
+    /// A fake with no GPU API to open, like a Mac whose Metal will not load.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn without_gpu_api(mut self) -> Fake {
+        self.answer = Answer::Unsupported;
         self
     }
 
@@ -105,6 +113,7 @@ impl Platform for Fake {
     fn device(&self, device: Id<Device>) -> Result<DeviceInfo, DeviceError> {
         match self.answer {
             Answer::Meet | Answer::OutOfMemory => {}
+            Answer::Unsupported => return Err(DeviceError::Unsupported),
             Answer::NoDevice => return Err(DeviceError::NoDevice),
         }
         let mut state = self.state();
@@ -123,7 +132,7 @@ impl Platform for Fake {
             return Err(BufferError::Fault(Fault::new(wrong)));
         }
         match self.answer {
-            Answer::Meet | Answer::NoDevice => {}
+            Answer::Meet | Answer::Unsupported | Answer::NoDevice => {}
             Answer::OutOfMemory => return Err(BufferError::OutOfMemory),
         }
         if state.taken(Handle::Buffer(buffer)) {
@@ -136,18 +145,16 @@ impl Platform for Fake {
     fn read(&self, to: ReadInto<'_>) -> Result<(), Fault> {
         let mut state = self.state();
         let id = to.buffer();
-        let into = to.into_slice();
-        match state.buffers.get(&id) {
-            Some(bytes) if bytes.len() == into.len() => {
-                into.copy_from_slice(bytes);
-                Ok(())
-            }
-            Some(_) | None => {
-                let wrong = format!("a read of {id:?} into {} bytes", into.len());
-                state.wrong.push(wrong.clone());
-                Err(Fault::new(wrong))
-            }
+        let read = match state.buffers.get(&id) {
+            Some(bytes) => to.copy_from(bytes),
+            None => Err(Fault::new(format!(
+                "a read of {id:?}, which it does not hold"
+            ))),
+        };
+        if let Err(wrong) = &read {
+            state.wrong.push(wrong.to_string());
         }
+        read
     }
 
     fn release(&self, handle: Handle) {

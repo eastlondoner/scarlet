@@ -11,8 +11,9 @@ fn example() -> PathBuf {
 }
 
 /// `scarlet run examples/metal.scrl` with `env` set: its stdout, after
-/// checking it exited cleanly with nothing to say on stderr but `allowed`.
-fn run(env: &[(&str, &str)], allowed: &str) -> String {
+/// checking it exited cleanly, saying on stderr exactly the lines that each
+/// contain one of `said`, in order.
+fn run(env: &[(&str, &str)], said: &[&str]) -> String {
     let out = Command::new(env!("CARGO_BIN_EXE_scarlet"))
         .arg("run")
         .arg(example())
@@ -21,11 +22,14 @@ fn run(env: &[(&str, &str)], allowed: &str) -> String {
         .expect("scarlet runs");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{:?}\n{stderr}", out.status);
-    let unexpected: Vec<&str> = stderr
-        .lines()
-        .filter(|l| allowed.is_empty() || !l.contains(allowed))
-        .collect();
-    assert!(unexpected.is_empty(), "stderr: {stderr}");
+    let lines: Vec<&str> = stderr.lines().collect();
+    assert_eq!(lines.len(), said.len(), "stderr: {stderr}");
+    for (line, want) in lines.iter().zip(said) {
+        assert!(
+            line.contains(want),
+            "{line:?} does not say {want:?}: {stderr}"
+        );
+    }
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
@@ -43,11 +47,12 @@ fn assert_round_trip(stdout: &str) {
 #[cfg(target_os = "macos")]
 #[test]
 fn bytes_go_through_metal_and_back() {
-    assert_round_trip(&run(&[], ""));
+    assert_round_trip(&run(&[], &[]));
 }
 
 /// The same run under Metal's validation layer in assert mode, where a
-/// request Metal would refuse stops the whole process.
+/// request Metal would refuse stops the whole process. The layer says it is
+/// on, so a run where it did not come on fails here.
 #[cfg(target_os = "macos")]
 #[test]
 fn the_round_trip_passes_the_validation_layer() {
@@ -55,7 +60,7 @@ fn the_round_trip_passes_the_validation_layer() {
         ("MTL_DEBUG_LAYER", "1"),
         ("MTL_DEBUG_LAYER_ERROR_MODE", "assert"),
     ];
-    assert_round_trip(&run(&env, "Metal API Validation Enabled"));
+    assert_round_trip(&run(&env, &["Metal API Validation Enabled"]));
 }
 
 /// The binary does not load Metal, or the Foundation it brings, when it
@@ -81,5 +86,5 @@ fn the_binary_does_not_load_metal_at_launch() {
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn off_macos_metal_is_unsupported() {
-    assert_eq!(run(&[], ""), "Err(Unsupported)\n");
+    assert_eq!(run(&[], &[]), "Err(Unsupported)\n");
 }

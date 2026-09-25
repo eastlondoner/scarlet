@@ -54,6 +54,9 @@ pub enum Stop {
     /// The program's heap grew past what the VM can address. A limit of the
     /// machine, like running out of memory, not a bug in the program.
     HeapFull,
+    /// The GPU has given out every id it can name an object by, 2^64 - 1 of
+    /// them across every run on it. A limit of the machine, like `HeapFull`.
+    OutOfIds,
     /// The program broke a promise the compiler makes about every program,
     /// like a `match` having an arm for every value. Only a compiler bug
     /// gives one, so this says what, rather than guessing on.

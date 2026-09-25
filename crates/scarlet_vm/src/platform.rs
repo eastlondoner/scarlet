@@ -6,15 +6,19 @@
 //! one in with the [`crate::Host`]; a host without one has no GPU, and
 //! `metal.device` answers `Err(Unsupported)`.
 //!
-//! The VM names every object before the platform makes it, with an [`Id`]
-//! from a counter of its run that never repeats, and the platform keeps the
-//! object under that id. A platform cannot make an id up, so every id it is
-//! handed is one the VM gave it, of the kind the method's type says.
+//! A platform is installed as a [`Gpu`], which pairs it with the one counter
+//! its ids come from. The VM names every object before the platform makes it,
+//! with an [`Id`] from that counter, and the platform keeps the object under
+//! that id. Every run on the platform, in turn or at once, takes its ids from
+//! the same counter, so none is given twice while the platform lives. A
+//! platform cannot make an id up, so every id it is handed is one the VM gave
+//! it, of the kind the method's type says.
 //!
 //! What a platform is handed has been checked by the VM, and its type says
 //! so: [`BufferBytes`] is at least one byte and fits its device, and
-//! [`ReadInto`] has room for exactly the buffer it names. A platform does
-//! not check them again, and every platform answers a program the same.
+//! [`ReadInto`] takes exactly as many bytes as the buffer it names holds. A
+//! platform does not check them again, and every platform answers a program
+//! the same.
 
 #![deny(clippy::wildcard_enum_match_arm)]
 
@@ -22,10 +26,12 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::num::NonZeroU64;
+use std::ops::Deref;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-/// An object a platform holds for a run, of kind `T`, like `Id<Buffer>`.
-/// The kind is only in the type, so a device's id cannot be passed where a
-/// buffer's goes. It is the object's identity for good, never its address,
+/// An object a platform holds, of kind `T`, like `Id<Buffer>`. The kind is
+/// only in the type, so a device's id cannot be passed where a buffer's goes.
+/// It is the object's identity on its platform for good, never its address,
 /// which a later object can come back at.
 pub struct Id<T> {
     raw: NonZeroU64,
@@ -123,22 +129,36 @@ pub(crate) enum Unfit {
     TooLarge(u64),
 }
 
-impl<'a> BufferBytes<'a> {
-    /// `bytes`, checked against `device`, which the VM holds as `info`.
-    pub(crate) fn check(
-        device: Id<Device>,
-        info: &DeviceInfo,
-        bytes: &'a [u8],
-    ) -> Result<BufferBytes<'a>, Unfit> {
-        if bytes.is_empty() {
+/// A length a buffer on `device` can hold, checked before the bytes are
+/// found, so that a request refused costs nothing.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Fits {
+    device: Id<Device>,
+    len: usize,
+}
+
+impl Fits {
+    /// `len` bytes on `device`, which the VM holds as `info`.
+    pub(crate) fn check(device: Id<Device>, info: &DeviceInfo, len: u64) -> Result<Fits, Unfit> {
+        if len == 0 {
             return Err(Unfit::Empty);
         }
-        match u64::try_from(bytes.len()) {
-            Ok(n) if n <= info.max_buffer_bytes => Ok(BufferBytes { device, bytes }),
+        match usize::try_from(len) {
+            Ok(n) if len <= info.max_buffer_bytes => Ok(Fits { device, len: n }),
             Ok(_) | Err(_) => Err(Unfit::TooLarge(info.max_buffer_bytes)),
         }
     }
 
+    /// `bytes`, as many as were checked, or `None` for another length.
+    pub(crate) fn bytes(self, bytes: &[u8]) -> Option<BufferBytes<'_>> {
+        (bytes.len() == self.len).then_some(BufferBytes {
+            device: self.device,
+            bytes,
+        })
+    }
+}
+
+impl<'a> BufferBytes<'a> {
     /// The device the bytes fit.
     pub fn device(&self) -> Id<Device> {
         self.device
@@ -151,7 +171,9 @@ impl<'a> BufferBytes<'a> {
 }
 
 /// Room for all of a buffer's bytes: exactly as many as it holds. Only the
-/// VM makes one, from the length it recorded when the buffer was made.
+/// VM makes one, from the length it recorded when the buffer was made, and
+/// the only way to fill it is whole, so a platform cannot leave part of it
+/// holding whatever the memory held before.
 #[derive(Debug)]
 pub struct ReadInto<'a> {
     buffer: Id<Buffer>,
@@ -170,9 +192,19 @@ impl<'a> ReadInto<'a> {
         self.buffer
     }
 
-    /// Where its bytes go, as many as it holds.
-    pub fn into_slice(self) -> &'a mut [u8] {
-        self.into
+    /// Fill the room with `bytes`, the buffer's. Bytes of any other length
+    /// are refused, and nothing is copied.
+    pub fn copy_from(self, bytes: &[u8]) -> Result<(), Fault> {
+        if bytes.len() != self.into.len() {
+            return Err(Fault::new(format!(
+                "{:?} read as {} bytes, where it holds {}",
+                self.buffer,
+                bytes.len(),
+                self.into.len()
+            )));
+        }
+        self.into.copy_from_slice(bytes);
+        Ok(())
     }
 }
 
@@ -229,4 +261,84 @@ pub trait Platform: Send + Sync {
     /// handle it made, when the last value naming it goes or the run ends,
     /// and never names it again. Like `Drop`, it cannot fail.
     fn release(&self, handle: Handle);
+}
+
+/// A platform, installed: `platform`, with the counter every id of an object
+/// it holds comes from. The counter goes with the platform, not with a run,
+/// so however many runs share it, in turn or at once, no id is given twice,
+/// released or not: an id is the identity of one object on this platform.
+pub struct Gpu<P: ?Sized = dyn Platform> {
+    /// The last id given out. Ids count up from 1, one counter for every
+    /// kind.
+    last: AtomicU64,
+    platform: P,
+}
+
+/// Every id a [`Gpu`] can give out has been given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OutOfIds;
+
+impl<P: Platform> Gpu<P> {
+    pub fn new(platform: P) -> Gpu<P> {
+        Gpu {
+            last: AtomicU64::new(0),
+            platform,
+        }
+    }
+
+    /// A platform whose last id given out was `last`, for a test of what
+    /// happens when they run out.
+    #[cfg(test)]
+    pub(crate) fn after(platform: P, last: u64) -> Gpu<P> {
+        Gpu {
+            last: AtomicU64::new(last),
+            platform,
+        }
+    }
+}
+
+impl<P: ?Sized + Platform> Gpu<P> {
+    /// A new id, never given out before by this platform.
+    pub(crate) fn next<T>(&self) -> Result<Id<T>, OutOfIds> {
+        // Relaxed: the counter orders nothing but itself, and a read-modify-
+        // write never gives two callers one value.
+        let last = self
+            .last
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .map_err(|_| OutOfIds)?;
+        let raw = last
+            .checked_add(1)
+            .and_then(NonZeroU64::new)
+            .ok_or(OutOfIds)?;
+        Ok(Id::new(raw))
+    }
+}
+
+impl<P: ?Sized> Deref for Gpu<P> {
+    type Target = P;
+
+    fn deref(&self) -> &P {
+        &self.platform
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Room for a read is filled whole or not at all: bytes of another
+    /// length are refused, and leave the room as it was.
+    #[test]
+    fn a_read_of_another_length_is_refused() {
+        let id = Id::new(NonZeroU64::MIN);
+        let mut room = [0xEE; 4];
+        for bytes in [&[1, 2][..], &[1, 2, 3, 4, 5]] {
+            let to = ReadInto::check(id, 4, &mut room).expect("room for 4");
+            assert!(to.copy_from(bytes).is_err(), "{bytes:?}");
+            assert_eq!(room, [0xEE; 4]);
+        }
+        let to = ReadInto::check(id, 4, &mut room).expect("room for 4");
+        assert_eq!(to.copy_from(&[1, 2, 3, 4]), Ok(()));
+        assert_eq!(room, [1, 2, 3, 4]);
+    }
 }

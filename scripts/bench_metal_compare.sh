@@ -32,6 +32,9 @@ fi
 [[ -f "$BASELINE" ]] || { echo "bench_metal_compare: no baseline for this machine at $BASELINE" >&2; exit 2; }
 
 printf '%-12s %10s %12s %12s %9s\n' op bytes before_ns after_ns delta
+# awk exits with 1 when a timing is worse, 2 when a baseline line is missing
+# from the results, and 3 for both.
+rc=0
 awk -v limit=10 '
   NR == FNR { was[$1 " " $2] = $3; next }
   {
@@ -43,11 +46,17 @@ awk -v limit=10 '
     if (pct > limit) worse = 1
   }
   END {
-    for (key in was) if (!(key in seen)) { print "missing from the results: " key; worse = 1 }
-    exit worse
+    for (key in was) if (!(key in seen)) { print "missing from the results: " key; missing = 2 }
+    exit worse + missing
   }
-' "$BASELINE" "$RESULTS" || {
-  echo
-  echo "bench_metal_compare: slower than $BASELINE by more than 10%" >&2
-  exit 1
-}
+' "$BASELINE" "$RESULTS" || rc=$?
+
+case $rc in
+  0) ;;
+  1) echo; echo "bench_metal_compare: slower than $BASELINE by more than 10%" >&2 ;;
+  2) echo; echo "bench_metal_compare: $RESULTS lacks a timing $BASELINE has" >&2 ;;
+  3) echo; echo "bench_metal_compare: slower than $BASELINE by more than 10%, and lacking a timing it has" >&2 ;;
+  *) echo "bench_metal_compare: awk failed ($rc)" >&2 ;;
+esac
+# 2 is kept for a missing file, above.
+[[ $rc -eq 0 ]] || exit 1

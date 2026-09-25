@@ -33,7 +33,7 @@ reason = "read by an implementation of Platform, which ships only on macOS"
 [[override]]
 lint = "hawk::unnecessary_public"
 crate = "scarlet_vm"
-item = "platform::ReadInto::<'a>::into_slice"
+item = "platform::ReadInto::<'a>::copy_from"
 level = "expect"
 target = "cfg(not(target_os = \"macos\"))"
 reason = "read by an implementation of Platform, which ships only on macOS"

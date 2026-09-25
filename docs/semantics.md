@@ -87,7 +87,14 @@ The old compiler accepted any spread whose base had the same type, and the old V
 
 ## Handles and the GPU
 
-**Built: a handle equals only itself.** A `metal.Device` or a `metal.Buffer` names something the runtime holds outside the program, and only the runtime makes one. `==` and a map key compare which handle it is, never what it names, so two calls to `metal.device()` give two handles that are not `==`, even to one GPU. It prints as its type and a number, like `<metal.Buffer #2>`, counting up through the run and never reused. What it names is freed when the last value naming it goes, and every one is freed when the run ends, however it ends.
+**Built: a handle equals only itself.** A `metal.Device` or a `metal.Buffer` names something the runtime holds outside the program, and only the runtime makes one. `==` and a map key compare which handle it is, never what it names, so two calls to `metal.device()` give two handles that are not `==`, even to one GPU. It prints as its type and a number, like `<metal.Buffer #2>`, numbered by the GPU that made it, counting up and never reused, even across runs that share that GPU. What it names is freed when the last value naming it goes, and every one is freed when the run ends, however it ends.
+
+**Built, with two gaps: a handle goes where Perceus drops the last value naming it.** That is its last use, with two exceptions today, where the value is dropped only when the function holding it returns:
+
+- a value bound in a `match` that more work follows: the scrutinee and what its arm binds are held past the arm, to the end of the function (`match metal.buffer(d, bytes) { Ok(b) -> println(metal.read(b)) ... }` followed by more lines keeps the buffer until the function returns);
+- a handle passed through a generic parameter, like `fn keep(_x a)`: Perceus reads a value of a generic type as not on the heap, so the callee drops nothing at its last use, and the value goes when the callee returns.
+
+Both are how Perceus treats every heap value, not something of handles; a handle only makes them visible, as memory held outside the heap. A `match` in tail position, and a parameter whose type names a handle, go at the last use. Once the compiler drops in both places, a handle goes at its last use everywhere; `crates/scarlet_metal/src/suite.rs` holds a test of each shape, ignored until then.
 
 **Built: GPU misuse is a value.** Metal accepts some wrong requests in silence and, under its validation layer, stops the whole OS process on others. The runtime checks every request before Metal sees it, and one Metal would refuse is an `Err` of `metal.MetalError` naming what was wrong: an empty buffer, a binary that is not whole bytes, or a buffer past the device's largest, carrying that size. Off macOS, `metal.device()` is `Err(Unsupported)`. An Objective-C exception that gets past the checks is caught, and stops the run as a bug in the runtime rather than aborting the process (`docs/metal-design.md`, "The rule, applied to the GPU").
 

@@ -10,6 +10,14 @@
 //! `internal.live_handles()` is 0 once its work is done. So every test checks
 //! for leaks without asking.
 //!
+//! A handle is released where Perceus drops the last value naming it. Today
+//! that is its last use only where Perceus drops there: a value bound in a
+//! `match` that more work follows, and a handle passed through a generic
+//! parameter, are dropped when the function returns instead
+//! (`docs/semantics.md`, "Handles and the GPU"). The tests of those two
+//! shapes assert the last use, and are ignored, naming why, until the
+//! compiler drops there.
+//!
 //! On macOS the Metal half needs a GPU, and a Mac without one fails it,
 //! saying so. Off macOS the Metal half is skipped, and says so.
 
@@ -19,8 +27,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use scarlet_vm::fake::Fake;
 use scarlet_vm::platform::{
-    Buffer, BufferBytes, BufferError, Device, DeviceError, DeviceInfo, Fault, Handle, Id, Platform,
-    ReadInto,
+    Buffer, BufferBytes, BufferError, Device, DeviceError, DeviceInfo, Fault, Gpu, Handle, Id,
+    Platform, ReadInto,
 };
 use scarlet_vm::{Host, Stop};
 
@@ -191,7 +199,7 @@ impl<S: Platform> Platform for Ledger<S> {
 
 /// What a program prints goes into the ledger among the platform's events,
 /// so a test sees where each release falls among its lines.
-struct Printer<S>(Arc<Ledger<S>>);
+struct Printer<S>(Arc<Gpu<Ledger<S>>>);
 
 impl<S> Write for Printer<S> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -210,7 +218,8 @@ impl<S> Write for Printer<S> {
 
 struct Ran {
     events: Vec<String>,
-    stop: Result<(), Stop>,
+    /// How each run ended, in the order they were given.
+    stops: Vec<Result<(), Stop>>,
     calls: Calls,
     peak: usize,
 }
@@ -220,6 +229,12 @@ impl Ran {
     fn printed(&self) -> Vec<&str> {
         let lines = self.events.iter();
         lines.filter_map(|e| e.strip_prefix("print ")).collect()
+    }
+
+    /// How the one run ended.
+    fn stop(&self) -> &Result<(), Stop> {
+        assert_eq!(self.stops.len(), 1, "one run");
+        &self.stops[0]
     }
 }
 
@@ -232,20 +247,41 @@ fn compile(src: &str) -> scarlet_core::core_ir::Program {
     result.into_runnable().expect("a clean compile is runnable")
 }
 
+/// How [`run_on_one_host`] runs its programs.
+#[derive(Clone, Copy)]
+enum Runs {
+    InTurn,
+    AtOnce,
+}
+
 /// Run `src` on a fresh `S`, and check that the run left nothing behind: the
 /// VM released every handle it made, once, and the platform's table is
 /// empty.
 fn run<S: Subject>(src: &str) -> Ran {
-    let program = compile(src);
-    let ledger = Arc::new(Ledger {
+    run_on_one_host::<S>(&[src], Runs::InTurn)
+}
+
+/// Run each of `srcs` on one host, with one fresh `S`, and check what
+/// [`run`] checks once they are all done.
+fn run_on_one_host<S: Subject>(srcs: &[&str], runs: Runs) -> Ran {
+    let gpu = Arc::new(Gpu::new(Ledger {
         inner: S::make(),
         log: Mutex::default(),
-    });
-    let stop = {
-        let host = Host::new(Vec::new(), Vec::new()).with_platform(ledger.clone());
-        scarlet_vm::run(&program, &host, &mut Printer(ledger.clone()))
+    }));
+    let stops = {
+        let host = Host::new(Vec::new(), Vec::new()).with_gpu(gpu.clone());
+        // A `Program` stays on the thread that compiled it.
+        let one = |src: &str| scarlet_vm::run(&compile(src), &host, &mut Printer(gpu.clone()));
+        match runs {
+            Runs::InTurn => srcs.iter().map(|src| one(src)).collect(),
+            Runs::AtOnce => std::thread::scope(|scope| {
+                let running: Vec<_> = srcs.iter().map(|src| scope.spawn(|| one(src))).collect();
+                let joined = running.into_iter().map(|r| r.join().expect("a run"));
+                joined.collect::<Vec<_>>()
+            }),
+        }
     };
-    let log = ledger.log();
+    let log = gpu.log();
     let events = log.events.clone();
     assert!(
         !events
@@ -256,10 +292,10 @@ fn run<S: Subject>(src: &str) -> Ran {
     );
     assert_eq!(log.wrong, Vec::<String>::new(), "{events:#?}");
     assert!(log.live.is_empty(), "held after the run: {:?}", log.live);
-    assert_eq!(ledger.inner.held(), 0, "the platform's own table");
+    assert_eq!(gpu.inner.held(), 0, "the platform's own table");
     Ran {
         events,
-        stop,
+        stops,
         calls: log.calls,
         peak: log.peak,
     }
@@ -291,7 +327,7 @@ fn run_test<S: Subject>(defs: &str) -> Ran {
          \tprintln('live ${{internal.live_handles()}}')\n\
          }}\n"
     ));
-    assert_eq!(ran.stop, Ok(()), "{:#?}", ran.events);
+    assert_eq!(ran.stop(), &Ok(()), "{:#?}", ran.events);
     assert_eq!(ran.printed().last(), Some(&"live 0"), "{:#?}", ran.events);
     ran
 }
@@ -626,6 +662,47 @@ fn a_handle_inside_other_values_goes_with_the_last_of_them<S: Subject>() {
     );
 }
 
+/// A handle given up inside a cell Perceus keeps for reuse is freed by the
+/// heap, not at a `Drop` of its own, and is released before the platform is
+/// next asked for anything: what a program gave up is back before it asks
+/// for more.
+fn a_handle_given_up_is_released_before_the_next_is_made<S: Subject>() {
+    let ran = run_test::<S>(
+        "type Box {\n\
+         \tBox(buf metal.Buffer)\n\
+         }\n\
+         fn swap(d metal.Device, b metal.Buffer) Result(Box, metal.MetalError) {\n\
+         \t_old = Box(b)\n\
+         \tmatch metal.buffer(d, <<2>>) {\n\
+         \t\tOk(n) -> Ok(Box(n))\n\
+         \t\tErr(e) -> Err(e)\n\
+         \t}\n\
+         }\n\
+         fn test(d metal.Device) Nil {\n\
+         \tmatch metal.buffer(d, <<1>>) {\n\
+         \t\tOk(b) -> match swap(d, b) {\n\
+         \t\t\tOk(box) -> println(metal.byte_size(box.buf))\n\
+         \t\t\tErr(e) -> println(e)\n\
+         \t\t}\n\
+         \t\tErr(e) -> println(e)\n\
+         \t}\n\
+         }\n",
+    );
+    assert_eq!(
+        ran.events,
+        lines(&[
+            "made device #1",
+            "made buffer #2",
+            "released #2",
+            "made buffer #3",
+            "released #1",
+            "released #3",
+            "print 1",
+            "print live 0",
+        ])
+    );
+}
+
 /// A loop that makes a buffer each turn, and keeps it in a constructor whose
 /// cell Perceus reuses, holds one buffer at a time however long it runs: the
 /// one each turn gives up is released before the next is made.
@@ -686,7 +763,7 @@ fn a_run_that_stops_releases_what_it_held<S: Subject>() {
          \t}\n\
          }\n",
     );
-    assert_eq!(ran.stop, Err(Stop::HeapFull));
+    assert_eq!(ran.stop(), &Err(Stop::HeapFull));
     assert_eq!(
         ran.events,
         lines(&[
@@ -719,7 +796,7 @@ fn a_handle_in_a_global_is_released_when_the_run_ends<S: Subject>() {
          \tprintln(internal.live_handles())\n\
          }\n",
     );
-    assert_eq!(ran.stop, Ok(()));
+    assert_eq!(ran.stop(), &Ok(()));
     assert_eq!(
         ran.events,
         lines(&[
@@ -779,6 +856,113 @@ fn a_handle_equals_only_itself<S: Subject>() {
     );
 }
 
+/// Runs that share a host share its platform, and so its ids: two in turn
+/// never name two objects by one id, as the platform's table is keyed by it.
+fn runs_in_turn_on_one_host_share_its_ids<S: Subject>() {
+    let ran = run_on_one_host::<S>(&[MAKE_A_BUFFER, MAKE_A_BUFFER], Runs::InTurn);
+    assert_eq!(ran.stops, [Ok(()), Ok(())]);
+    assert_eq!(
+        ran.events,
+        lines(&[
+            "made device #1",
+            "made buffer #2",
+            "released #1",
+            "print Ok(<metal.Buffer #2>)",
+            "released #2",
+            "made device #3",
+            "made buffer #4",
+            "released #3",
+            "print Ok(<metal.Buffer #4>)",
+            "released #4",
+        ])
+    );
+}
+
+/// Two runs at once on one host take their ids from one counter, so each
+/// object has an id of its own, whichever run asks first.
+fn runs_at_once_on_one_host_share_its_ids<S: Subject>() {
+    let runs = [MAKE_A_BUFFER; 8];
+    let ran = run_on_one_host::<S>(&runs, Runs::AtOnce);
+    assert!(ran.stops.iter().all(Result::is_ok), "{:?}", ran.stops);
+    assert_eq!(ran.stops.len(), runs.len());
+    let n = runs.len() as u64;
+    assert_eq!(
+        ran.calls,
+        Calls {
+            device: n,
+            buffer: n,
+            read: 0,
+            release: 2 * n,
+            bytes_in: 2 * n,
+            bytes_out: 0,
+        }
+    );
+    let buffers: BTreeSet<&str> = ran.printed().into_iter().collect();
+    assert_eq!(buffers.len(), runs.len(), "{buffers:?}");
+}
+
+const MAKE_A_BUFFER: &str = "import scarlet/metal\n\
+     import scarlet/result\n\
+     pub fn main() {\n\
+     \tprintln(result.then(metal.device(), fn(d) { metal.buffer(d, <<1, 2>>) }))\n\
+     }\n";
+
+/// A buffer bound in a `match` that more work follows goes at its last use,
+/// inside the arm, as it does in a `match` in tail position.
+fn a_match_followed_by_more_work_releases_at_the_last_use<S: Subject>() {
+    let ran = run_test::<S>(
+        "fn test(d metal.Device) Nil {\n\
+         \tmatch metal.buffer(d, <<1, 2, 3>>) {\n\
+         \t\tOk(b) -> {\n\
+         \t\t\tprintln(metal.read(b))\n\
+         \t\t\tprintln('in the arm ${internal.live_handles()}')\n\
+         \t\t}\n\
+         \t\tErr(e) -> println(e)\n\
+         \t}\n\
+         \tprintln('after ${internal.live_handles()}')\n\
+         }\n",
+    );
+    assert_eq!(
+        ran.events,
+        lines(&[
+            "made device #1",
+            "made buffer #2",
+            "released #1",
+            "released #2",
+            "print Ok(<<1, 2, 3>>)",
+            "print in the arm 0",
+            "print after 0",
+            "print live 0",
+        ])
+    );
+}
+
+/// A handle passed to a function goes at its last use there, whether the
+/// parameter's type names it or is generic.
+fn a_handle_through_a_generic_parameter_goes_at_its_last_use<S: Subject>() {
+    let ran = run_test::<S>(
+        "fn concrete(_x metal.Buffer) Int {\n\
+         \tinternal.live_handles()\n\
+         }\n\
+         fn generic(_x a) Int {\n\
+         \tinternal.live_handles()\n\
+         }\n\
+         fn through(d metal.Device, is_generic Bool) Int {\n\
+         \tmatch metal.buffer(d, <<1>>) {\n\
+         \t\tOk(b) -> if is_generic { generic(b) } else { concrete(b) }\n\
+         \t\tErr(_) -> -1\n\
+         \t}\n\
+         }\n\
+         fn test(d metal.Device) Nil {\n\
+         \tprintln(through(d, False))\n\
+         \tprintln(through(d, True))\n\
+         \tprintln(string.length(metal.name(d)) > 0)\n\
+         }\n",
+    );
+    // Only the device is held inside either callee.
+    assert_eq!(ran.printed(), ["1", "1", "True", "live 0"]);
+}
+
 /// A small seeded generator (xorshift64*), so a failing program can be made
 /// again from its seed.
 struct Rng(u64);
@@ -817,7 +1001,10 @@ struct Step {
 /// `internal.live_handles()`; and, for each check, what it must print. A
 /// handle is live exactly while a value bound so far that holds it is used
 /// later, since Perceus drops each value at its last use.
-fn random_program(seed: u64) -> (String, BTreeMap<usize, usize>) {
+///
+/// With `matches`, it also takes a buffer apart in a `match` that more work
+/// follows, sometimes checking inside the arm, after its last use there.
+fn random_program(seed: u64, matches: bool) -> (String, BTreeMap<usize, usize>) {
     let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
     let mut bound: Vec<Bound> = Vec::new();
     let mut steps: Vec<Step> = Vec::new();
@@ -826,7 +1013,7 @@ fn random_program(seed: u64) -> (String, BTreeMap<usize, usize>) {
     for _ in 0..40 {
         let v = bound.len();
         let results: Vec<usize> = (0..v).filter(|&r| bound[r].result).collect();
-        match rng.below(10) {
+        match rng.below(if matches { 12 } else { 10 }) {
             0..=3 => {
                 steps.push(Step {
                     binds: Some(v),
@@ -886,6 +1073,28 @@ fn random_program(seed: u64) -> (String, BTreeMap<usize, usize>) {
                     ..Step::default()
                 });
             }
+            10 | 11 if !results.is_empty() => {
+                let r = results[rng.below(results.len())];
+                let size = "println(metal.byte_size(b))";
+                let (arm, check) = if rng.below(2) == 0 {
+                    (size.to_string(), None)
+                } else {
+                    let check = checks;
+                    checks += 1;
+                    let live = "${internal.live_handles()}";
+                    let arm =
+                        format!("{{\n\t\t\t{size}\n\t\t\tprintln('check {check} {live}')\n\t\t}}");
+                    (arm, Some(check))
+                };
+                steps.push(Step {
+                    text: format!(
+                        "match v{r} {{\n\t\tOk(b) -> {arm}\n\t\tErr(e) -> println(e)\n\t}}"
+                    ),
+                    uses: vec![r],
+                    check,
+                    ..Step::default()
+                });
+            }
             _ => {
                 steps.push(Step {
                     text: format!("println('check {checks} ${{internal.live_handles()}}')"),
@@ -896,6 +1105,8 @@ fn random_program(seed: u64) -> (String, BTreeMap<usize, usize>) {
             }
         }
     }
+    // A check inside a match's arm comes after the arm's last use of what it
+    // matched, so, like a check of its own, it sees only what later steps use.
     let mut want = BTreeMap::new();
     for (at, step) in steps.iter().enumerate() {
         let Some(check) = step.check else {
@@ -931,8 +1142,17 @@ fn random_program(seed: u64) -> (String, BTreeMap<usize, usize>) {
 /// what liveness says it must, and the harness finds every handle released
 /// once and nothing held at the end.
 fn random_lifetimes_release_each_handle_once_at_its_last_use<S: Subject>() {
+    random_lifetimes::<S>(false);
+}
+
+/// The same, with buffers taken apart in `match`es that more work follows.
+fn random_lifetimes_with_matches_release_each_handle_at_its_last_use<S: Subject>() {
+    random_lifetimes::<S>(true);
+}
+
+fn random_lifetimes<S: Subject>(matches: bool) {
     for seed in 1..=40 {
-        let (body, want) = random_program(seed);
+        let (body, want) = random_program(seed, matches);
         let ran = run_test::<S>(&body);
         let got: BTreeMap<usize, usize> = ran
             .printed()
@@ -960,15 +1180,36 @@ macro_rules! suite {
             a_captured_handle_lives_as_long_as_its_closure,
             a_handle_inside_other_values_goes_with_the_last_of_them,
             a_loop_reusing_cells_holds_one_buffer_at_a_time,
+            a_handle_given_up_is_released_before_the_next_is_made,
             a_run_that_stops_releases_what_it_held,
             a_handle_in_a_global_is_released_when_the_run_ends,
             a_handle_equals_only_itself,
             random_lifetimes_release_each_handle_once_at_its_last_use,
+            runs_in_turn_on_one_host_share_its_ids,
+            runs_at_once_on_one_host_share_its_ids,
+        );
+        suite!(@ignored $subject;
+            a_match_followed_by_more_work_releases_at_the_last_use = "Perceus drops what a match that more work follows binds only when the \
+                function returns; this passes once it drops it at its last use",
+            random_lifetimes_with_matches_release_each_handle_at_its_last_use = "Perceus drops what a match that more work follows binds only when the \
+                function returns; this passes once it drops it at its last use",
+            a_handle_through_a_generic_parameter_goes_at_its_last_use = "Perceus treats a \
+                value of a generic type as not on the heap, so drops none at its last use; \
+                this passes once it does",
         );
     };
     (@each $subject:ty; $($test:ident),* $(,)?) => {
         $(
             #[test]
+            fn $test() {
+                super::$test::<$subject>();
+            }
+        )*
+    };
+    (@ignored $subject:ty; $($test:ident = $why:literal),* $(,)?) => {
+        $(
+            #[test]
+            #[ignore = $why]
             fn $test() {
                 super::$test::<$subject>();
             }
@@ -1020,7 +1261,7 @@ mod on_metal {
                 .parse()
                 .ok()
         });
-        assert_eq!(passed, Some(13usize), "{stdout}");
+        assert_eq!(passed, Some(16usize), "{stdout}");
     }
 }
 

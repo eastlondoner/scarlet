@@ -10,6 +10,11 @@
 //! `-dead_strip_dylibs`, and nothing here names a Metal or Foundation symbol,
 //! so neither is loaded until [`create_device`] opens Metal. Every other call
 //! is an Objective-C message, which the runtime looks up when it is sent.
+//!
+//! Every method runs inside an autorelease pool of its own. Metal hands some
+//! objects back autoreleased, like a device's name, and `scarlet run`'s thread
+//! has no pool of its own to drain them: without one each would live until
+//! the process ends.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -18,7 +23,7 @@ use std::panic::AssertUnwindSafe;
 use std::ptr::NonNull;
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
-use objc2::rc::Retained;
+use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
 use scarlet_vm::platform::{
@@ -113,6 +118,13 @@ fn guarded<R>(f: impl FnOnce() -> R) -> Result<R, Fault> {
     })
 }
 
+/// Run `f`, a whole `Platform` method, in an autorelease pool drained when it
+/// returns, so nothing Metal autoreleases outlives the call. `guarded` inside
+/// catches an exception before it reaches the pool.
+fn pooled<R>(f: impl FnOnce() -> R) -> R {
+    autoreleasepool(|_| f())
+}
+
 fn made_twice(handle: Handle) -> Fault {
     Fault::new(format!("the VM named two objects {handle:?}"))
 }
@@ -123,6 +135,24 @@ fn not_held(handle: Handle) -> Fault {
 
 impl Platform for Metal {
     fn device(&self, id: Id<Device>) -> Result<DeviceInfo, DeviceError> {
+        pooled(|| self.make_device(id))
+    }
+
+    fn buffer(&self, id: Id<Buffer>, bytes: BufferBytes<'_>) -> Result<(), BufferError> {
+        pooled(|| self.make_buffer(id, bytes))
+    }
+
+    fn read(&self, to: ReadInto<'_>) -> Result<(), Fault> {
+        pooled(|| self.read_into(to))
+    }
+
+    fn release(&self, handle: Handle) {
+        pooled(|| self.let_go(handle));
+    }
+}
+
+impl Metal {
+    fn make_device(&self, id: Id<Device>) -> Result<DeviceInfo, DeviceError> {
         let create = create_device().ok_or(DeviceError::Unsupported)?;
         let raw = guarded(|| {
             // SAFETY: `create` is `MTLCreateSystemDefaultDevice`, which takes
@@ -148,7 +178,7 @@ impl Platform for Metal {
         ))
     }
 
-    fn buffer(&self, id: Id<Buffer>, bytes: BufferBytes<'_>) -> Result<(), BufferError> {
+    fn make_buffer(&self, id: Id<Buffer>, bytes: BufferBytes<'_>) -> Result<(), BufferError> {
         let on = bytes.device();
         let device = self.objects().devices.get(&on).cloned();
         let device = device.ok_or_else(|| BufferError::Fault(not_held(Handle::Device(on))))?;
@@ -175,30 +205,21 @@ impl Platform for Metal {
         Ok(())
     }
 
-    fn read(&self, to: ReadInto<'_>) -> Result<(), Fault> {
+    fn read_into(&self, to: ReadInto<'_>) -> Result<(), Fault> {
         let id = to.buffer();
         let buffer = self.objects().buffers.get(&id).map(|kept| kept.0.clone());
         let buffer = buffer.ok_or_else(|| not_held(Handle::Buffer(id)))?;
         let (contents, length) = guarded(|| (buffer.contents(), buffer.length()))?;
-        let into = to.into_slice();
-        // The VM made `into` the length it recorded for the buffer. Reading
-        // Metal's memory soundly rests on Metal's own length, not on that.
-        if into.len() != length {
-            return Err(Fault::new(format!(
-                "{id:?} holds {length} bytes, and the VM made room for {}",
-                into.len()
-            )));
-        }
         // SAFETY: a buffer made with `StorageModeShared` keeps its bytes in
         // memory the CPU can read, `length` of them at `contents`, for as
         // long as it lives, and `buffer` keeps it alive past the copy. No GPU
-        // work exists yet to write them while they are read.
+        // work exists yet to write them while they are read. The length is
+        // Metal's own, and `copy_from` refuses it if it is not the room's.
         let held = unsafe { std::slice::from_raw_parts(contents.as_ptr().cast::<u8>(), length) };
-        into.copy_from_slice(held);
-        Ok(())
+        to.copy_from(held)
     }
 
-    fn release(&self, handle: Handle) {
+    fn let_go(&self, handle: Handle) {
         let mut objects = self.objects();
         let device = match handle {
             Handle::Device(id) => objects.devices.remove(&id),

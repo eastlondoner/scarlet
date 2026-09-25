@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::platform::Platform;
+use crate::platform::Gpu;
 
 /// The world a run sees.
 pub struct Host {
@@ -17,9 +17,10 @@ pub struct Host {
     env: Vec<(String, String)>,
     /// What `time.monotonic` counts from.
     started: Instant,
-    /// What `scarlet/metal` reaches. With none, the machine has no GPU the
-    /// run can use, and `metal.device` says so.
-    platform: Option<Arc<dyn Platform>>,
+    /// What `scarlet/metal` reaches, shared by every run on this host. With
+    /// none, the machine has no GPU the run can use, and `metal.device` says
+    /// so.
+    gpu: Option<Arc<Gpu>>,
 }
 
 impl Host {
@@ -28,14 +29,14 @@ impl Host {
             argv,
             env,
             started: Instant::now(),
-            platform: None,
+            gpu: None,
         }
     }
 
-    /// This world, with `platform` as its GPU instead of none.
-    pub fn with_platform(self, platform: Arc<dyn Platform>) -> Host {
+    /// This world, with `gpu` as its GPU instead of none.
+    pub fn with_gpu(self, gpu: Arc<Gpu>) -> Host {
         Host {
-            platform: Some(platform),
+            gpu: Some(gpu),
             ..self
         }
     }
@@ -56,8 +57,8 @@ impl Host {
         &self.env
     }
 
-    pub(crate) fn platform(&self) -> Option<&dyn Platform> {
-        self.platform.as_deref()
+    pub(crate) fn gpu(&self) -> Option<&Gpu> {
+        self.gpu.as_deref()
     }
 
     /// Milliseconds since the run began, on a clock that only goes forward.

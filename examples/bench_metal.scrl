@@ -6,50 +6,49 @@ import scarlet/crypto
 import scarlet/metal
 import scarlet/time
 
-fn make(device metal.Device, bytes Binary, n Int) Int {
+fn make(device metal.Device, bytes Binary, n Int) Result(Nil, metal.MetalError) {
 	if n == 0 {
-		0
+		Ok(Nil)
 	} else {
 		match metal.buffer(device, bytes) {
 			Ok(_) -> make(device, bytes, n - 1)
-			Err(_) -> -1
+			Err(e) -> Err(e)
 		}
 	}
 }
 
-fn read(buffer metal.Buffer, n Int) Int {
+fn read(buffer metal.Buffer, n Int) Result(Nil, metal.MetalError) {
 	if n == 0 {
-		0
+		Ok(Nil)
 	} else {
 		match metal.read(buffer) {
 			Ok(_) -> read(buffer, n - 1)
-			Err(_) -> -1
+			Err(e) -> Err(e)
 		}
 	}
 }
 
-fn round_trip(device metal.Device, bytes Binary, n Int) Int {
+fn round_trip(device metal.Device, bytes Binary, n Int) Result(Nil, metal.MetalError) {
 	if n == 0 {
-		0
+		Ok(Nil)
 	} else {
 		match metal.buffer(device, bytes) {
 			Ok(buffer) -> match metal.read(buffer) {
 				Ok(_) -> round_trip(device, bytes, n - 1)
-				Err(_) -> -1
+				Err(e) -> Err(e)
 			}
-			Err(_) -> -1
+			Err(e) -> Err(e)
 		}
 	}
 }
 
-fn timed(op String, size Int, n Int, run fn() Int) Nil {
+fn timed(op String, size Int, n Int, run fn() Result(Nil, metal.MetalError)) Nil {
 	start = time.monotonic()
-	failed = run()
+	ran = run()
 	ms = time.since_ms(time.monotonic(), start)
-	if failed == 0 {
-		println('${op} ${size} ${n} ${ms}')
-	} else {
-		println('${op} ${size} failed')
+	match ran {
+		Ok(Nil) -> println('${op} ${size} ${n} ${ms}')
+		Err(e) -> println('${op} ${size} failed: ${e}')
 	}
 }
 
